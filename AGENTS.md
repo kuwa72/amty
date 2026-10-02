@@ -11,6 +11,8 @@ GUI (egui, src/gui.rs)          -- thin; renders session store + event bus
 App core (src/app.rs)           -- config, sessions, approvals, event broadcast
   |- agent loop (src/agent.rs)  -- provider stream -> tool calls -> results -> repeat
   |- providers (src/provider.rs)-- Anthropic native + OpenAI-compatible (hand-rolled SSE)
+  |                             + Command Code (POST /alpha/generate, NDJSON stream,
+  |                               key from ~/.commandcode/auth.json)
   |- builtin tools (src/tools.rs) -- fs_read/fs_list/fs_write/fs_edit/shell/config_*/mcp
   |- MCP client (src/mcp.rs)    -- stdio JSON-RPC, tools exposed as mcp__<srv>__<tool>
   |
@@ -58,6 +60,12 @@ cargo build --release
 
 ## Known limits / TODO
 
+- Command Code provider: provider name `commandcode`. Auth comes from
+  `~/.commandcode/auth.json` (sign in with the `cmdc` CLI first), or set
+  `providers.commandcode.api_key` / `api_key_env`. The server requires an
+  `x-command-code-version` header — amty detects it via `cmdc --version`.
+  Model ids are like `deepseek/deepseek-v4-flash` or `kimi-k2.5`
+  (see `cmdc --list-models`).
 - MCP client supports stdio transport only (no streamable-HTTP servers yet).
 - Anthropic provider needs `ANTHROPIC_API_KEY`; OAuth token heuristic is minimal.
 - No token accounting, retries/backoff, or prompt caching yet.

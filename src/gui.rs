@@ -520,10 +520,12 @@ fn settings_window(ctx: &egui::Context, open: &mut bool, buf: &mut SettingsBuf, 
                             .selected_text(match p.kind {
                                 ProviderKind::Anthropic => "anthropic",
                                 ProviderKind::OpenAi => "openai",
+                                ProviderKind::CommandCode => "commandcode",
                             })
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut p.kind, ProviderKind::Anthropic, "anthropic");
                                 ui.selectable_value(&mut p.kind, ProviderKind::OpenAi, "openai (compatible)");
+                                ui.selectable_value(&mut p.kind, ProviderKind::CommandCode, "commandcode");
                             });
                     });
                     egui::Grid::new("pgrid").num_columns(2).show(ui, |ui| {

@@ -16,6 +16,7 @@ pub fn build(conf: &ProviderConf) -> Box<dyn Provider> {
     match conf.kind {
         crate::config::ProviderKind::Anthropic => Box::new(Anthropic { conf: conf.clone() }),
         crate::config::ProviderKind::OpenAi => Box::new(OpenAi { conf: conf.clone() }),
+        crate::config::ProviderKind::CommandCode => Box::new(CommandCode { conf: conf.clone() }),
     }
 }
 
@@ -352,6 +353,239 @@ impl OpenAi {
             let input = if js.is_empty() { json!({}) } else { serde_json::from_str(&js).unwrap_or(json!({})) };
             let id = if id.is_empty() { format!("call_{}", uuid::Uuid::new_v4()) } else { id };
             let _ = tx.send(StreamEvent::ToolUse { id, name, input });
+        }
+        let _ = tx.send(StreamEvent::Done);
+        Ok(())
+    }
+}
+
+// ---------------- Command Code ----------------
+//
+// POST {base}/alpha/generate with NDJSON (line-delimited JSON) streaming —
+// the same protocol the `cmdc` CLI speaks. Auth: Bearer token from
+// ~/.commandcode/auth.json (or api_key / api_key_env overrides).
+
+struct CommandCode {
+    conf: ProviderConf,
+}
+
+fn chrono_iso_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (y, mo, d, h, mi, s) = {
+        let days = secs / 86400;
+        let rem = secs % 86400;
+        let z = days as i64 + 719468;
+        let era = if z >= 0 { z } else { z - 146096 } / 146097;
+        let doe = (z - era * 146097) as u64;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if mo <= 2 { y + 1 } else { y };
+        (y, mo, d, rem / 3600, rem % 3600 / 60, rem % 60)
+    };
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+fn cc_messages(messages: &[ChatMessage]) -> Vec<Value> {
+    let mut out = Vec::new();
+    // tool_call_id -> toolName, needed to name tool-result blocks
+    let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for m in messages {
+        match m.role {
+            Role::Assistant => {
+                let mut content = Vec::new();
+                for b in &m.blocks {
+                    match b {
+                        Block::Text { text } => content.push(json!({"type": "text", "text": text})),
+                        Block::ToolUse { id, name, input } => {
+                            names.insert(id.clone(), name.clone());
+                            content.push(json!({"type": "tool-call", "toolCallId": id,
+                                                "toolName": name, "input": input}));
+                        }
+                        Block::ToolResult { .. } => {}
+                    }
+                }
+                out.push(json!({"role": "assistant", "content": content}));
+            }
+            Role::User => {
+                let mut user = Vec::new();
+                let mut results = Vec::new();
+                for b in &m.blocks {
+                    match b {
+                        Block::Text { text } => user.push(json!({"type": "text", "text": text})),
+                        Block::ToolResult { tool_use_id, content, is_error } => results.push(json!({
+                            "type": "tool-result",
+                            "toolCallId": tool_use_id,
+                            "toolName": names.get(tool_use_id).cloned().unwrap_or_else(|| "unknown".into()),
+                            "output": if *is_error {
+                                json!({"type": "error-text", "value": content})
+                            } else {
+                                json!({"type": "text", "value": content})
+                            },
+                        })),
+                        _ => {}
+                    }
+                }
+                if !results.is_empty() {
+                    out.push(json!({"role": "tool", "content": results}));
+                }
+                if !user.is_empty() {
+                    out.push(json!({"role": "user", "content": user}));
+                }
+            }
+        }
+    }
+    out
+}
+
+#[async_trait]
+impl Provider for CommandCode {
+    async fn stream(&self, req: &ChatRequest, tx: mpsc::UnboundedSender<StreamEvent>) {
+        if let Err(e) = self.run(req, &tx).await {
+            let _ = tx.send(StreamEvent::Err(e.to_string()));
+        }
+    }
+}
+
+fn cmdc_version() -> &'static str {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        std::process::Command::new("cmdc")
+            .arg("--version")
+            .output()
+            .ok()
+            .and_then(|o| {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                (!s.is_empty()).then_some(s)
+            })
+            .unwrap_or_else(|| "1.74.0".into())
+    })
+}
+
+impl CommandCode {
+    async fn run(&self, req: &ChatRequest, tx: &mpsc::UnboundedSender<StreamEvent>) -> Result<()> {
+        let key = self.conf.resolved_key()
+            .ok_or_else(|| anyhow!("no Command Code api key — run `cmdc` once to sign in, or set providers.commandcode.api_key"))?;
+        let system: Value = match &req.system {
+            Some(s) => json!([{ "type": "text", "text": s }]),
+            None => Value::Null,
+        };
+        // Server validates this `config` env block and rejects missing fields.
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let git = |args: &[&str]| -> String {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&cwd)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        };
+        let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]);
+        let is_repo = !branch.is_empty();
+        let body = json!({
+            "config": {
+                "workingDir": cwd.to_string_lossy(),
+                "date": chrono_iso_now(),
+                "environment": std::env::consts::OS,
+                "structure": [],
+                "isGitRepo": is_repo,
+                "currentBranch": branch,
+                "mainBranch": "main",
+                "gitStatus": git(&["status", "--porcelain"]),
+                "recentCommits": git(&["log", "--oneline", "-5"]).lines().collect::<Vec<_>>(),
+            },
+            "memory": null, "taste": null, "skills": null,
+            "permissionMode": "standard",
+            "mode": "agent",
+            "promptCache": "off",
+            "params": {
+                "model": req.model,
+                "messages": cc_messages(&req.messages),
+                "tools": req.tools.iter().map(|t| json!({
+                    "name": t.name, "description": t.description, "input_schema": t.schema,
+                })).collect::<Vec<_>>(),
+                "system": system,
+                "max_tokens": req.max_tokens,
+                "stream": true,
+            },
+        });
+        let client = reqwest::Client::new();
+        let mut rb = client
+            .post(format!("{}/alpha/generate", self.conf.resolved_base()))
+            .header("content-type", "application/json")
+            .header("user-agent", "cli")
+            .header("x-cli-environment", "production")
+            .header("x-command-code-version", cmdc_version())
+            .bearer_auth(&key);
+        for (k, v) in &self.conf.headers {
+            rb = rb.header(k.as_str(), v.as_str());
+        }
+        let resp = rb.json(&body).send().await?;
+        if !resp.status().is_success() {
+            bail!("commandcode HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default());
+        }
+        // NDJSON stream — one JSON object per line.
+        let mut stream = Box::pin(resp.bytes_stream());
+        let mut buf = Vec::<u8>::new();
+        let mut finished = false;
+        'outer: loop {
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line);
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let Ok(ev) = serde_json::from_str::<Value>(line) else { continue };
+                match ev["type"].as_str() {
+                    Some("text-delta") => {
+                        if let Some(t) = ev["text"].as_str() {
+                            if !t.is_empty() {
+                                let _ = tx.send(StreamEvent::Text(t.into()));
+                            }
+                        }
+                    }
+                    Some("tool-call") => {
+                        let input = ev.get("input").or_else(|| ev.get("args")).cloned().unwrap_or(json!({}));
+                        let _ = tx.send(StreamEvent::ToolUse {
+                            id: ev["toolCallId"].as_str().unwrap_or("").into(),
+                            name: ev["toolName"].as_str().unwrap_or("").into(),
+                            input,
+                        });
+                    }
+                    Some("finish") => {
+                        finished = true;
+                        break 'outer;
+                    }
+                    Some("error") => {
+                        let msg = if let Some(s) = ev["error"].as_str() {
+                            s.to_string()
+                        } else {
+                            ev["error"]["message"].as_str().unwrap_or("stream error").to_string()
+                        };
+                        bail!("commandcode stream error: {msg}");
+                    }
+                    Some("abort") => break 'outer,
+                    _ => {}
+                }
+            }
+            match stream.next().await {
+                Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                Some(Err(e)) => return Err(anyhow!("stream error: {e}")),
+                None => break,
+            }
+        }
+        if !finished {
+            // tolerate EOF without an explicit finish event, but surface it
+            let _ = tx.send(StreamEvent::Text("\n[stream ended without finish event]".into()));
         }
         let _ = tx.send(StreamEvent::Done);
         Ok(())

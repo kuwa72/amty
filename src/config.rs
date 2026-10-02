@@ -8,6 +8,7 @@ use std::path::PathBuf;
 pub enum ProviderKind {
     Anthropic,
     OpenAi,
+    CommandCode,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45,7 +46,13 @@ impl ProviderConf {
                 }
             }
         }
-        self.api_key.clone()
+        if self.api_key.is_some() {
+            return self.api_key.clone();
+        }
+        if self.kind == ProviderKind::CommandCode {
+            return commandcode_key();
+        }
+        None
     }
 
     pub fn resolved_base(&self) -> String {
@@ -55,6 +62,7 @@ impl ProviderConf {
         match self.kind {
             ProviderKind::Anthropic => "https://api.anthropic.com".into(),
             ProviderKind::OpenAi => "https://api.openai.com/v1".into(),
+            ProviderKind::CommandCode => "https://api.commandcode.ai".into(),
         }
     }
 }
@@ -126,6 +134,14 @@ impl Default for Config {
             },
         );
         providers.insert(
+            "commandcode".into(),
+            ProviderConf {
+                kind: ProviderKind::CommandCode,
+                model: "deepseek/deepseek-v4-flash".into(),
+                ..Default::default()
+            },
+        );
+        providers.insert(
             "ollama".into(),
             ProviderConf {
                 kind: ProviderKind::OpenAi,
@@ -144,6 +160,13 @@ impl Default for Config {
             mcp_servers: BTreeMap::new(),
         }
     }
+}
+
+/// Read the apiKey stored by the `cmdc` CLI (`~/.commandcode/auth.json`).
+fn commandcode_key() -> Option<String> {
+    let path = dirs::home_dir()?.join(".commandcode/auth.json");
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    v.get("apiKey")?.as_str().map(String::from).filter(|s| !s.is_empty())
 }
 
 pub fn config_dir() -> PathBuf {
