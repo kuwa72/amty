@@ -82,10 +82,34 @@ pub enum ConfigCmd {
     Set { key: String, value: String },
 }
 
+/// Linux/WSL display fixups: point XDG_RUNTIME_DIR at WSLg's socket dir when
+/// the Wayland socket isn't reachable, else drop WAYLAND_DISPLAY so winit
+/// falls back to X11.
+#[cfg(target_os = "linux")]
+fn fix_display_env() {
+    use std::path::Path;
+    let wayland = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());
+    let reachable = std::env::var("XDG_RUNTIME_DIR")
+        .map(|d| Path::new(&d).join(&wayland).exists())
+        .unwrap_or(false);
+    if reachable {
+        return;
+    }
+    if Path::new("/mnt/wslg/runtime-dir").join(&wayland).exists() {
+        std::env::set_var("XDG_RUNTIME_DIR", "/mnt/wslg/runtime-dir");
+    } else if std::env::var("DISPLAY").is_ok() {
+        std::env::remove_var("WAYLAND_DISPLAY");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fix_display_env() {}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd.unwrap_or(Cmd::Gui) {
         Cmd::Gui => {
+            fix_display_env();
             let rt = tokio::runtime::Runtime::new()?;
             let app = rt.block_on(app::App::start())?;
             let r = gui::run(rt, app);
