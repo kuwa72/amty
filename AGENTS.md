@@ -1,0 +1,64 @@
+# amty
+
+Lightweight, scriptable AI chat & agent client. Rust + egui (no webview, no Electron).
+Main target: macOS. Development happens on WSL/Linux; the same code builds for macOS.
+
+## Architecture
+
+```
+GUI (egui, src/gui.rs)          -- thin; renders session store + event bus
+  |
+App core (src/app.rs)           -- config, sessions, approvals, event broadcast
+  |- agent loop (src/agent.rs)  -- provider stream -> tool calls -> results -> repeat
+  |- providers (src/provider.rs)-- Anthropic native + OpenAI-compatible (hand-rolled SSE)
+  |- builtin tools (src/tools.rs) -- fs_read/fs_list/fs_write/fs_edit/shell/config_*/mcp
+  |- MCP client (src/mcp.rs)    -- stdio JSON-RPC, tools exposed as mcp__<srv>__<tool>
+  |
+Control API (src/api.rs)        -- axum on 127.0.0.1:<ephemeral>, Bearer token.
+                                   port+token in $XDG_DATA_HOME/amty/runtime.json
+  |- CLI (src/cli.rs)           -- `amty send/sessions/status/config/approve/...`
+  `- MCP facade (src/mcp_serve.rs) -- `amty mcp-serve` exposes the app itself as an
+                                    MCP server so external agents can drive it
+```
+
+Key idea: one control plane, three surfaces — GUI, CLI, MCP. Anything the agent can
+do via `config_set`, a script can do via `POST /v1/config`, and vice versa.
+
+## Files
+
+- config: `$XDG_CONFIG_HOME/amty/config.toml` (auto-created; `mcp_servers` uses the
+  same shape as `claude_desktop_config.json`'s `mcpServers`)
+- sessions: `$XDG_DATA_HOME/amty/sessions/<id>.jsonl` (meta line + messages)
+- runtime discovery: `$XDG_DATA_HOME/amty/runtime.json` (0600)
+
+## Build / test / run
+
+```sh
+cargo check          # fast type check
+cargo test           # unit tests (all offline)
+cargo build          # debug binary at target/debug/amty
+cargo build --release
+
+./target/debug/amty              # GUI (needs a display; on WSL use WSLg:
+                                 #   XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir)
+./target/debug/amty status       # requires a running instance
+./target/debug/amty send "hi"    # most recent session; --new, -s <id>, --no-wait
+./target/debug/amty mcp-serve    # stdio MCP server for external agents
+```
+
+## Conventions
+
+- Egui 0.36: `eframe::App` uses `fn ui(&mut self, ui: &mut Ui, frame)`; panels are
+  `egui::Panel::{left,right,top,bottom}` and `CentralPanel`, all taking `&mut Ui`.
+- reqwest 0.13: TLS feature is `rustls` (platform verifier), not `rustls-tls`.
+- No MCP/LLM SDK deps on purpose — hand-rolled SSE + JSON-RPC keeps the dep tree
+  and binary small.
+- CJK fonts are loaded from OS font paths at startup (see `install_cjk_fonts`);
+  egui's bundled fonts have no CJK glyphs.
+
+## Known limits / TODO
+
+- MCP client supports stdio transport only (no streamable-HTTP servers yet).
+- Anthropic provider needs `ANTHROPIC_API_KEY`; OAuth token heuristic is minimal.
+- No token accounting, retries/backoff, or prompt caching yet.
+- macOS packaging (.app bundle, signing) not set up; `cargo build` on macOS works.
