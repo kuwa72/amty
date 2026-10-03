@@ -104,7 +104,20 @@ async fn run_inner(app: &Arc<App>, sid: &str, text: String) -> Result<()> {
             }
             blocks
         });
-        prov.stream(&req, tx).await;
+        // stream is cancel-safe: dropping the future aborts the HTTP request
+        {
+            let mut fut = std::pin::pin!(prov.stream(&req, tx));
+            loop {
+                tokio::select! {
+                    _ = &mut fut => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                        if cancelled() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         let blocks = fwd.await.unwrap_or_default();
 
         let tool_uses: Vec<Block> = blocks
@@ -122,17 +135,20 @@ async fn run_inner(app: &Arc<App>, sid: &str, text: String) -> Result<()> {
             return Ok(());
         }
 
-        // execute tools, collect results
-        let mut results = vec![];
+        // execute tools, collect results — on cancel, still write results
+        // for every tool_use so the session doesn't end up with a dangling
+        // call the provider will reject next turn
+        let mut results: Vec<Block> = vec![];
         // (name, input) -> (content, is_error) — identical calls in one turn
         // run once and share the result; models sometimes emit exact dupes
         let mut seen: std::collections::HashMap<String, (String, bool)> = std::collections::HashMap::new();
-        for b in tool_uses {
+        let mut interrupted = false;
+        for b in &tool_uses {
             if cancelled() {
-                app.emit(sid, EvKind::Error { message: "cancelled".into() });
-                return Ok(());
+                interrupted = true;
+                break;
             }
-            let Block::ToolUse { id, name, input } = b else { continue };
+            let Block::ToolUse { id, name, input } = b.clone() else { continue };
             let dup_key = format!("{name}\u{1}{input}");
             if let Some((content, is_error)) = seen.get(&dup_key) {
                 results.push(Block::ToolResult {
@@ -177,8 +193,27 @@ async fn run_inner(app: &Arc<App>, sid: &str, text: String) -> Result<()> {
                 }
             }
         }
+        // backfill results for tool calls never executed (interrupted mid-batch)
+        for b in &tool_uses {
+            if let Block::ToolUse { id, .. } = b {
+                let answered = results.iter().any(|r| {
+                    matches!(r, Block::ToolResult { tool_use_id, .. } if tool_use_id == id)
+                });
+                if !answered {
+                    results.push(Block::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: "(interrupted — tool call not executed)".into(),
+                        is_error: true,
+                    });
+                }
+            }
+        }
         app.sessions.push_message(sid, ChatMessage::tool_results(results));
         app.emit(sid, EvKind::Touched);
+        if interrupted {
+            app.emit(sid, EvKind::Error { message: "cancelled".into() });
+            return Ok(());
+        }
     }
     app.emit(sid, EvKind::Error { message: format!("stopped after {MAX_TURNS} turns") });
     Ok(())

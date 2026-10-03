@@ -102,7 +102,7 @@ struct Anthropic {
 }
 
 fn anthropic_messages(messages: &[ChatMessage]) -> Vec<Value> {
-    messages
+    ensure_tool_results(messages)
         .iter()
         .map(|m| {
             let role = match m.role {
@@ -238,7 +238,7 @@ fn openai_messages(req: &ChatRequest) -> Vec<Value> {
     if let Some(sys) = &req.system {
         out.push(json!({"role": "system", "content": sys}));
     }
-    for m in &req.messages {
+    for m in &ensure_tool_results(&req.messages) {
         match m.role {
             Role::User => {
                 let mut text = String::new();
@@ -405,7 +405,7 @@ fn cc_messages(messages: &[ChatMessage]) -> Vec<Value> {
     let mut out = Vec::new();
     // tool_call_id -> toolName, needed to name tool-result blocks
     let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for m in messages {
+    for m in &ensure_tool_results(messages) {
         match m.role {
             Role::Assistant => {
                 let mut content = Vec::new();
