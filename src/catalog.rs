@@ -128,15 +128,46 @@ pub fn find(id: &str) -> Option<&'static Entry> {
     CATALOG.iter().find(|e| e.id == id)
 }
 
+/// Resolve the npx executable. On Windows `npx` may be freshly installed but
+/// missing from this process's (stale) PATH — fall back to the standard
+/// installer location. Rust spawns .cmd shims via cmd.exe internally.
+fn npx_exe() -> Option<String> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        Some("npx".to_string())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let on_path = std::process::Command::new("where")
+            .arg("npx")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if on_path {
+            return Some("npx".to_string());
+        }
+        let pf = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
+        for p in [
+            format!(r"{pf}\nodejs\npx.cmd"),
+            format!(r"{}\fnm\aliases\default\npx.cmd", std::env::var("LOCALAPPDATA").unwrap_or_default()),
+            format!(r"{}\npx.cmd", std::env::var("APPDATA").unwrap_or_default()),
+        ] {
+            if std::path::Path::new(&p).exists() {
+                return Some(p);
+            }
+        }
+        None
+    }
+}
+
 /// Is `npx` runnable on this machine?
 pub fn node_available() -> bool {
     static OK: OnceLock<bool> = OnceLock::new();
     *OK.get_or_init(|| {
-        #[cfg(target_os = "windows")]
-        let c = std::process::Command::new("cmd").args(["/c", "npx", "--version"]).output();
-        #[cfg(not(target_os = "windows"))]
-        let c = std::process::Command::new("npx").arg("--version").output();
-        c.map(|o| o.status.success()).unwrap_or(false)
+        npx_exe()
+            .and_then(|npx| std::process::Command::new(npx).arg("--version").output().ok())
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     })
 }
 
@@ -196,10 +227,16 @@ pub fn build_conf(id: &str, env: BTreeMap<String, String>) -> Result<(String, Mc
             final_env.insert(spec.key.into(), v);
         }
     }
-    #[cfg(target_os = "windows")]
-    let (command, args) = ("cmd".to_string(), vec!["/c".into(), "npx".into(), "-y".into(), entry.package.into()]);
-    #[cfg(not(target_os = "windows"))]
-    let (command, args) = ("npx".to_string(), vec!["-y".into(), entry.package.into()]);
+    let command = npx_exe().context("npx disappeared")?;
+    // when npx was found via a fallback path (this process's PATH predates the
+    // Node install), the .cmd shim still needs `node` on PATH — inject its dir
+    if command != "npx" {
+        if let Some(dir) = std::path::Path::new(&command).parent() {
+            let cur = std::env::var("PATH").unwrap_or_default();
+            final_env.insert("PATH".into(), format!("{};{cur}", dir.display()));
+        }
+    }
+    let args = vec!["-y".to_string(), entry.package.into()];
     Ok((entry.id.to_string(), McpServerConf { command, args, env: final_env, enabled: true }))
 }
 
@@ -224,12 +261,6 @@ mod tests {
         assert_eq!(name, "notion");
         assert_eq!(conf.env["NOTION_TOKEN"], "ntn_x");
         assert!(conf.args.iter().any(|a| a.contains("notion-mcp")));
-        // npx can't be spawned directly on Windows (.cmd shim)
-        if cfg!(windows) {
-            assert_eq!(conf.command, "cmd");
-            assert_eq!(conf.args[1], "npx");
-        } else {
-            assert_eq!(conf.command, "npx");
-        }
+        assert!(conf.command.contains("npx"));
     }
 }

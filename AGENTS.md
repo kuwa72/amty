@@ -78,11 +78,14 @@ cargo build --release --target x86_64-pc-windows-gnu
 - Japanese IME works on macOS/Windows native, NOT under WSLg (no
   `text_input_v3` in the WSLg compositor). On WSL use paste or `amty send`.
 - MCP client supports stdio transport only (no streamable-HTTP servers yet).
-- Catalog installs need Node.js/npx on PATH. On Windows the conf is written as
-  `cmd /c npx -y <pkg>` because npx is a .cmd shim. First-run downloads are
-  slow — MCP handshake timeout is 120 s. Google-family servers still need a
-  manual OAuth step (see each entry's note in src/catalog.rs); a failed start
-  surfaces the server's stderr tail in the status.
+- Catalog installs need Node.js. On Windows npx is resolved from PATH, falling
+  back to `%ProgramFiles%\nodejs\npx.cmd` (fresh installs land there while the
+  running process still has a stale PATH); when a fallback path is used its dir
+  is injected into the child's PATH env so `node` resolves. MCP children get
+  `current_dir = ~` since npm refuses to run under a UNC cwd. First-run npx
+  downloads are slow — MCP handshake timeout is 120 s. Google-family servers
+  still need a manual OAuth step (see each entry's note in src/catalog.rs); a
+  failed start surfaces the server's stderr tail in the status.
 - Anthropic provider needs `ANTHROPIC_API_KEY`; OAuth token heuristic is minimal.
 - No token accounting, retries/backoff, or prompt caching yet.
 - macOS packaging (.app bundle, signing) not set up; `cargo build` on macOS works.

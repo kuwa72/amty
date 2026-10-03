@@ -27,6 +27,9 @@ impl Rpc {
         let mut cmd = Command::new(&conf.command);
         cmd.args(&conf.args)
             .envs(&conf.env)
+            // servers expect a sane cwd; amty may have been launched from a
+            // UNC path (cmd/npm refuse to run with a UNC current dir)
+            .current_dir(dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(".")))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
