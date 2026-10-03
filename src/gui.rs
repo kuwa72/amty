@@ -477,6 +477,7 @@ impl eframe::App for GuiApp {
             let mut install_target: Option<&'static str> = None;
             let mut auth_target: Option<&'static str> = None;
             let mut keys_target: Option<(&'static str, String)> = None;
+            let mut cred_prompt: Option<&'static str> = None;
             egui::Window::new(t("mcp servers")).open(&mut self.show_mcp).default_size([440.0, 380.0]).show(&ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for (name, status, enabled) in self.app.mcp.statuses() {
@@ -549,7 +550,19 @@ impl eframe::App for GuiApp {
                                     if running {
                                         ui.weak(t("auth running…"));
                                     } else if ui.button(t("auth")).clicked() {
-                                        auth_target = Some(entry.id);
+                                        // needs_client && no client id yet → open the
+                                        // install form for creds instead of erroring
+                                        let needs_creds = entry.oauth.map(|o| o.needs_client).unwrap_or(false)
+                                            && installed
+                                                .get(entry.id)
+                                                .and_then(|s| s.oauth_client_id.clone())
+                                                .unwrap_or_default()
+                                                .is_empty();
+                                        if needs_creds {
+                                            cred_prompt = Some(entry.id);
+                                        } else {
+                                            auth_target = Some(entry.id);
+                                        }
                                     }
                                     if !running {
                                         ui.weak(t("(browser may open)"));
@@ -599,6 +612,11 @@ impl eframe::App for GuiApp {
                     }
                 });
             });
+            if let Some(id) = cred_prompt {
+                self.cat_sel = Some(id);
+                self.cat_env.clear();
+                self.toast(t("enter the OAuth client id/secret, then install"));
+            }
             if let Some(id) = install_target {
                 self.catalog_install(id);
             }
@@ -606,7 +624,7 @@ impl eframe::App for GuiApp {
                 let started = self.app.clone();
                 match started.start_auth(id) {
                     Ok(_) => self.toast(t("auth started")),
-                    Err(e) => self.toast(format!("{} {e}", t("install failed: "))),
+                    Err(e) => self.toast(format!("{} {e}", t("auth failed: "))),
                 }
             }
             if let Some((id, src)) = keys_target {
