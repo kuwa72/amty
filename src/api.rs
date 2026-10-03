@@ -32,6 +32,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/mcp/{name}", post(mcp_toggle))
         .route("/v1/mcp-catalog", get(mcp_catalog))
         .route("/v1/mcp-install", post(mcp_install))
+        .route("/v1/mcp-auth", post(mcp_auth))
+        .route("/v1/mcp-auth/{id}", get(mcp_auth_status))
         .layer(middleware::from_fn_with_state(app.clone(), auth))
         .with_state(app)
 }
@@ -320,6 +322,26 @@ async fn mcp_install(
         .unwrap_or_default();
     app.emit("", EvKind::Touched);
     Ok(Json(json!({"installed": name, "status": status})))
+}
+
+#[derive(Deserialize)]
+struct AuthBody {
+    id: String,
+}
+
+/// Kick off a catalog entry's OAuth/auth subcommand (browser may open).
+async fn mcp_auth(
+    State(app): State<Arc<App>>,
+    Json(b): Json<AuthBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let log = app.start_auth(&b.id).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(json!({"started": b.id, "log": log.to_string_lossy()})))
+}
+
+async fn mcp_auth_status(State(app): State<Arc<App>>, Path(id): Path<String>) -> Json<Value> {
+    let running = app.auth.lock().unwrap().get(&id).map(|a| a.running).unwrap_or(false);
+    let tail = app.auth_log_tail(&id, 2000).unwrap_or_default();
+    Json(json!({"id": id, "running": running, "log_tail": tail}))
 }
 
 async fn mcp_toggle(

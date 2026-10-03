@@ -278,7 +278,8 @@ impl eframe::App for GuiApp {
         self.refresh_view();
 
         let any_running = self.running.values().any(|r| *r);
-        if any_running || !self.pending.is_empty() {
+        let auth_running = self.app.auth.lock().unwrap().values().any(|a| a.running);
+        if any_running || auth_running || !self.pending.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
@@ -471,6 +472,7 @@ impl eframe::App for GuiApp {
             let ja = lang == "ja";
             let t = |k: &'static str| crate::i18n::t(&lang, k);
             let mut install_target: Option<&'static str> = None;
+            let mut auth_target: Option<&'static str> = None;
             egui::Window::new(t("mcp servers")).open(&mut self.show_mcp).default_size([440.0, 380.0]).show(&ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for (name, status, enabled) in self.app.mcp.statuses() {
@@ -512,6 +514,27 @@ impl eframe::App for GuiApp {
                                 }
                             });
                             ui.weak(if ja { entry.desc_ja } else { entry.desc });
+                            // OAuth/auth runner (google-family servers)
+                            if entry.auth_cmd.is_some() {
+                                let running = self.app.auth.lock().unwrap().get(entry.id).map(|a| a.running).unwrap_or(false);
+                                ui.horizontal(|ui| {
+                                    if running {
+                                        ui.weak(t("auth running…"));
+                                    } else if ui.button(t("auth")).clicked() {
+                                        auth_target = Some(entry.id);
+                                    }
+                                    if !running {
+                                        ui.weak(t("(browser may open)"));
+                                    }
+                                });
+                                if let Some(tail) = self.app.auth_log_tail(entry.id, 600) {
+                                    if !tail.trim().is_empty() {
+                                        ui.add(egui::Label::new(
+                                            egui::RichText::new(tail.trim_end()).monospace().small(),
+                                        ).wrap());
+                                    }
+                                }
+                            }
                             if self.cat_sel == Some(entry.id) {
                                 for spec in entry.env {
                                     ui.horizontal(|ui| {
@@ -536,6 +559,13 @@ impl eframe::App for GuiApp {
             });
             if let Some(id) = install_target {
                 self.catalog_install(id);
+            }
+            if let Some(id) = auth_target {
+                let started = self.app.clone();
+                match started.start_auth(id) {
+                    Ok(_) => self.toast(t("auth started")),
+                    Err(e) => self.toast(format!("{} {e}", t("install failed: "))),
+                }
             }
         }
 

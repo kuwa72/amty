@@ -27,6 +27,8 @@ pub struct Entry {
     /// extra setup the user must do by hand (OAuth keys file etc.)
     pub note: &'static str,
     pub note_ja: &'static str,
+    /// OAuth/auth subcommand runnable as `npx -y <pkg> <cmd>` from the GUI
+    pub auth_cmd: Option<&'static str>,
 }
 
 pub const CATALOG: &[Entry] = &[
@@ -45,6 +47,7 @@ pub const CATALOG: &[Entry] = &[
         }],
         note: "Create an internal integration at notion.so/profile/integrations, then share target pages with it.",
         note_ja: "notion.so/profile/integrations でインテグレーションを作成し、対象ページに「コネクト」で共有してください。",
+        auth_cmd: None,
     },
     Entry {
         id: "slack",
@@ -70,6 +73,7 @@ pub const CATALOG: &[Entry] = &[
         ],
         note: "Create a Slack app at api.slack.com/apps, add bot scopes (channels:history, chat:write, …), install it, copy the Bot User OAuth Token.",
         note_ja: "api.slack.com/apps でアプリを作成 → Botスコープ (channels:history, chat:write など) を付与 → インストールしてBotトークンをコピー。",
+        auth_cmd: None,
     },
     Entry {
         id: "gmail",
@@ -78,8 +82,9 @@ pub const CATALOG: &[Entry] = &[
         desc_ja: "Gmail — 読み取り/検索/送信、ラベル、添付。コミュニティ製(gongrzhe)。",
         package: "@gongrzhe/server-gmail-autoauth-mcp",
         env: &[],
-        note: "Requires Google Cloud OAuth keys: place gcp-oauth.keys.json in ~/.gmail-mcp/, then run `npx @gongrzhe/server-gmail-autoauth-mcp auth` once in a terminal.",
-        note_ja: "Google CloudのOAuthキーが必要: gcp-oauth.keys.json を ~/.gmail-mcp/ に置き、ターミナルで `npx @gongrzhe/server-gmail-autoauth-mcp auth` を1回実行。",
+        note: "Requires Google Cloud OAuth keys: place gcp-oauth.keys.json in ~/.gmail-mcp/, then run auth (button below or `npx @gongrzhe/server-gmail-autoauth-mcp auth`).",
+        note_ja: "Google CloudのOAuthキーが必要: gcp-oauth.keys.json を ~/.gmail-mcp/ に置き、下の「認証」ボタン(または `npx @gongrzhe/server-gmail-autoauth-mcp auth`)を実行。",
+        auth_cmd: Some("auth"),
     },
     Entry {
         id: "gdrive",
@@ -95,7 +100,8 @@ pub const CATALOG: &[Entry] = &[
             required: false,
         }],
         note: "Place Google Cloud OAuth keys as gcp-oauth.keys.json in ~/.config/google-drive-mcp/ (or set the env var), enable Drive/Docs/Sheets/Slides APIs. Browser auth runs on first launch.",
-        note_ja: "Google CloudのOAuthキーを gcp-oauth.keys.json として ~/.config/google-drive-mcp/ に配置(または環境変数で指定)し、Drive/Docs/Sheets/Slides APIを有効化。初回起動時にブラウザ認証。",
+        note_ja: "Google CloudのOAuthキーを gcp-oauth.keys.json として ~/.config/google-drive-mcp/ に配置(または環境変数で指定)し、Drive/Docs/Sheets/Slides APIを有効化。下の「認証」ボタンでブラウザ認証(初回は自動でも開きます)。",
+        auth_cmd: Some("auth"),
     },
     Entry {
         id: "gdocs",
@@ -120,7 +126,8 @@ pub const CATALOG: &[Entry] = &[
             },
         ],
         note: "Enable Docs/Sheets/Drive APIs in Google Cloud, create a Desktop-type OAuth client, then run `npx -y @a-bonus/google-docs-mcp auth` once.",
-        note_ja: "Google CloudでDocs/Sheets/Drive APIを有効化し、デスクトップ型OAuthクライアントを作成。`npx -y @a-bonus/google-docs-mcp auth` を1回実行。",
+        note_ja: "Google CloudでDocs/Sheets/Drive APIを有効化し、デスクトップ型OAuthクライアントを作成。envにID/SECRETを入れて導入後、「認証」ボタンを実行。",
+        auth_cmd: Some("auth"),
     },
 ];
 
@@ -181,6 +188,7 @@ pub struct CatalogRow {
     pub env: Vec<serde_json::Value>,
     pub note: &'static str,
     pub note_ja: &'static str,
+    pub auth_cmd: Option<&'static str>,
     pub installed: bool,
 }
 
@@ -205,6 +213,7 @@ pub fn rows(installed: &BTreeMap<String, McpServerConf>) -> Vec<CatalogRow> {
                 .collect(),
             note: e.note,
             note_ja: e.note_ja,
+            auth_cmd: e.auth_cmd,
             installed: installed.contains_key(e.id),
         })
         .collect()
@@ -228,16 +237,32 @@ pub fn build_conf(id: &str, env: BTreeMap<String, String>) -> Result<(String, Mc
         }
     }
     let command = npx_exe().context("npx disappeared")?;
-    // when npx was found via a fallback path (this process's PATH predates the
-    // Node install), the .cmd shim still needs `node` on PATH — inject its dir
-    if command != "npx" {
-        if let Some(dir) = std::path::Path::new(&command).parent() {
-            let cur = std::env::var("PATH").unwrap_or_default();
-            final_env.insert("PATH".into(), format!("{};{cur}", dir.display()));
-        }
-    }
+    inject_node_dir(&command, &mut final_env);
     let args = vec!["-y".to_string(), entry.package.into()];
     Ok((entry.id.to_string(), McpServerConf { command, args, env: final_env, enabled: true }))
+}
+
+/// When npx was found via a fallback path (this process's PATH predates the
+/// Node install), the .cmd shim still needs `node` on PATH — inject its dir.
+fn inject_node_dir(command: &str, env: &mut BTreeMap<String, String>) {
+    if command != "npx" && !env.contains_key("PATH") {
+        if let Some(dir) = std::path::Path::new(command).parent() {
+            let cur = std::env::var("PATH").unwrap_or_default();
+            env.insert("PATH".into(), format!("{};{cur}", dir.display()));
+        }
+    }
+}
+
+/// Command+env for `npx -y <pkg> <auth_cmd>` — used by GUI/API auth flows.
+/// `base_env` is the installed server's env (OAuth flows often need the
+/// same client id/secret as the server itself).
+pub fn auth_spawn(id: &str, base_env: &BTreeMap<String, String>) -> Result<(String, Vec<String>, BTreeMap<String, String>)> {
+    let entry = find(id).context("unknown catalog id")?;
+    let auth = entry.auth_cmd.context("no auth command for this entry")?;
+    let command = npx_exe().context("npx disappeared")?;
+    let mut env = base_env.clone();
+    inject_node_dir(&command, &mut env);
+    Ok((command, vec!["-y".into(), entry.package.into(), auth.into()], env))
 }
 
 #[cfg(test)]

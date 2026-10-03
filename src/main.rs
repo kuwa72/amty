@@ -80,6 +80,12 @@ pub enum Cmd {
         /// KEY=VALUE env pairs for the server
         env: Vec<String>,
     },
+    /// Run a catalog server's OAuth/auth subcommand (opens browser).
+    Auth {
+        id: String,
+        /// print log tail instead of starting auth
+        #[arg(long)] status: bool,
+    },
     /// Expose the running instance as an MCP server (stdio) for external agents.
     McpServe,
     /// Import mcpServers from claude_desktop_config.json into config.toml.

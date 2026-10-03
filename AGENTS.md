@@ -50,6 +50,7 @@ cargo build --release
 ./target/debug/amty mcp-serve    # stdio MCP server for external agents
 ./target/debug/amty catalog      # list installable MCP servers
 ./target/debug/amty install notion NOTION_TOKEN=ntn_…   # catalog install via API
+./target/debug/amty auth gdrive [--status]   # run a catalog entry's OAuth flow
 
 # Windows native binary (cross-compiled from WSL; needs mingw-w64 + cmake):
 cargo build --release --target x86_64-pc-windows-gnu
@@ -85,7 +86,10 @@ cargo build --release --target x86_64-pc-windows-gnu
   `current_dir = ~` since npm refuses to run under a UNC cwd. First-run npx
   downloads are slow — MCP handshake timeout is 120 s. Google-family servers
   still need a manual OAuth step (see each entry's note in src/catalog.rs); a
-  failed start surfaces the server's stderr tail in the status.
+  failed start surfaces the server's stderr tail in the status. Catalog entries
+  with `auth_cmd` get a GUI/CLI auth runner (`POST /v1/mcp-auth`) that spawns
+  `npx -y <pkg> <cmd>` with the server's env, logs to
+  `$XDG_DATA_HOME/amty/auth-<id>.log`, then reconnects the server.
 - Anthropic provider needs `ANTHROPIC_API_KEY`; OAuth token heuristic is minimal.
 - No token accounting, retries/backoff, or prompt caching yet.
 - macOS packaging (.app bundle, signing) not set up; `cargo build` on macOS works.

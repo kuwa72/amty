@@ -44,6 +44,10 @@ static JA: &[(&str, &str)] = &[
     ("Node.js (npx) is required to install these", "導入には Node.js (npx) が必要です"),
     ("installed ", "導入しました: "),
     ("install failed: ", "導入に失敗: "),
+    ("auth", "認証"),
+    ("auth running…", "認証実行中…"),
+    ("(browser may open)", "(ブラウザが開きます)"),
+    ("auth started", "認証を開始しました"),
     // settings
     ("settings", "設定"),
     ("providers", "プロバイダ"),

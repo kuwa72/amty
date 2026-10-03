@@ -60,6 +60,11 @@ impl ApprovalQueue {
     }
 }
 
+pub struct AuthRun {
+    pub running: bool,
+    pub log: std::path::PathBuf,
+}
+
 pub struct App {
     pub cfg: RwLock<Config>,
     pub cfg_path: std::path::PathBuf,
@@ -69,8 +74,11 @@ pub struct App {
     pub events: broadcast::Sender<AppEvent>,
     /// session id → cancel flag
     pub runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// catalog id → auth subprocess state
+    pub auth: Mutex<HashMap<String, AuthRun>>,
     pub token: String,
     pub started: u64,
+    pub rt: tokio::runtime::Handle,
 }
 
 #[derive(Serialize)]
@@ -104,8 +112,10 @@ impl App {
             approvals: ApprovalQueue::default(),
             events,
             runs: Mutex::new(HashMap::new()),
+            auth: Mutex::new(HashMap::new()),
             token,
             started: crate::session::now_secs(),
+            rt: tokio::runtime::Handle::current(),
         });
 
         let router = crate::api::router(app.clone());
@@ -172,6 +182,70 @@ impl App {
 
     pub fn is_running(&self, session: &str) -> bool {
         self.runs.lock().unwrap().contains_key(session)
+    }
+
+    /// Run a catalog entry's OAuth/auth subcommand (`npx -y <pkg> auth`),
+    /// logging output to `<data_dir>/auth-<id>.log`. The installed server's
+    /// env (client id/secret etc.) is inherited. On exit the MCP manager
+    /// reconnects so the server picks up fresh credentials.
+    pub fn start_auth(self: &Arc<Self>, id: &str) -> Result<std::path::PathBuf> {
+        let base_env = self
+            .cfg
+            .read()
+            .unwrap()
+            .mcp_servers
+            .get(id)
+            .map(|s| s.env.clone())
+            .unwrap_or_default();
+        let (cmd, args, env) = crate::catalog::auth_spawn(id, &base_env)?;
+        let log = crate::config::data_dir().join(format!("auth-{id}.log"));
+        let file = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&log)?;
+        let file_err = file.try_clone()?;
+        let mut child = std::process::Command::new(&cmd)
+            .args(&args)
+            .envs(&env)
+            .current_dir(dirs::home_dir().unwrap_or_default())
+            .stdin(std::process::Stdio::null())
+            .stdout(file)
+            .stderr(file_err)
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("auth spawn '{cmd}': {e}"))?;
+        self.auth.lock().unwrap().insert(
+            id.to_string(),
+            AuthRun { running: true, log: log.clone() },
+        );
+        // monitor: mark finished, append exit code, reconnect the server
+        let app = self.clone();
+        let id_s = id.to_string();
+        let log_c = log.clone();
+        std::thread::spawn(move || {
+            let code = child.wait().map(|s| s.to_string()).unwrap_or_else(|_| "killed".into());
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&log_c) {
+                use std::io::Write;
+                let _ = writeln!(f, "\n[amty] auth exited: {code}");
+            }
+            if let Ok(mut m) = app.auth.lock() {
+                if let Some(a) = m.get_mut(&id_s) {
+                    a.running = false;
+                }
+            }
+            let app2 = app.clone();
+            app.rt.spawn(async move {
+                app2.mcp.update_servers(app2.mcp_servers_map());
+                app2.mcp.reconcile().await;
+                app2.emit("", EvKind::Touched);
+            });
+        });
+        Ok(log)
+    }
+
+    /// Tail of a catalog auth log, if any.
+    pub fn auth_log_tail(&self, id: &str, bytes: usize) -> Option<String> {
+        let path = self.auth.lock().unwrap().get(id).map(|a| a.log.clone())
+            .unwrap_or_else(|| crate::config::data_dir().join(format!("auth-{id}.log")));
+        let data = std::fs::read(path).ok()?;
+        let s = String::from_utf8_lossy(&data);
+        Some(s.chars().rev().take(bytes).collect::<String>().chars().rev().collect())
     }
 
     /// Snapshot of the configured MCP servers (for `Manager::update_servers`).
