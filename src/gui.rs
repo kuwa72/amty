@@ -97,6 +97,8 @@ pub struct GuiApp {
     /// currently executing tool label per session
     live_tool: HashMap<String, String>,
     running: HashMap<String, bool>,
+    /// last error per session, shown in the header until cleared
+    last_error: HashMap<String, String>,
     pending: Vec<PendingView>,
     /// cached view of the current session (refreshed on Touched)
     view: Option<Session>,
@@ -120,6 +122,7 @@ impl GuiApp {
             live_text: HashMap::new(),
             live_tool: HashMap::new(),
             running: HashMap::new(),
+            last_error: HashMap::new(),
             pending: vec![],
             view: None,
             view_dirty: true,
@@ -150,10 +153,16 @@ impl GuiApp {
             EvKind::Running { running } => {
                 self.running.insert(ev.session.clone(), running);
             }
-            EvKind::Touched | EvKind::Done | EvKind::Error { .. } => {
+            EvKind::Error { message } => {
+                self.last_error.insert(ev.session.clone(), message);
+                self.live_text.remove(&ev.session);
+                self.live_tool.remove(&ev.session);
+                self.view_dirty = true;
+            }
+            EvKind::Touched | EvKind::Done => {
                 // store now has everything streamed so far
                 self.live_text.remove(&ev.session);
-                if matches!(ev.kind, EvKind::Done | EvKind::Error { .. }) {
+                if matches!(ev.kind, EvKind::Done) {
                     self.live_tool.remove(&ev.session);
                 }
                 self.view_dirty = true;
@@ -204,9 +213,14 @@ impl GuiApp {
             return;
         }
         self.input.clear();
+        self.last_error.remove(&sid);
         self.view_dirty = true;
+        let app_ref = self.app.clone();
+        let sid_err = sid.clone();
         self.rt.spawn(async move {
-            if let Err(_e) = crate::agent::start_run(&app, &sid2, text) {}
+            if let Err(e) = crate::agent::start_run(&app, &sid2, text) {
+                app_ref.emit(&sid_err, EvKind::Error { message: e.to_string() });
+            }
         });
     }
 
@@ -368,8 +382,16 @@ impl eframe::App for GuiApp {
                 ui.weak(format!("{prov} / {model}"));
                 if let Some(t) = self.live_tool.get(&self.current) {
                     ui.weak(format!("⏳ {t}"));
+                } else if *self.running.get(&self.current).unwrap_or(&false) {
+                    ui.weak(format!("⏳ {}", self.tr("working…")));
                 }
             });
+            if let Some(err) = self.last_error.get(&self.current) {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 100, 100),
+                    format!("{} {}", self.tr("error:"), err),
+                );
+            }
             ui.separator();
             egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
                 let lang = self.app.cfg.read().unwrap().lang.clone();

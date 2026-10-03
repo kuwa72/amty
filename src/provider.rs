@@ -1,6 +1,6 @@
 use crate::config::ProviderConf;
 use crate::types::*;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -10,6 +10,15 @@ use tokio::sync::mpsc;
 #[async_trait]
 pub trait Provider: Send + Sync {
     async fn stream(&self, req: &ChatRequest, tx: mpsc::UnboundedSender<StreamEvent>);
+}
+
+/// Connect fails fast (20s); a stalled stream gives up after 180s without data.
+fn http() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .read_timeout(std::time::Duration::from_secs(180))
+        .build()
+        .map_err(Into::into)
 }
 
 pub fn build(conf: &ProviderConf) -> Box<dyn Provider> {
@@ -141,7 +150,7 @@ impl Anthropic {
                 "name": t.name, "description": t.description, "input_schema": t.schema,
             })).collect::<Vec<_>>(),
         });
-        let client = reqwest::Client::new();
+        let client = http()?;
         let mut rb = client
             .post(format!("{}/v1/messages", self.conf.resolved_base()))
             .header("x-api-key", &key)
@@ -155,7 +164,7 @@ impl Anthropic {
         for (k, v) in &self.conf.headers {
             rb = rb.header(k.as_str(), v.as_str());
         }
-        let resp = rb.json(&body).send().await?;
+        let resp = rb.json(&body).send().await.context("anthropic request failed (check network/proxy)")?;
         if !resp.status().is_success() {
             bail!("anthropic HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default());
         }
@@ -304,7 +313,7 @@ impl OpenAi {
                 "function": {"name": t.name, "description": t.description, "parameters": t.schema},
             })).collect::<Vec<_>>(),
         });
-        let client = reqwest::Client::new();
+        let client = http()?;
         let mut rb = client
             .post(format!("{}/chat/completions", self.conf.resolved_base()))
             .header("content-type", "application/json");
@@ -314,7 +323,7 @@ impl OpenAi {
         for (k, v) in &self.conf.headers {
             rb = rb.header(k.as_str(), v.as_str());
         }
-        let resp = rb.json(&body).send().await?;
+        let resp = rb.json(&body).send().await.context("openai request failed (check network/proxy)")?;
         if !resp.status().is_success() {
             bail!("openai HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default());
         }
@@ -517,7 +526,7 @@ impl CommandCode {
                 "stream": true,
             },
         });
-        let client = reqwest::Client::new();
+        let client = http()?;
         let mut rb = client
             .post(format!("{}/alpha/generate", self.conf.resolved_base()))
             .header("content-type", "application/json")
@@ -528,7 +537,7 @@ impl CommandCode {
         for (k, v) in &self.conf.headers {
             rb = rb.header(k.as_str(), v.as_str());
         }
-        let resp = rb.json(&body).send().await?;
+        let resp = rb.json(&body).send().await.context("commandcode request failed (check network/proxy; base_url should be https://api.commandcode.ai)")?;
         if !resp.status().is_success() {
             bail!("commandcode HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default());
         }

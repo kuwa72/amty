@@ -13,6 +13,8 @@ static JA: &[(&str, &str)] = &[
     ("message (Enter to send, Shift+Enter for newline)", "メッセージ (Enterで送信 / Shift+Enterで改行)"),
     ("send a message to start", "メッセージを送ると会話が始まります"),
     ("already running in this session", "このセッションは実行中です"),
+    ("working…", "処理中…"),
+    ("error:", "エラー:"),
     ("you", "あなた"),
     ("assistant", "アシスタント"),
     // approvals
