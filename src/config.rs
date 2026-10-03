@@ -80,7 +80,7 @@ fn default_true() -> bool {
 }
 
 /// Compatible with Claude Desktop's `mcpServers` entries (stdio transport).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct McpServerConf {
     pub command: String,
     #[serde(default)]

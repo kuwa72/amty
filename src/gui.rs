@@ -107,6 +107,10 @@ pub struct GuiApp {
     mark: egui_commonmark::CommonMarkCache,
     settings: Option<SettingsBuf>,
     show_mcp: bool,
+    /// catalog entry selected for install (id into catalog::CATALOG)
+    cat_sel: Option<&'static str>,
+    /// env field buffers for the selected catalog entry
+    cat_env: HashMap<String, String>,
 }
 
 impl GuiApp {
@@ -130,6 +134,34 @@ impl GuiApp {
             mark: egui_commonmark::CommonMarkCache::default(),
             settings: None,
             show_mcp: false,
+            cat_sel: None,
+            cat_env: HashMap::new(),
+        }
+    }
+
+    /// Install a catalog entry with the env values collected in `cat_env`.
+    /// Mirrors POST /v1/mcp-install without going through HTTP.
+    fn catalog_install(&mut self, id: &'static str) {
+        let fail_lbl = self.tr("save failed:");
+        match crate::catalog::build_conf(id, self.cat_env.clone().into_iter().collect()) {
+            Ok((name, conf)) => {
+                {
+                    let mut cfg = self.app.cfg.write().unwrap();
+                    cfg.mcp_servers.insert(name.clone(), conf);
+                    if let Err(e) = cfg.save(&self.app.cfg_path) {
+                        drop(cfg);
+                        self.toast(format!("{fail_lbl} {e}"));
+                        return;
+                    }
+                }
+                self.app.mcp.update_servers(self.app.mcp_servers_map());
+                let mcp = self.app.mcp.clone();
+                self.rt.spawn(async move { mcp.reconcile().await });
+                self.cat_sel = None;
+                self.cat_env.clear();
+                self.toast(format!("{}{name}", self.tr("installed ")));
+            }
+            Err(e) => self.toast(format!("{}{e}", self.tr("install failed: "))),
         }
     }
 
@@ -436,22 +468,75 @@ impl eframe::App for GuiApp {
 
         if self.show_mcp {
             let lang = self.app.cfg.read().unwrap().lang.clone();
+            let ja = lang == "ja";
             let t = |k: &'static str| crate::i18n::t(&lang, k);
-            egui::Window::new(t("mcp servers")).open(&mut self.show_mcp).show(&ctx, |ui| {
-                for (name, status, enabled) in self.app.mcp.statuses() {
-                    let st = match status {
-                        crate::mcp::Status::Disabled => t("disabled").to_string(),
-                        crate::mcp::Status::Connecting => t("connecting…").to_string(),
-                        crate::mcp::Status::Connected(n) => format!("{n} {}", t("tools")),
-                        crate::mcp::Status::Failed(e) => format!("{} {e}", t("failed:")),
-                    };
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{name}:"));
-                        ui.weak(st);
-                        ui.weak(if enabled { t("enabled") } else { t("off") });
-                    });
-                }
+            let mut install_target: Option<&'static str> = None;
+            egui::Window::new(t("mcp servers")).open(&mut self.show_mcp).default_size([440.0, 380.0]).show(&ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (name, status, enabled) in self.app.mcp.statuses() {
+                        let st = match status {
+                            crate::mcp::Status::Disabled => t("disabled").to_string(),
+                            crate::mcp::Status::Connecting => t("connecting…").to_string(),
+                            crate::mcp::Status::Connected(n) => format!("{n} {}", t("tools")),
+                            crate::mcp::Status::Failed(e) => format!("{} {e}", t("failed:")),
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{name}:"));
+                            ui.weak(st);
+                            ui.weak(if enabled { t("enabled") } else { t("off") });
+                        });
+                    }
+                    ui.separator();
+                    ui.heading(t("catalog"));
+                    if !crate::catalog::node_available() {
+                        ui.colored_label(egui::Color32::from_rgb(255, 200, 80), t("Node.js (npx) is required to install these"));
+                    }
+                    let installed = self.app.cfg.read().unwrap().mcp_servers.clone();
+                    for entry in crate::catalog::CATALOG {
+                        let is_installed = installed.contains_key(entry.id);
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(entry.label).strong());
+                                if is_installed {
+                                    ui.weak(t("installed"));
+                                } else {
+                                    ui.weak(format!("npx {}", entry.package));
+                                    if self.cat_sel == Some(entry.id) {
+                                        if ui.small_button("✕").clicked() {
+                                            self.cat_sel = None;
+                                        }
+                                    } else if ui.button(t("install")).clicked() {
+                                        self.cat_sel = Some(entry.id);
+                                        self.cat_env.clear();
+                                    }
+                                }
+                            });
+                            ui.weak(if ja { entry.desc_ja } else { entry.desc });
+                            if self.cat_sel == Some(entry.id) {
+                                for spec in entry.env {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("{}{}", spec.key, if spec.required { format!(" ({})", t("required")) } else { String::new() }));
+                                        let v = self.cat_env.entry(spec.key.to_string()).or_default();
+                                        ui.add(
+                                            egui::TextEdit::singleline(v)
+                                                .password(spec.secret)
+                                                .desired_width(200.0)
+                                                .hint_text(if ja { spec.hint_ja } else { spec.hint }),
+                                        );
+                                    });
+                                }
+                                ui.weak(format!("{} {}", t("setup:"), if ja { entry.note_ja } else { entry.note }));
+                                if ui.button(format!("{} {}", t("install"), entry.label)).clicked() {
+                                    install_target = Some(entry.id);
+                                }
+                            }
+                        });
+                    }
+                });
             });
+            if let Some(id) = install_target {
+                self.catalog_install(id);
+            }
         }
 
         if self.settings.is_some() {

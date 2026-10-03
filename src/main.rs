@@ -1,6 +1,7 @@
 mod agent;
 mod api;
 mod app;
+mod catalog;
 mod cli;
 mod config;
 mod gui;
@@ -71,6 +72,14 @@ pub enum Cmd {
     },
     /// Show MCP server statuses.
     Mcp,
+    /// List the installable MCP server catalog.
+    Catalog,
+    /// Install an MCP server from the catalog. `amty install notion NOTION_TOKEN=ntn_…`
+    Install {
+        id: String,
+        /// KEY=VALUE env pairs for the server
+        env: Vec<String>,
+    },
     /// Expose the running instance as an MCP server (stdio) for external agents.
     McpServe,
     /// Import mcpServers from claude_desktop_config.json into config.toml.

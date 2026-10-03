@@ -34,6 +34,16 @@ static JA: &[(&str, &str)] = &[
     ("import failed:", "インポートに失敗:"),
     ("save failed:", "保存に失敗:"),
     ("server(s) imported:", "サーバーをインポート:"),
+    // mcp catalog
+    ("catalog", "カタログ"),
+    ("install", "導入"),
+    ("installed", "導入済み"),
+    ("installing…", "導入中…"),
+    ("required", "必須"),
+    ("setup:", "セットアップ:"),
+    ("Node.js (npx) is required to install these", "導入には Node.js (npx) が必要です"),
+    ("installed ", "導入しました: "),
+    ("install failed: ", "導入に失敗: "),
     // settings
     ("settings", "設定"),
     ("providers", "プロバイダ"),

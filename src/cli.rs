@@ -26,24 +26,27 @@ pub fn client(token: &str) -> reqwest::Client {
         .unwrap()
 }
 
+async fn err_body(resp: reqwest::Response) -> Result<Value> {
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        // error bodies may be plain text (axum tuple errors) or json
+        match serde_json::from_str::<Value>(&text) {
+            Ok(v) => bail!("HTTP {status}: {v}"),
+            Err(_) => bail!("HTTP {status}: {text}"),
+        }
+    }
+    Ok(serde_json::from_str(&text).unwrap_or(json!(null)))
+}
+
 pub async fn get(base: &str, token: &str, path: &str) -> Result<Value> {
     let resp = client(token).get(format!("{base}{path}")).send().await?;
-    let status = resp.status();
-    let v: Value = resp.json().await.unwrap_or(json!(null));
-    if !status.is_success() {
-        bail!("HTTP {status}: {v}");
-    }
-    Ok(v)
+    err_body(resp).await
 }
 
 pub async fn post(base: &str, token: &str, path: &str, body: Value) -> Result<Value> {
     let resp = client(token).post(format!("{base}{path}")).json(&body).send().await?;
-    let status = resp.status();
-    let v: Value = resp.json().await.unwrap_or(json!(null));
-    if !status.is_success() {
-        bail!("HTTP {status}: {v}");
-    }
-    Ok(v)
+    err_body(resp).await
 }
 
 pub async fn delete(base: &str, token: &str, path: &str) -> Result<Value> {
@@ -180,6 +183,34 @@ pub async fn run(cmd: crate::Cmd) -> Result<()> {
         Mcp => {
             let (base, tok) = runtime_info()?;
             print_json(&get(&base, &tok, "/v1/mcp").await?);
+        }
+        Catalog => {
+            let (base, tok) = runtime_info()?;
+            let v = get(&base, &tok, "/v1/mcp-catalog").await?;
+            if !v["node_available"].as_bool().unwrap_or(false) {
+                eprintln!("note: Node.js (npx) not found on PATH");
+            }
+            if let Some(arr) = v["entries"].as_array() {
+                for e in arr {
+                    let mark = if e["installed"].as_bool().unwrap_or(false) { "✓" } else { " " };
+                    println!("{mark} {:10} {}\n    pkg: npx -y {}", e["id"].as_str().unwrap_or(""), e["label"].as_str().unwrap_or(""), e["package"].as_str().unwrap_or(""));
+                    if let Some(envs) = e["env"].as_array() {
+                        for ev in envs {
+                            let req = if ev["required"].as_bool().unwrap_or(false) { " (required)" } else { "" };
+                            println!("    env: {}{}", ev["key"].as_str().unwrap_or(""), req);
+                        }
+                    }
+                }
+            }
+        }
+        Install { id, env } => {
+            let (base, tok) = runtime_info()?;
+            let env_map: serde_json::Map<String, Value> = env
+                .iter()
+                .filter_map(|kv| kv.split_once('='))
+                .map(|(k, v)| (k.to_string(), json!(v)))
+                .collect();
+            print_json(&post(&base, &tok, "/v1/mcp-install", json!({"id": id, "env": env_map})).await?);
         }
     }
     Ok(())

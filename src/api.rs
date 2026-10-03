@@ -30,6 +30,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/approvals/{id}", post(resolve_approval))
         .route("/v1/mcp", get(mcp_status).post(mcp_add))
         .route("/v1/mcp/{name}", post(mcp_toggle))
+        .route("/v1/mcp-catalog", get(mcp_catalog))
+        .route("/v1/mcp-install", post(mcp_install))
         .layer(middleware::from_fn_with_state(app.clone(), auth))
         .with_state(app)
 }
@@ -276,6 +278,48 @@ async fn mcp_add(
 #[derive(Deserialize)]
 struct ToggleBody {
     enabled: bool,
+}
+
+async fn mcp_catalog(State(app): State<Arc<App>>) -> Json<Value> {
+    let installed = app.cfg.read().unwrap().mcp_servers.clone();
+    Json(json!({
+        "node_available": crate::catalog::node_available(),
+        "entries": crate::catalog::rows(&installed),
+    }))
+}
+
+#[derive(Deserialize)]
+struct InstallBody {
+    id: String,
+    #[serde(default)]
+    env: std::collections::BTreeMap<String, String>,
+    /// override the server name in config (default: catalog id)
+    name: Option<String>,
+}
+
+async fn mcp_install(
+    State(app): State<Arc<App>>,
+    Json(b): Json<InstallBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let (def_name, conf) = crate::catalog::build_conf(&b.id, b.env)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let name = b.name.unwrap_or(def_name);
+    {
+        let mut cfg = app.cfg.write().unwrap();
+        cfg.mcp_servers.insert(name.clone(), conf);
+        cfg.save(&app.cfg_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+    app.mcp.update_servers(app.mcp_servers_map());
+    app.mcp.reconcile().await;
+    let status = app
+        .mcp
+        .statuses()
+        .into_iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|(_, s, _)| format!("{s:?}"))
+        .unwrap_or_default();
+    app.emit("", EvKind::Touched);
+    Ok(Json(json!({"installed": name, "status": status})))
 }
 
 async fn mcp_toggle(

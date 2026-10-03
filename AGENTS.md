@@ -15,6 +15,8 @@ App core (src/app.rs)           -- config, sessions, approvals, event broadcast
   |                               key from ~/.commandcode/auth.json)
   |- builtin tools (src/tools.rs) -- fs_read/fs_list/fs_write/fs_edit/shell/config_*/mcp
   |- MCP client (src/mcp.rs)    -- stdio JSON-RPC, tools exposed as mcp__<srv>__<tool>
+  |- MCP catalog (src/catalog.rs) -- curated `npx -y` servers (notion/slack/gmail/
+  |                               gdrive/gdocs); GUI one-click install + env form
   |
 Control API (src/api.rs)        -- axum on 127.0.0.1:<ephemeral>, Bearer token.
                                    port+token in $XDG_DATA_HOME/amty/runtime.json
@@ -46,6 +48,8 @@ cargo build --release
 ./target/debug/amty status       # requires a running instance
 ./target/debug/amty send "hi"    # most recent session; --new, -s <id>, --no-wait
 ./target/debug/amty mcp-serve    # stdio MCP server for external agents
+./target/debug/amty catalog      # list installable MCP servers
+./target/debug/amty install notion NOTION_TOKEN=ntn_…   # catalog install via API
 
 # Windows native binary (cross-compiled from WSL; needs mingw-w64 + cmake):
 cargo build --release --target x86_64-pc-windows-gnu
@@ -74,6 +78,11 @@ cargo build --release --target x86_64-pc-windows-gnu
 - Japanese IME works on macOS/Windows native, NOT under WSLg (no
   `text_input_v3` in the WSLg compositor). On WSL use paste or `amty send`.
 - MCP client supports stdio transport only (no streamable-HTTP servers yet).
+- Catalog installs need Node.js/npx on PATH. On Windows the conf is written as
+  `cmd /c npx -y <pkg>` because npx is a .cmd shim. First-run downloads are
+  slow — MCP handshake timeout is 120 s. Google-family servers still need a
+  manual OAuth step (see each entry's note in src/catalog.rs); a failed start
+  surfaces the server's stderr tail in the status.
 - Anthropic provider needs `ANTHROPIC_API_KEY`; OAuth token heuristic is minimal.
 - No token accounting, retries/backoff, or prompt caching yet.
 - macOS packaging (.app bundle, signing) not set up; `cargo build` on macOS works.

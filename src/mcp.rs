@@ -18,6 +18,8 @@ struct Rpc {
     next: AtomicU64,
     tx: mpsc::UnboundedSender<Value>,
     child: Mutex<Child>,
+    /// last bytes of the server's stderr — included in failure status
+    stderr_tail: Arc<Mutex<String>>,
 }
 
 impl Rpc {
@@ -27,11 +29,31 @@ impl Rpc {
             .envs(&conf.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = cmd.spawn().context(format!("spawn '{}'", conf.command))?;
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+        let stderr_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        if let Some(stderr) = child.stderr.take() {
+            let tail = stderr_tail.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut rdr = BufReader::new(stderr);
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = rdr.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let mut t = tail.lock().unwrap();
+                    t.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if t.len() > 4096 {
+                        let cut = t.len() - 4096;
+                        t.drain(..cut);
+                    }
+                }
+            });
+        }
         let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -84,7 +106,7 @@ impl Rpc {
             }
         });
 
-        Ok(Arc::new(Self { pending, next: AtomicU64::new(1), tx, child: Mutex::new(child) }))
+        Ok(Arc::new(Self { pending, next: AtomicU64::new(1), tx, child: Mutex::new(child), stderr_tail }))
     }
 
     async fn call(&self, method: &str, params: Value, timeout_s: u64) -> Result<Value> {
@@ -116,7 +138,7 @@ struct Client {
     tools: Vec<(String, ToolSpec)>, // (original_name, spec with mcp__ prefix)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Status {
     Disabled,
     Connecting,
@@ -156,11 +178,22 @@ impl Manager {
     }
 
     pub fn update_servers(&self, servers: HashMap<String, McpServerConf>) {
-        // drop clients whose conf changed or was removed
+        // drop clients whose conf changed or was removed/disabled
         let mut clients = self.clients.lock().unwrap();
         clients.retain(|name, _| {
             servers.get(name).map(|s| s.enabled).unwrap_or(false)
         });
+        // re-check conf equality: force reconnect when the def changed
+        let defs = self.servers.lock().unwrap();
+        let changed: Vec<String> = defs
+            .iter()
+            .filter(|(n, old)| servers.get(*n).map(|new| new != *old).unwrap_or(false))
+            .map(|(n, _)| n.clone())
+            .collect();
+        drop(defs);
+        for n in changed {
+            clients.remove(&n);
+        }
         *self.servers.lock().unwrap() = servers;
     }
 
@@ -202,7 +235,18 @@ impl Manager {
     }
 
     async fn handshake(conf: McpServerConf) -> Result<Client> {
+        // npx -y downloads the package on first run — allow ample time
+        const INIT_TIMEOUT: u64 = 120;
         let rpc = Rpc::spawn(conf)?;
+        // attach the server's stderr tail so config/setup errors are visible
+        let with_err = |e: anyhow::Error| -> anyhow::Error {
+            let tail = rpc.stderr_tail.lock().unwrap().trim().to_string();
+            if tail.is_empty() {
+                e
+            } else {
+                e.context(format!("stderr: {}", tail.chars().take(600).collect::<String>()))
+            }
+        };
         rpc.call(
             "initialize",
             json!({
@@ -210,9 +254,10 @@ impl Manager {
                 "capabilities": {},
                 "clientInfo": {"name": "amty", "version": env!("CARGO_PKG_VERSION")},
             }),
-            20,
+            INIT_TIMEOUT,
         )
-        .await?;
+        .await
+        .map_err(with_err)?;
         let _ = rpc.tx.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
         let mut tools = vec![];
         let mut cursor = Value::Null;
@@ -221,7 +266,7 @@ impl Manager {
             if !cursor.is_null() {
                 params["cursor"] = cursor.clone();
             }
-            let res = rpc.call("tools/list", params, 20).await?;
+            let res = rpc.call("tools/list", params, 30).await.map_err(with_err)?;
             if let Some(list) = res["tools"].as_array() {
                 for t in list {
                     let name = t["name"].as_str().unwrap_or("").to_string();
