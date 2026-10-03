@@ -268,6 +268,12 @@ impl App {
                 }
             })
         };
+        if spec.needs_client && conf.oauth_client_id.as_deref().unwrap_or("").is_empty() {
+            anyhow::bail!(
+                "{id}: no OAuth client id — install the catalog entry first (fill OAUTH_CLIENT_ID/SECRET), \
+                 or set 'oauth client id/secret' in Settings → MCP"
+            );
+        }
         self.auth.lock().unwrap().insert(id.to_string(), AuthRun { running: true, log: log.clone() });
         let app = self.clone();
         let id_s = id.to_string();

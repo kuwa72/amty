@@ -197,7 +197,8 @@ pub async fn authorize(
     let mut client_secret = conf.oauth_client_secret.clone();
     if client_id.is_empty() {
         let Some(reg) = reg_url.clone() else {
-            bail!("no client_id configured and server does not support dynamic registration");
+            bail!("no OAuth client id configured and this server has no dynamic registration — \
+                   set 'oauth client id' in Settings → MCP");
         };
         logf(format!("registering oauth client at {reg}"));
         let http = reqwest::Client::new();
