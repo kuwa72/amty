@@ -229,9 +229,9 @@ pub async fn execute(app: &App, name: &str, input: &Value) -> Result<String, Str
         "shell" => {
             let command = input["command"].as_str().ok_or("command required")?;
             let timeout = input["timeout"].as_u64().unwrap_or(60).clamp(1, 300);
-            let (prog, flag) = shell_prog();
+            let (prog, flag, command) = wrap_shell(command);
             let mut cmd = tokio::process::Command::new(prog);
-            cmd.args([flag, command]);
+            cmd.args([flag, &command]);
             if let Some(wd) = input["workdir"].as_str() {
                 cmd.current_dir(wd);
             }
@@ -304,14 +304,17 @@ pub async fn execute(app: &App, name: &str, input: &Value) -> Result<String, Str
     }
 }
 
+/// Returns (program, flag, wrapped command). On Windows, force UTF-8 output —
+/// cmd.exe otherwise answers in the OEM codepage (cp932 on ja-JP), which
+/// shows up as mojibake both in tool results and in the model's context.
 #[cfg(unix)]
-fn shell_prog() -> (&'static str, &'static str) {
-    ("/bin/sh", "-c")
+fn wrap_shell(command: &str) -> (&'static str, &'static str, String) {
+    ("/bin/sh", "-c", command.to_string())
 }
 
 #[cfg(windows)]
-fn shell_prog() -> (&'static str, &'static str) {
-    ("cmd", "/C")
+fn wrap_shell(command: &str) -> (&'static str, &'static str, String) {
+    ("cmd", "/C", format!("chcp 65001 >nul & {command}"))
 }
 
 #[cfg(test)]

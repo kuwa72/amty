@@ -124,12 +124,24 @@ async fn run_inner(app: &Arc<App>, sid: &str, text: String) -> Result<()> {
 
         // execute tools, collect results
         let mut results = vec![];
+        // (name, input) -> (content, is_error) — identical calls in one turn
+        // run once and share the result; models sometimes emit exact dupes
+        let mut seen: std::collections::HashMap<String, (String, bool)> = std::collections::HashMap::new();
         for b in tool_uses {
             if cancelled() {
                 app.emit(sid, EvKind::Error { message: "cancelled".into() });
                 return Ok(());
             }
             let Block::ToolUse { id, name, input } = b else { continue };
+            let dup_key = format!("{name}\u{1}{input}");
+            if let Some((content, is_error)) = seen.get(&dup_key) {
+                results.push(Block::ToolResult {
+                    tool_use_id: id,
+                    content: format!("(deduplicated: identical call already ran)\n{content}"),
+                    is_error: *is_error,
+                });
+                continue;
+            }
             let detail = tools::summarize(&name, &input);
             app.emit(sid, EvKind::ToolStart { name: name.clone(), detail: detail.clone() });
 
@@ -155,10 +167,12 @@ async fn run_inner(app: &Arc<App>, sid: &str, text: String) -> Result<()> {
                         ok: true,
                         preview: preview(&text),
                     });
+                    seen.insert(dup_key, (text.clone(), false));
                     results.push(Block::ToolResult { tool_use_id: id, content: text, is_error: false });
                 }
                 Err(e) => {
                     app.emit(sid, EvKind::ToolEnd { name: name.clone(), ok: false, preview: preview(&e) });
+                    seen.insert(dup_key, (e.clone(), true));
                     results.push(Block::ToolResult { tool_use_id: id, content: e, is_error: true });
                 }
             }
