@@ -179,6 +179,10 @@ impl GuiApp {
         self.toast = Some((msg.into(), Instant::now()));
     }
 
+    fn tr(&self, key: &'static str) -> &'static str {
+        crate::i18n::t(&self.app.cfg.read().unwrap().lang, key)
+    }
+
     fn ensure_session(&mut self) -> String {
         if self.current.is_empty() {
             self.current = self.app.sessions.create(None, None);
@@ -236,7 +240,7 @@ impl eframe::App for GuiApp {
         egui::Panel::left("side").min_size(200.0).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("amty");
-                if ui.button("＋ new").clicked() {
+                if ui.button(self.tr("＋ new")).clicked() {
                     self.current = self.app.sessions.create(None, None);
                     self.view_dirty = true;
                 }
@@ -258,7 +262,7 @@ impl eframe::App for GuiApp {
             let (prov, model) = self.session_provider();
             let names: Vec<String> = self.app.cfg.read().unwrap().providers.keys().cloned().collect();
             let mut sel = prov.clone();
-            egui::ComboBox::from_label("provider")
+            egui::ComboBox::from_label(self.tr("provider"))
                 .selected_text(&sel)
                 .show_ui(ui, |ui| {
                     for n in &names {
@@ -271,17 +275,31 @@ impl eframe::App for GuiApp {
                 self.view_dirty = true;
             }
             ui.horizontal(|ui| {
-                ui.label("model");
+                ui.label(self.tr("model"));
                 let mut m = model.clone();
-                if ui.add(egui::TextEdit::singleline(&mut m).desired_width(120.0)).lost_focus() && m != model {
+                if ui.add(egui::TextEdit::singleline(&mut m).desired_width(150.0)).lost_focus() && m != model {
                     let sid = self.ensure_session();
                     self.app.sessions.set_fields(&sid, None, Some(m));
                     self.view_dirty = true;
                 }
+                let kind = self.app.cfg.read().unwrap().providers.get(&prov).map(|p| p.kind);
+                let suggestions = kind.map(crate::provider::model_suggestions).unwrap_or_default();
+                if !suggestions.is_empty() {
+                    ui.menu_button("▾", |ui| {
+                        for s in suggestions {
+                            if ui.button(&s).clicked() {
+                                let sid = self.ensure_session();
+                                self.app.sessions.set_fields(&sid, None, Some(s));
+                                self.view_dirty = true;
+                                ui.close();
+                            }
+                        }
+                    });
+                }
             });
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("⚙ settings").clicked() {
+                if ui.button(self.tr("⚙ settings")).clicked() {
                     if self.settings.is_none() {
                         let cfg = self.app.cfg.read().unwrap().clone();
                         self.settings = Some(SettingsBuf {
@@ -293,7 +311,7 @@ impl eframe::App for GuiApp {
                         });
                     }
                 }
-                if ui.button("mcp").clicked() {
+                if ui.button(self.tr("mcp")).clicked() {
                     self.show_mcp = !self.show_mcp;
                 }
             });
@@ -304,11 +322,12 @@ impl eframe::App for GuiApp {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let w = (ui.available_width() - 90.0).max(100.0);
+                let hint = self.tr("message (Enter to send, Shift+Enter for newline)");
                 let resp = ui.add_sized(
                     [w, 64.0],
-                    egui::TextEdit::multiline(&mut self.input).hint_text("message (Enter to send, Shift+Enter for newline)"),
+                    egui::TextEdit::multiline(&mut self.input).hint_text(hint),
                 );
-                let mut do_send = ui.button("send").clicked();
+                let mut do_send = ui.button(self.tr("send")).clicked();
                 let ime = ui.ctx().input(|i| {
                     i.events.iter().any(|e| matches!(e, egui::Event::Ime(_)))
                         || i.raw.events.iter().any(|e| matches!(e, egui::Event::Ime(_)))
@@ -324,7 +343,7 @@ impl eframe::App for GuiApp {
                     resp.request_focus();
                 }
                 let running = *self.running.get(&self.current).unwrap_or(&false);
-                if running && ui.button("stop").clicked() {
+                if running && ui.button(self.tr("stop")).clicked() {
                     self.app.cancel(&self.current);
                 }
             });
@@ -353,16 +372,17 @@ impl eframe::App for GuiApp {
             });
             ui.separator();
             egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+                let lang = self.app.cfg.read().unwrap().lang.clone();
                 if let Some(s) = self.view.clone() {
                     for msg in &s.messages {
-                        render_message(ui, &mut self.mark, msg);
+                        render_message(ui, &mut self.mark, msg, &lang);
                     }
                 } else {
-                    ui.weak("send a message to start");
+                    ui.weak(self.tr("send a message to start"));
                 }
                 if let Some(t) = self.live_text.get(&self.current) {
                     if !t.is_empty() {
-                        ui.colored_label(ui.visuals().weak_text_color(), "assistant");
+                        ui.colored_label(ui.visuals().weak_text_color(), self.tr("assistant"));
                         egui_commonmark::CommonMarkViewer::new().show(ui, &mut self.mark, t);
                     }
                 }
@@ -372,16 +392,16 @@ impl eframe::App for GuiApp {
         // ----- approvals -----
         let mut resolved: Vec<(String, bool)> = vec![];
         for p in &self.pending {
-            egui::Window::new(format!("approve: {}", p.tool))
+            egui::Window::new(format!("{} {}", self.tr("approve:"), p.tool))
                 .collapsible(false)
                 .resizable(false)
                 .show(&ctx, |ui| {
                     ui.label(&p.detail);
                     ui.horizontal(|ui| {
-                        if ui.button("allow").clicked() {
+                        if ui.button(self.tr("allow")).clicked() {
                             resolved.push((p.id.clone(), true));
                         }
-                        if ui.button("deny").clicked() {
+                        if ui.button(self.tr("deny")).clicked() {
                             resolved.push((p.id.clone(), false));
                         }
                     });
@@ -393,18 +413,20 @@ impl eframe::App for GuiApp {
         }
 
         if self.show_mcp {
-            egui::Window::new("mcp servers").open(&mut self.show_mcp).show(&ctx, |ui| {
+            let lang = self.app.cfg.read().unwrap().lang.clone();
+            let t = |k: &'static str| crate::i18n::t(&lang, k);
+            egui::Window::new(t("mcp servers")).open(&mut self.show_mcp).show(&ctx, |ui| {
                 for (name, status, enabled) in self.app.mcp.statuses() {
                     let st = match status {
-                        crate::mcp::Status::Disabled => "disabled".to_string(),
-                        crate::mcp::Status::Connecting => "connecting…".to_string(),
-                        crate::mcp::Status::Connected(n) => format!("{n} tools"),
-                        crate::mcp::Status::Failed(e) => format!("failed: {e}"),
+                        crate::mcp::Status::Disabled => t("disabled").to_string(),
+                        crate::mcp::Status::Connecting => t("connecting…").to_string(),
+                        crate::mcp::Status::Connected(n) => format!("{n} {}", t("tools")),
+                        crate::mcp::Status::Failed(e) => format!("{} {e}", t("failed:")),
                     };
                     ui.horizontal(|ui| {
                         ui.label(format!("{name}:"));
                         ui.weak(st);
-                        ui.weak(if enabled { "enabled" } else { "off" });
+                        ui.weak(if enabled { t("enabled") } else { t("off") });
                     });
                 }
             });
@@ -415,18 +437,19 @@ impl eframe::App for GuiApp {
             let mut open = true;
             let mut save = false;
             let mut import = false;
-            settings_window(&ctx, &mut open, &mut buf, &mut save, &mut import);
+            let lang = self.app.cfg.read().unwrap().lang.clone();
+            settings_window(&ctx, &lang, &mut open, &mut buf, &mut save, &mut import);
             if import {
                 match crate::config::import_claude(&mut buf.cfg) {
-                    Ok(added) => self.toast(format!("imported {} server(s): {}", added.len(), added.join(", "))),
-                    Err(e) => self.toast(format!("import failed: {e}")),
+                    Ok(added) => self.toast(format!("{} {}", added.len(), self.tr("server(s) imported:"))),
+                    Err(e) => self.toast(format!("{} {e}", self.tr("import failed:"))),
                 }
             }
             if save {
                 {
                     *self.app.cfg.write().unwrap() = buf.cfg.clone();
                     if let Err(e) = buf.cfg.save(&self.app.cfg_path) {
-                        self.toast(format!("save failed: {e}"));
+                        self.toast(format!("{} {e}", self.tr("save failed:")));
                     }
                 }
                 let servers = self
@@ -442,7 +465,7 @@ impl eframe::App for GuiApp {
                 let mcp = self.app.mcp.clone();
                 self.rt.spawn(async move { mcp.reconcile().await });
                 self.view_dirty = true;
-                self.toast("saved");
+                self.toast(self.tr("saved"));
             }
             if open {
                 self.settings = Some(buf);
@@ -451,10 +474,11 @@ impl eframe::App for GuiApp {
     }
 }
 
-fn render_message(ui: &mut egui::Ui, mark: &mut egui_commonmark::CommonMarkCache, msg: &crate::types::ChatMessage) {
+fn render_message(ui: &mut egui::Ui, mark: &mut egui_commonmark::CommonMarkCache, msg: &crate::types::ChatMessage, lang: &str) {
+    let t = |k: &'static str| crate::i18n::t(lang, k);
     let (label, color) = match msg.role {
-        Role::User => ("you", egui::Color32::from_rgb(120, 180, 255)),
-        Role::Assistant => ("assistant", egui::Color32::from_rgb(160, 220, 160)),
+        Role::User => (t("you"), egui::Color32::from_rgb(120, 180, 255)),
+        Role::Assistant => (t("assistant"), egui::Color32::from_rgb(160, 220, 160)),
     };
     let is_tool_msg = msg.blocks.iter().all(|b| matches!(b, Block::ToolResult { .. }));
     if !is_tool_msg {
@@ -475,7 +499,7 @@ fn render_message(ui: &mut egui::Ui, mark: &mut egui_commonmark::CommonMarkCache
                     });
             }
             Block::ToolResult { content, is_error, .. } => {
-                let head = if *is_error { "✗ result (error)" } else { "✓ result" };
+                let head = if *is_error { t("✗ result (error)") } else { t("✓ result") };
                 egui::CollapsingHeader::new(head)
                     .id_salt(format!("tr_{}", content.as_ptr() as usize))
                     .show(ui, |ui| {
@@ -488,10 +512,22 @@ fn render_message(ui: &mut egui::Ui, mark: &mut egui_commonmark::CommonMarkCache
     ui.add_space(8.0);
 }
 
-fn settings_window(ctx: &egui::Context, open: &mut bool, buf: &mut SettingsBuf, save: &mut bool, import: &mut bool) {
-    egui::Window::new("settings").open(open).default_size([560.0, 480.0]).show(ctx, |ui| {
+fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut SettingsBuf, save: &mut bool, import: &mut bool) {
+    let t = |k: &'static str| crate::i18n::t(lang, k);
+    egui::Window::new(t("settings")).open(open).default_size([560.0, 480.0]).show(ctx, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.heading("providers");
+            ui.horizontal(|ui| {
+                ui.label(t("language:"));
+                egui::ComboBox::from_id_salt("lang")
+                    .selected_text(&buf.cfg.lang)
+                    .show_ui(ui, |ui| {
+                        for l in crate::i18n::LANGS {
+                            ui.selectable_value(&mut buf.cfg.lang, l.to_string(), *l);
+                        }
+                    });
+            });
+            ui.separator();
+            ui.heading(t("providers"));
             ui.horizontal(|ui| {
                 for name in buf.cfg.providers.keys().cloned().collect::<Vec<_>>() {
                     if ui.selectable_label(buf.sel_provider == name, &name).clicked() {
@@ -500,7 +536,7 @@ fn settings_window(ctx: &egui::Context, open: &mut bool, buf: &mut SettingsBuf, 
                 }
             });
             ui.horizontal(|ui| {
-                ui.label("add:");
+                ui.label(t("add:"));
                 ui.text_edit_singleline(&mut buf.new_provider);
                 if ui.button("＋").clicked() && !buf.new_provider.trim().is_empty() {
                     let name = buf.new_provider.trim().to_string();
@@ -561,7 +597,7 @@ fn settings_window(ctx: &egui::Context, open: &mut bool, buf: &mut SettingsBuf, 
             }
             ui.separator();
             ui.horizontal(|ui| {
-                ui.label("default provider:");
+                ui.label(t("default provider:"));
                 let names: Vec<String> = buf.cfg.providers.keys().cloned().collect();
                 egui::ComboBox::from_id_salt("defp").selected_text(&buf.cfg.provider).show_ui(ui, |ui| {
                     for n in names {
@@ -571,7 +607,7 @@ fn settings_window(ctx: &egui::Context, open: &mut bool, buf: &mut SettingsBuf, 
             });
 
             ui.separator();
-            ui.heading("mcp servers");
+            ui.heading(t("mcp servers"));
             for name in buf.cfg.mcp_servers.keys().cloned().collect::<Vec<_>>() {
                 ui.horizontal(|ui| {
                     let mut en = buf.cfg.mcp_servers.get(&name).map(|s| s.enabled).unwrap_or(false);
@@ -592,7 +628,7 @@ fn settings_window(ctx: &egui::Context, open: &mut bool, buf: &mut SettingsBuf, 
                 });
             }
             ui.horizontal(|ui| {
-                ui.label("add:");
+                ui.label(t("add:"));
                 ui.text_edit_singleline(&mut buf.new_mcp);
                 if ui.button("＋").clicked() && !buf.new_mcp.trim().is_empty() {
                     let name = buf.new_mcp.trim().to_string();
@@ -610,16 +646,16 @@ fn settings_window(ctx: &egui::Context, open: &mut bool, buf: &mut SettingsBuf, 
                 if let Some(s) = buf.cfg.mcp_servers.get_mut(&name) {
                     ui.group(|ui| {
                         egui::Grid::new("mgrid").num_columns(2).show(ui, |ui| {
-                            ui.label("command");
+                            ui.label(t("command"));
                             ui.text_edit_singleline(&mut s.command);
                             ui.end_row();
-                            ui.label("args (space sep)");
+                            ui.label(t("args (space sep)"));
                             let mut a = s.args.join(" ");
                             if ui.text_edit_singleline(&mut a).changed() {
                                 s.args = a.split_whitespace().map(String::from).collect();
                             }
                             ui.end_row();
-                            ui.label("env (K=V per line)");
+                            ui.label(t("env (K=V per line)"));
                             let mut e = s.env.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("\n");
                             if ui.add(egui::TextEdit::multiline(&mut e).desired_rows(3)).changed() {
                                 s.env = e.lines().filter_map(|l| l.split_once('=')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect();
@@ -630,9 +666,9 @@ fn settings_window(ctx: &egui::Context, open: &mut bool, buf: &mut SettingsBuf, 
                 }
             }
             ui.separator();
-            ui.heading("behavior");
+            ui.heading(t("behavior"));
             ui.horizontal(|ui| {
-                ui.label("approval:");
+                ui.label(t("approval:"));
                 egui::ComboBox::from_id_salt("ap")
                     .selected_text(match buf.cfg.approval {
                         ApprovalMode::Ask => "ask",
@@ -645,25 +681,25 @@ fn settings_window(ctx: &egui::Context, open: &mut bool, buf: &mut SettingsBuf, 
                         ui.selectable_value(&mut buf.cfg.approval, ApprovalMode::Allowlist, "allowlist");
                     });
             });
-            ui.label("allowed command prefixes (one per line):");
+            ui.label(t("allowed command prefixes (one per line):"));
             let mut ac = buf.cfg.allow_commands.join("\n");
             if ui.add(egui::TextEdit::multiline(&mut ac).desired_rows(3).desired_width(400.0)).changed() {
                 buf.cfg.allow_commands = ac.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
             }
-            ui.label("allowed write paths (one per line):");
+            ui.label(t("allowed write paths (one per line):"));
             let mut ap = buf.cfg.allow_paths.join("\n");
             if ui.add(egui::TextEdit::multiline(&mut ap).desired_rows(3).desired_width(400.0)).changed() {
                 buf.cfg.allow_paths = ap.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
             }
-            ui.label("system prompt:");
+            ui.label(t("system prompt:"));
             ui.add(egui::TextEdit::multiline(&mut buf.cfg.system_prompt).desired_rows(4).desired_width(520.0));
         });
         ui.separator();
         ui.horizontal(|ui| {
-            if ui.button("import Claude Desktop mcpServers").clicked() {
+            if ui.button(t("import Claude Desktop mcpServers")).clicked() {
                 *import = true;
             }
-            if ui.button("save").clicked() {
+            if ui.button(t("save")).clicked() {
                 *save = true;
             }
         });

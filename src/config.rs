@@ -94,7 +94,8 @@ pub struct McpServerConf {
 pub const DEFAULT_SYSTEM: &str = "You are amty, a lightweight desktop AI agent. \
 You can read/write files, run shell commands, and change this app's own settings \
 through the provided tools. Ask before destructive actions unless the user already \
-approved them. Keep answers concise.";
+approved them. Keep answers concise. Always reply in the same language the user \
+writes in.";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -107,6 +108,8 @@ pub struct Config {
     /// Path prefixes writable without asking (allowlist mode).
     pub allow_paths: Vec<String>,
     pub system_prompt: String,
+    /// UI language: "en" | "ja".
+    pub lang: String,
     pub providers: BTreeMap<String, ProviderConf>,
     /// Same shape as claude_desktop_config.json `mcpServers`.
     pub mcp_servers: BTreeMap<String, McpServerConf>,
@@ -156,6 +159,7 @@ impl Default for Config {
             allow_commands: vec!["ls".into(), "pwd".into(), "git status".into()],
             allow_paths: vec![],
             system_prompt: DEFAULT_SYSTEM.into(),
+            lang: "ja".into(),
             providers,
             mcp_servers: BTreeMap::new(),
         }
@@ -248,6 +252,13 @@ impl Config {
                 self.system_prompt = value.into();
                 Ok("system_prompt updated".into())
             }
+            "lang" => {
+                if !crate::i18n::LANGS.contains(&value) {
+                    bail!("lang must be one of: {}", crate::i18n::LANGS.join(", "));
+                }
+                self.lang = value.into();
+                Ok(format!("lang = {value}"))
+            }
             "allow_commands" | "allow_paths" | "+allow_commands" | "+allow_paths" => {
                 let (append, field) = if key.starts_with('+') {
                     (true, &key[1..])
@@ -300,6 +311,7 @@ impl Config {
             "model" => Ok(self.providers.get(&self.provider).map(|p| p.model.clone()).unwrap_or_default()),
             "approval" => Ok(format!("{:?}", self.approval).to_lowercase()),
             "system_prompt" => Ok(self.system_prompt.clone()),
+            "lang" => Ok(self.lang.clone()),
             "allow_commands" => Ok(self.allow_commands.join(", ")),
             "allow_paths" => Ok(self.allow_paths.join(", ")),
             "providers" => Ok(self.providers.keys().cloned().collect::<Vec<_>>().join(", ")),

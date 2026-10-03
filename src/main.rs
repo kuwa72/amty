@@ -4,6 +4,7 @@ mod app;
 mod cli;
 mod config;
 mod gui;
+mod i18n;
 mod mcp;
 mod mcp_serve;
 mod provider;

@@ -592,6 +592,48 @@ impl CommandCode {
     }
 }
 
+/// Known model ids for the model picker. Command Code is enumerated live via
+/// `cmdc --list-models` (cached); other providers use a static shortlist —
+/// the field stays free-text so anything works.
+pub fn model_suggestions(kind: crate::config::ProviderKind) -> Vec<String> {
+    use crate::config::ProviderKind as K;
+    match kind {
+        K::CommandCode => cmdc_models().to_vec(),
+        K::Anthropic => [
+            "claude-sonnet-4-5",
+            "claude-opus-4-1",
+            "claude-haiku-4-5",
+            "claude-sonnet-4-0",
+        ].iter().map(|s| s.to_string()).collect(),
+        K::OpenAi => [
+            "gpt-5", "gpt-5-mini", "gpt-5-nano", "o4-mini",
+        ].iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+fn cmdc_models() -> &'static [String] {
+    static V: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        let out = std::process::Command::new("cmdc")
+            .arg("--list-models")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        let mut models: Vec<String> = out
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .filter(|tok| tok.contains('/') || tok.starts_with("claude-") || tok.starts_with("gpt-"))
+            .filter(|tok| tok.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.')))
+            .map(String::from)
+            .collect();
+        if models.is_empty() {
+            models.push("deepseek/deepseek-v4-flash".into());
+        }
+        models
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
