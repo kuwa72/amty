@@ -105,8 +105,13 @@ fn random_verifier() -> String {
 }
 
 fn open_browser(url: &str) -> Result<()> {
+    // `cmd /c start` would split the URL at every unquoted '&' (query params
+    // get eaten as command separators) — rundll32 opens the default browser
+    // without any shell parsing.
     #[cfg(target_os = "windows")]
-    let r = std::process::Command::new("cmd").args(["/c", "start", "", url]).spawn();
+    let r = std::process::Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", url])
+        .spawn();
     #[cfg(target_os = "macos")]
     let r = std::process::Command::new("open").arg(url).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
