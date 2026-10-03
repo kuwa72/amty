@@ -46,6 +46,11 @@ cargo build --release
 ./target/debug/amty status       # requires a running instance
 ./target/debug/amty send "hi"    # most recent session; --new, -s <id>, --no-wait
 ./target/debug/amty mcp-serve    # stdio MCP server for external agents
+
+# Windows native binary (cross-compiled from WSL; needs mingw-w64 + cmake):
+cargo build --release --target x86_64-pc-windows-gnu
+# -> target/x86_64-pc-windows-gnu/release/amty.exe  (~18 MB, static, no DLLs)
+# config on Windows: %APPDATA%\amty\config.toml
 ```
 
 ## Conventions
@@ -66,6 +71,8 @@ cargo build --release
   `x-command-code-version` header — amty detects it via `cmdc --version`.
   Model ids are like `deepseek/deepseek-v4-flash` or `kimi-k2.5`
   (see `cmdc --list-models`).
+- Japanese IME works on macOS/Windows native, NOT under WSLg (no
+  `text_input_v3` in the WSLg compositor). On WSL use paste or `amty send`.
 - MCP client supports stdio transport only (no streamable-HTTP servers yet).
 - Anthropic provider needs `ANTHROPIC_API_KEY`; OAuth token heuristic is minimal.
 - No token accounting, retries/backoff, or prompt caching yet.
