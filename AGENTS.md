@@ -14,9 +14,15 @@ App core (src/app.rs)           -- config, sessions, approvals, event broadcast
   |                             + Command Code (POST /alpha/generate, NDJSON stream,
   |                               key from ~/.commandcode/auth.json)
   |- builtin tools (src/tools.rs) -- fs_read/fs_list/fs_write/fs_edit/shell/config_*/mcp
-  |- MCP client (src/mcp.rs)    -- stdio JSON-RPC, tools exposed as mcp__<srv>__<tool>
+  |- MCP client (src/mcp.rs)    -- stdio JSON-RPC + streamable HTTP transports,
+  |                               tools exposed as mcp__<srv>__<tool>
+  |- OAuth client (src/oauth.rs) -- auth-code + PKCE + localhost:8571 callback,
+  |                               RFC 9728/8414 discovery, dynamic client
+  |                               registration, tokens in $XDG_DATA_HOME/amty/oauth/
   |- MCP catalog (src/catalog.rs) -- curated `npx -y` servers (notion/slack/gmail/
-  |                               gdrive/gdocs); GUI one-click install + env form
+  |                               gdrive/gdocs) + hosted OAuth servers (notion-
+  |                               hosted, google-gmail/drive/docs/calendar);
+  |                               GUI one-click install + env/OAuth form
   |
 Control API (src/api.rs)        -- axum on 127.0.0.1:<ephemeral>, Bearer token.
                                    port+token in $XDG_DATA_HOME/amty/runtime.json
@@ -78,8 +84,17 @@ cargo build --release --target x86_64-pc-windows-gnu
   (see `cmdc --list-models`).
 - Japanese IME works on macOS/Windows native, NOT under WSLg (no
   `text_input_v3` in the WSLg compositor). On WSL use paste or `amty send`.
-- MCP client supports stdio transport only (no streamable-HTTP servers yet).
-- Catalog installs need Node.js. On Windows npx is resolved from PATH, falling
+- MCP client supports stdio + streamable HTTP. Hosted servers set `url` (and
+  `oauth_client_id`/`oauth_client_secret`/`oauth_scopes`/`oauth_token_url`) in
+  `mcp_servers` with `command = ""`. OAuth flow: `POST /v1/mcp-auth` → browser +
+  `http://127.0.0.1:8571/oauth/callback` + PKCE; tokens go to
+  `$XDG_DATA_HOME/amty/oauth/<id>.json` (mode 0600 on unix), refresh runs
+  automatically via the stored `oauth_token_url`. Entries with fixed
+  auth/token endpoints (Google) skip discovery; others use RFC 9728/8414
+  discovery + dynamic client registration (verified against mcp.notion.com).
+  Google hosted endpoints are Developer Preview and need a Web-application
+  OAuth client with that redirect URI registered.
+- npm-based catalog installs need Node.js (hosted entries don't). On Windows npx is resolved from PATH, falling
   back to `%ProgramFiles%\nodejs\npx.cmd` (fresh installs land there while the
   running process still has a stale PATH); when a fallback path is used its dir
   is injected into the child's PATH env so `node` resolves. MCP children get

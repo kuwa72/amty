@@ -31,6 +31,23 @@ pub struct Entry {
     pub auth_cmd: Option<&'static str>,
     /// credentials file the server needs before auth can run
     pub keys: Option<KeysSpec>,
+    /// hosted (streamable HTTP) endpoint — no local command needed
+    pub url: Option<&'static str>,
+    /// OAuth parameters for hosted entries
+    pub oauth: Option<OauthSpec>,
+}
+
+#[derive(Clone, Copy)]
+pub struct OauthSpec {
+    /// space-separated scope list ("" = server default)
+    pub scopes: &'static str,
+    /// fixed endpoints (Google); None = RFC 8414/9728 discovery
+    pub auth_url: Option<&'static str>,
+    pub token_url: Option<&'static str>,
+    /// request offline access (refresh token) — Google needs these params
+    pub offline: bool,
+    /// client id/secret must be provided by the user (no DCR available)
+    pub needs_client: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -57,6 +74,8 @@ pub const CATALOG: &[Entry] = &[
         note_ja: "notion.so/profile/integrations でインテグレーションを作成し、対象ページに「コネクト」で共有してください。",
         auth_cmd: None,
         keys: None,
+        url: None,
+        oauth: None,
     },
     Entry {
         id: "slack",
@@ -84,6 +103,8 @@ pub const CATALOG: &[Entry] = &[
         note_ja: "api.slack.com/apps でアプリを作成 → Botスコープ (channels:history, chat:write など) を付与 → インストールしてBotトークンをコピー。",
         auth_cmd: None,
         keys: None,
+        url: None,
+        oauth: None,
     },
     Entry {
         id: "gmail",
@@ -96,6 +117,8 @@ pub const CATALOG: &[Entry] = &[
         note_ja: "Google CloudのOAuthキーが必要: gcp-oauth.keys.json を ~/.gmail-mcp/ に置き、下の「認証」ボタン(または `npx @gongrzhe/server-gmail-autoauth-mcp auth`)を実行。",
         auth_cmd: Some("auth"),
         keys: Some(KeysSpec { path: ".gmail-mcp/gcp-oauth.keys.json" }),
+        url: None,
+        oauth: None,
     },
     Entry {
         id: "gdrive",
@@ -114,6 +137,8 @@ pub const CATALOG: &[Entry] = &[
         note_ja: "Google CloudのOAuthキーを gcp-oauth.keys.json として ~/.config/google-drive-mcp/ に配置(または環境変数で指定)し、Drive/Docs/Sheets/Slides APIを有効化。下の「認証」ボタンでブラウザ認証(初回は自動でも開きます)。",
         auth_cmd: Some("auth"),
         keys: Some(KeysSpec { path: ".config/google-drive-mcp/gcp-oauth.keys.json" }),
+        url: None,
+        oauth: None,
     },
     Entry {
         id: "gdocs",
@@ -141,6 +166,109 @@ pub const CATALOG: &[Entry] = &[
         note_ja: "Google CloudでDocs/Sheets/Drive APIを有効化し、デスクトップ型OAuthクライアントを作成。envにID/SECRETを入れて導入後、「認証」ボタンを実行。",
         auth_cmd: Some("auth"),
         keys: None,
+        url: None,
+        oauth: None,
+    },
+    // ---- hosted (streamable HTTP) servers: OAuth, no local process ----
+    Entry {
+        id: "notion-hosted",
+        label: "Notion (hosted)",
+        desc: "Official hosted Notion MCP — standard OAuth, nothing to install.",
+        desc_ja: "Notion公式ホスト型MCP — 標準OAuth認証、インストール不要。",
+        package: "",
+        env: &[],
+        note: "Standard OAuth — press auth, sign in to Notion in the browser, done.",
+        note_ja: "標準OAuth — 「認証」ボタンでブラウザが開き、Notionにログインするだけで完了します。",
+        auth_cmd: None,
+        keys: None,
+        url: Some("https://mcp.notion.com/mcp"),
+        oauth: Some(OauthSpec {
+            scopes: "",
+            auth_url: None,
+            token_url: None,
+            offline: false,
+            needs_client: false,
+        }),
+    },
+    Entry {
+        id: "google-gmail",
+        label: "Gmail (hosted, official)",
+        desc: "Google-hosted Gmail MCP — messages, drafts, search. Developer Preview.",
+        desc_ja: "Google公式ホスト型Gmail MCP — メッセージ/下書き/検索。Developer Preview。",
+        package: "",
+        env: &[],
+        note: "Needs a Google Cloud OAuth client (Web application) with redirect URI http://127.0.0.1:8571/oauth/callback and the Gmail MCP API + Gmail API enabled. Enter its ID/secret at install, then press auth.",
+        note_ja: "Google CloudのOAuthクライアント(Webアプリ型)が必要: リダイレクトURI `http://127.0.0.1:8571/oauth/callback` を登録し、Gmail MCP API + Gmail API を有効化。ID/シークレットを入れて導入→「認証」。",
+        auth_cmd: None,
+        keys: None,
+        url: Some("https://gmailmcp.googleapis.com/mcp/v1"),
+        oauth: Some(OauthSpec {
+            scopes: "https://www.googleapis.com/auth/gmail.modify",
+            auth_url: Some("https://accounts.google.com/o/oauth2/v2/auth"),
+            token_url: Some("https://oauth2.googleapis.com/token"),
+            offline: true,
+            needs_client: true,
+        }),
+    },
+    Entry {
+        id: "google-drive",
+        label: "Google Drive (hosted, official)",
+        desc: "Google-hosted Drive MCP — files, folders, permissions. Developer Preview.",
+        desc_ja: "Google公式ホスト型Drive MCP — ファイル/フォルダ/権限。Developer Preview。",
+        package: "",
+        env: &[],
+        note: "Needs a Google Cloud OAuth client (Web application) with redirect URI http://127.0.0.1:8571/oauth/callback and the Drive MCP API + Drive API enabled.",
+        note_ja: "Google CloudのOAuthクライアント(Webアプリ型)が必要: リダイレクトURI `http://127.0.0.1:8571/oauth/callback` を登録し、Drive MCP API + Drive API を有効化。",
+        auth_cmd: None,
+        keys: None,
+        url: Some("https://drivemcp.googleapis.com/mcp/v1"),
+        oauth: Some(OauthSpec {
+            scopes: "https://www.googleapis.com/auth/drive",
+            auth_url: Some("https://accounts.google.com/o/oauth2/v2/auth"),
+            token_url: Some("https://oauth2.googleapis.com/token"),
+            offline: true,
+            needs_client: true,
+        }),
+    },
+    Entry {
+        id: "google-docs",
+        label: "Google Docs (hosted, official)",
+        desc: "Google-hosted Docs MCP — read/write documents. Developer Preview.",
+        desc_ja: "Google公式ホスト型Docs MCP — ドキュメント読み書き。Developer Preview。",
+        package: "",
+        env: &[],
+        note: "Needs a Google Cloud OAuth client (Web application) with redirect URI http://127.0.0.1:8571/oauth/callback and the Docs MCP API + Docs API enabled.",
+        note_ja: "Google CloudのOAuthクライアント(Webアプリ型)が必要: リダイレクトURI `http://127.0.0.1:8571/oauth/callback` を登録し、Docs MCP API + Docs API を有効化。",
+        auth_cmd: None,
+        keys: None,
+        url: Some("https://docsmcp.googleapis.com/mcp/v1"),
+        oauth: Some(OauthSpec {
+            scopes: "https://www.googleapis.com/auth/documents",
+            auth_url: Some("https://accounts.google.com/o/oauth2/v2/auth"),
+            token_url: Some("https://oauth2.googleapis.com/token"),
+            offline: true,
+            needs_client: true,
+        }),
+    },
+    Entry {
+        id: "google-calendar",
+        label: "Google Calendar (hosted, official)",
+        desc: "Google-hosted Calendar MCP — events, free/busy. Developer Preview.",
+        desc_ja: "Google公式ホスト型Calendar MCP — 予定/空き時間。Developer Preview。",
+        package: "",
+        env: &[],
+        note: "Needs a Google Cloud OAuth client (Web application) with redirect URI http://127.0.0.1:8571/oauth/callback and the Calendar MCP API + Calendar API enabled.",
+        note_ja: "Google CloudのOAuthクライアント(Webアプリ型)が必要: リダイレクトURI `http://127.0.0.1:8571/oauth/callback` を登録し、Calendar MCP API + Calendar API を有効化。",
+        auth_cmd: None,
+        keys: None,
+        url: Some("https://calendarmcp.googleapis.com/mcp/v1"),
+        oauth: Some(OauthSpec {
+            scopes: "https://www.googleapis.com/auth/calendar",
+            auth_url: Some("https://accounts.google.com/o/oauth2/v2/auth"),
+            token_url: Some("https://oauth2.googleapis.com/token"),
+            offline: true,
+            needs_client: true,
+        }),
     },
 ];
 
@@ -219,6 +347,9 @@ pub struct CatalogRow {
     pub note: &'static str,
     pub note_ja: &'static str,
     pub auth_cmd: Option<&'static str>,
+    pub url: Option<&'static str>,
+    /// oauth-capable hosted entry; needs_client => user must supply id/secret
+    pub oauth: Option<&'static str>, // "discovery" | "client"
     pub installed: bool,
 }
 
@@ -244,6 +375,8 @@ pub fn rows(installed: &BTreeMap<String, McpServerConf>) -> Vec<CatalogRow> {
             note: e.note,
             note_ja: e.note_ja,
             auth_cmd: e.auth_cmd,
+            url: e.url,
+            oauth: e.oauth.map(|o| if o.needs_client { "client" } else { "discovery" }),
             installed: installed.contains_key(e.id),
         })
         .collect()
@@ -251,8 +384,29 @@ pub fn rows(installed: &BTreeMap<String, McpServerConf>) -> Vec<CatalogRow> {
 
 /// Build the McpServerConf for a catalog entry. npx is a .cmd shim on
 /// Windows and can't be spawned directly, so it goes through `cmd /c`.
+/// Env keys OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET map to the conf's OAuth
+/// fields for hosted entries.
 pub fn build_conf(id: &str, env: BTreeMap<String, String>) -> Result<(String, McpServerConf)> {
     let entry = find(id).context("unknown catalog id")?;
+    if let Some(url) = entry.url {
+        let oauth = entry.oauth.context("hosted entry without oauth spec")?;
+        let cid = env.get("OAUTH_CLIENT_ID").map(|s| s.trim().to_string()).unwrap_or_default();
+        let csec = env.get("OAUTH_CLIENT_SECRET").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        if oauth.needs_client && cid.is_empty() {
+            bail!("OAUTH_CLIENT_ID is required (create an OAuth client in Google Cloud first)");
+        }
+        return Ok((
+            entry.id.to_string(),
+            McpServerConf {
+                url: Some(url.into()),
+                oauth_client_id: if cid.is_empty() { None } else { Some(cid) },
+                oauth_client_secret: csec,
+                oauth_scopes: Some(oauth.scopes.into()),
+                oauth_token_url: oauth.token_url.map(String::from),
+                ..Default::default()
+            },
+        ));
+    }
     if !node_available() {
         bail!("Node.js (npx) not found on PATH — install Node.js first");
     }
@@ -269,7 +423,7 @@ pub fn build_conf(id: &str, env: BTreeMap<String, String>) -> Result<(String, Mc
     let command = npx_exe().context("npx disappeared")?;
     inject_node_dir(&command, &mut final_env);
     let args = vec!["-y".to_string(), entry.package.into()];
-    Ok((entry.id.to_string(), McpServerConf { command, args, env: final_env, enabled: true }))
+    Ok((entry.id.to_string(), McpServerConf { command, args, env: final_env, ..Default::default() }))
 }
 
 /// When npx was found via a fallback path (this process's PATH predates the
@@ -298,6 +452,28 @@ pub fn auth_spawn(id: &str, base_env: &BTreeMap<String, String>) -> Result<(Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hosted_build_conf() {
+        // google hosted requires a client id
+        assert!(build_conf("google-gmail", Default::default()).is_err());
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("OAUTH_CLIENT_ID".to_string(), "abc.apps.googleusercontent.com".to_string());
+        env.insert("OAUTH_CLIENT_SECRET".to_string(), "sec".to_string());
+        let (name, conf) = build_conf("google-gmail", env).unwrap();
+        assert_eq!(name, "google-gmail");
+        assert_eq!(conf.url.as_deref(), Some("https://gmailmcp.googleapis.com/mcp/v1"));
+        assert_eq!(conf.oauth_client_id.as_deref(), Some("abc.apps.googleusercontent.com"));
+        assert_eq!(conf.oauth_token_url.as_deref(), Some("https://oauth2.googleapis.com/token"));
+        assert!(conf.command.is_empty());
+    }
+
+    #[test]
+    fn hosted_dcr_entry_needs_no_client() {
+        let (_, conf) = build_conf("notion-hosted", Default::default()).unwrap();
+        assert_eq!(conf.url.as_deref(), Some("https://mcp.notion.com/mcp"));
+        assert!(conf.oauth_client_id.is_none());
+    }
 
     #[test]
     fn unknown_id_rejected() {

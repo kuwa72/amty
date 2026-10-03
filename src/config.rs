@@ -80,6 +80,8 @@ fn default_true() -> bool {
 }
 
 /// Compatible with Claude Desktop's `mcpServers` entries (stdio transport).
+/// Hosted/streamable-HTTP servers set `url` (and optionally OAuth fields)
+/// and leave `command` empty.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct McpServerConf {
     pub command: String,
@@ -89,6 +91,35 @@ pub struct McpServerConf {
     pub env: BTreeMap<String, String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// streamable-http endpoint for hosted servers
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub oauth_client_id: Option<String>,
+    #[serde(default)]
+    pub oauth_client_secret: Option<String>,
+    /// space-separated OAuth scopes to request
+    #[serde(default)]
+    pub oauth_scopes: Option<String>,
+    /// resolved token endpoint (persisted so refresh needs no discovery)
+    #[serde(default)]
+    pub oauth_token_url: Option<String>,
+}
+
+impl Default for McpServerConf {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            args: vec![],
+            env: Default::default(),
+            enabled: true,
+            url: None,
+            oauth_client_id: None,
+            oauth_client_secret: None,
+            oauth_scopes: None,
+            oauth_token_url: None,
+        }
+    }
 }
 
 pub const DEFAULT_SYSTEM: &str = "You are amty, a lightweight desktop AI agent. \
@@ -372,6 +403,7 @@ pub fn import_claude(cfg: &mut Config) -> Result<Vec<String>> {
                 args: s.get("args").and_then(|a| a.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
                 env: s.get("env").and_then(|e| e.as_object()).map(|e| e.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect()).unwrap_or_default(),
                 enabled: true,
+                ..Default::default()
             },
         );
         added.push(name);
@@ -408,7 +440,7 @@ mod tests {
         assert_eq!(cfg.providers["ollama"].model, "llama4");
         cfg.apply_set("mcp.foo.enabled", "false").err().unwrap(); // unknown server
         cfg.mcp_servers.insert("srv".into(), McpServerConf {
-            command: "x".into(), args: vec![], env: Default::default(), enabled: true,
+            command: "x".into(), ..Default::default()
         });
         cfg.apply_set("mcp.srv.enabled", "false").unwrap();
         assert!(!cfg.mcp_servers["srv"].enabled);

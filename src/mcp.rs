@@ -136,8 +136,138 @@ impl Drop for Rpc {
     }
 }
 
+/// Streamable-HTTP MCP transport (hosted servers). POST-per-request; the
+/// response may be plain JSON or an SSE stream carrying the JSON-RPC reply.
+struct HttpRpc {
+    http: reqwest::Client,
+    url: String,
+    name: String,
+    conf: McpServerConf,
+    session: Mutex<Option<String>>,
+}
+
+fn sse_response(body: &str, want_id: u64) -> Option<Value> {
+    for chunk in body.split("\n\n") {
+        let mut data = String::new();
+        for line in chunk.lines() {
+            if let Some(d) = line.strip_prefix("data:") {
+                data.push_str(d.trim());
+            }
+        }
+        if data.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(&data) {
+            if v.get("id").and_then(|i| i.as_u64()) == Some(want_id) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+impl HttpRpc {
+    fn new(name: String, conf: McpServerConf) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            url: conf.url.clone().unwrap_or_default(),
+            name,
+            conf,
+            session: Mutex::new(None),
+        }
+    }
+
+    async fn call(&self, method: &str, params: Value, timeout_s: u64) -> Result<Value> {
+        use std::sync::atomic::Ordering as Ord2;
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, Ord2::SeqCst);
+        let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let resp = self.post(body, timeout_s).await?;
+        let v = match resp {
+            HttpResp::Json(v) => v,
+            HttpResp::Sse(text) => sse_response(&text, id).context("no matching response in SSE stream")?,
+        };
+        if let Some(err) = v.get("error") {
+            bail!("{}", err["message"].as_str().unwrap_or("rpc error"));
+        }
+        Ok(v.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    async fn notify(&self, method: &str) {
+        let _ = self
+            .post(json!({"jsonrpc": "2.0", "method": method, "params": {}}), 10)
+            .await;
+    }
+
+    async fn post(&self, body: Value, timeout_s: u64) -> Result<HttpResp> {
+        let token = if self.conf.oauth_client_id.is_some() || self.conf.oauth_token_url.is_some() || crate::oauth::load(&self.name).is_some() {
+            crate::oauth::access_token(&self.name, &self.conf).await?
+        } else {
+            None
+        };
+        let mut req = self
+            .http
+            .post(&self.url)
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", PROTOCOL_VERSION)
+            .json(&body);
+        if let Some(sid) = self.session.lock().unwrap().clone() {
+            req = req.header("mcp-session-id", sid);
+        }
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        let fut = req.send();
+        let resp = match tokio::time::timeout(std::time::Duration::from_secs(timeout_s), fut).await {
+            Ok(r) => r?,
+            Err(_) => bail!("mcp '{method}' timed out", method = body["method"].as_str().unwrap_or("")),
+        };
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            bail!("HTTP 401 — authentication required (run auth for '{n}')", n = self.name);
+        }
+        if !resp.status().is_success() && resp.status() != reqwest::StatusCode::ACCEPTED {
+            bail!("HTTP {}", resp.status());
+        }
+        if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+            *self.session.lock().unwrap() = Some(sid.to_string());
+        }
+        let ctype = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        if ctype.contains("text/event-stream") {
+            Ok(HttpResp::Sse(resp.text().await?))
+        } else if ctype.contains("json") {
+            Ok(HttpResp::Json(resp.json::<Value>().await?))
+        } else {
+            Ok(HttpResp::Json(Value::Null))
+        }
+    }
+}
+
+enum HttpResp {
+    Json(Value),
+    Sse(String),
+}
+
+enum Transport {
+    Stdio(Arc<Rpc>),
+    Http(Arc<HttpRpc>),
+}
+
+impl Transport {
+    async fn call(&self, method: &str, params: Value, timeout_s: u64) -> Result<Value> {
+        match self {
+            Transport::Stdio(r) => r.call(method, params, timeout_s).await,
+            Transport::Http(r) => r.call(method, params, timeout_s).await,
+        }
+    }
+}
+
 struct Client {
-    rpc: Arc<Rpc>,
+    rpc: Transport,
     tools: Vec<(String, ToolSpec)>, // (original_name, spec with mcp__ prefix)
 }
 
@@ -225,7 +355,7 @@ impl Manager {
             _ => return,
         };
         self.status.lock().unwrap().insert(name.into(), Status::Connecting);
-        match Self::handshake(conf).await {
+        match Self::handshake(conf, name).await {
             Ok(client) => {
                 let n = client.tools.len();
                 self.clients.lock().unwrap().insert(name.into(), Arc::new(client));
@@ -237,13 +367,20 @@ impl Manager {
         }
     }
 
-    async fn handshake(conf: McpServerConf) -> Result<Client> {
+    async fn handshake(conf: McpServerConf, name: &str) -> Result<Client> {
         // npx -y downloads the package on first run — allow ample time
         const INIT_TIMEOUT: u64 = 120;
-        let rpc = Rpc::spawn(conf)?;
+        let rpc: Transport = if conf.url.is_some() {
+            Transport::Http(Arc::new(HttpRpc::new(name.to_string(), conf.clone())))
+        } else {
+            Transport::Stdio(Rpc::spawn(conf.clone())?)
+        };
         // attach the server's stderr tail so config/setup errors are visible
         let with_err = |e: anyhow::Error| -> anyhow::Error {
-            let tail = rpc.stderr_tail.lock().unwrap().trim().to_string();
+            let tail = match &rpc {
+                Transport::Stdio(r) => r.stderr_tail.lock().unwrap().trim().to_string(),
+                _ => String::new(),
+            };
             if tail.is_empty() {
                 e
             } else {
@@ -261,7 +398,12 @@ impl Manager {
         )
         .await
         .map_err(with_err)?;
-        let _ = rpc.tx.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        match &rpc {
+            Transport::Stdio(r) => {
+                let _ = r.tx.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+            }
+            Transport::Http(r) => r.notify("notifications/initialized").await,
+        }
         let mut tools = vec![];
         let mut cursor = Value::Null;
         loop {
@@ -386,5 +528,23 @@ impl Manager {
             return "no mcp tools".into();
         }
         specs.iter().map(|s| format!("{}: {}", s.name, s.description)).collect::<Vec<_>>().join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sse_response_finds_matching_id() {
+        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"tools\":[1,2]}}\n\n";
+        let v = sse_response(body, 7).unwrap();
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 2);
+        assert!(sse_response(body, 8).is_none());
+        // multi-line data + unrelated events
+        let body2 = "event: ping\n\n: comment\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\ndata: {\"id\":2}\n\n";
+        assert!(sse_response(body2, 1).is_some());
+        assert!(sse_response(body2, 2).is_some());
+        assert!(sse_response(body2, 3).is_none());
     }
 }

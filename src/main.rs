@@ -8,6 +8,7 @@ mod gui;
 mod i18n;
 mod mcp;
 mod mcp_serve;
+mod oauth;
 mod provider;
 mod session;
 mod tools;

@@ -184,11 +184,18 @@ impl App {
         self.runs.lock().unwrap().contains_key(session)
     }
 
-    /// Run a catalog entry's OAuth/auth subcommand (`npx -y <pkg> auth`),
-    /// logging output to `<data_dir>/auth-<id>.log`. The installed server's
-    /// env (client id/secret etc.) is inherited. On exit the MCP manager
-    /// reconnects so the server picks up fresh credentials.
+    /// Run a catalog entry's auth flow: `npx -y <pkg> auth` for package-based
+    /// servers, or the built-in OAuth client for hosted (streamable HTTP)
+    /// entries. Progress goes to `<data_dir>/auth-<id>.log`. On completion
+    /// the MCP manager reconnects so the server picks up fresh credentials.
     pub fn start_auth(self: &Arc<Self>, id: &str) -> Result<std::path::PathBuf> {
+        let entry = crate::catalog::find(id).ok_or_else(|| anyhow::anyhow!("unknown catalog id '{id}'"))?;
+        if entry.oauth.is_some() {
+            return self.start_oauth(id);
+        }
+        if entry.auth_cmd.is_none() {
+            anyhow::bail!("{id} has no auth flow");
+        }
         let base_env = self
             .cfg
             .read()
@@ -235,6 +242,76 @@ impl App {
                 app2.mcp.reconcile().await;
                 app2.emit("", EvKind::Touched);
             });
+        });
+        Ok(log)
+    }
+
+    /// Hosted OAuth flow: browser + localhost callback + PKCE + token store.
+    /// If the server isn't in the config yet, auth doubles as install.
+    fn start_oauth(self: &Arc<Self>, id: &str) -> Result<std::path::PathBuf> {
+        let entry = crate::catalog::find(id).ok_or_else(|| anyhow::anyhow!("unknown catalog id"))?;
+        let spec = entry.oauth.ok_or_else(|| anyhow::anyhow!("{id} is not an oauth entry"))?;
+        let log = crate::config::data_dir().join(format!("auth-{id}.log"));
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&log)?;
+        let conf = {
+            let cfg = self.cfg.read().unwrap();
+            cfg.mcp_servers.get(id).cloned().unwrap_or_else(|| {
+                crate::config::McpServerConf {
+                    url: entry.url.map(String::from),
+                    oauth_scopes: Some(spec.scopes.into()),
+                    oauth_token_url: spec.token_url.map(String::from),
+                    ..Default::default()
+                }
+            })
+        };
+        self.auth.lock().unwrap().insert(id.to_string(), AuthRun { running: true, log: log.clone() });
+        let app = self.clone();
+        let id_s = id.to_string();
+        let log_t = log.clone();
+        let rt = app.rt.clone();
+        rt.spawn(async move {
+            let res = crate::oauth::authorize(&id_s, &conf, &spec, &log_t).await;
+            match res {
+                Ok(out) => {
+                    // persist client registration + ensure the server exists
+                    {
+                        let mut cfg = app.cfg.write().unwrap();
+                        let s = cfg.mcp_servers.entry(id_s.clone()).or_insert_with(|| {
+                            crate::config::McpServerConf {
+                                url: entry.url.map(String::from),
+                                oauth_scopes: Some(spec.scopes.into()),
+                                ..Default::default()
+                            }
+                        });
+                        s.oauth_client_id = Some(out.client_id);
+                        s.oauth_client_secret = out.client_secret;
+                        s.oauth_token_url = Some(out.token_url);
+                        let _ = cfg.save(&app.cfg_path);
+                    }
+                    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&log_t) {
+                        use std::io::Write;
+                        let _ = writeln!(f, "[amty] auth complete");
+                    }
+                }
+                Err(e) => {
+                    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&log_t) {
+                        use std::io::Write;
+                        let _ = writeln!(f, "[amty] auth failed: {e}");
+                    }
+                }
+            }
+            if let Ok(mut m) = app.auth.lock() {
+                if let Some(a) = m.get_mut(&id_s) {
+                    a.running = false;
+                }
+            }
+            app.mcp.update_servers(app.mcp_servers_map());
+            app.mcp.reconcile().await;
+            app.emit("", EvKind::Touched);
         });
         Ok(log)
     }

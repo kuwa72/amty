@@ -495,7 +495,7 @@ impl eframe::App for GuiApp {
                     ui.separator();
                     ui.heading(t("catalog"));
                     if !crate::catalog::node_available() {
-                        ui.colored_label(egui::Color32::from_rgb(255, 200, 80), t("Node.js (npx) is required to install these"));
+                        ui.colored_label(egui::Color32::from_rgb(255, 200, 80), t("Node.js (npx) is required for npm-based entries"));
                     }
                     let installed = self.app.cfg.read().unwrap().mcp_servers.clone();
                     for entry in crate::catalog::CATALOG {
@@ -506,7 +506,10 @@ impl eframe::App for GuiApp {
                                 if is_installed {
                                     ui.weak(t("installed"));
                                 } else {
-                                    ui.weak(format!("npx {}", entry.package));
+                                    ui.weak(match entry.url {
+                                        Some(u) => u.to_string(),
+                                        None => format!("npx {}", entry.package),
+                                    });
                                     if self.cat_sel == Some(entry.id) {
                                         if ui.small_button("✕").clicked() {
                                             self.cat_sel = None;
@@ -539,8 +542,8 @@ impl eframe::App for GuiApp {
                                     });
                                 }
                             }
-                            // OAuth/auth runner (google-family servers)
-                            if entry.auth_cmd.is_some() {
+                            // OAuth/auth runner (package `auth` cmd or hosted oauth)
+                            if entry.auth_cmd.is_some() || entry.oauth.is_some() {
                                 let running = self.app.auth.lock().unwrap().get(entry.id).map(|a| a.running).unwrap_or(false);
                                 ui.horizontal(|ui| {
                                     if running {
@@ -561,6 +564,20 @@ impl eframe::App for GuiApp {
                                 }
                             }
                             if self.cat_sel == Some(entry.id) {
+                                // hosted oauth entries that need a user-registered client
+                                if entry.oauth.map(|o| o.needs_client).unwrap_or(false) {
+                                    for (key, secret) in [("OAUTH_CLIENT_ID", false), ("OAUTH_CLIENT_SECRET", true)] {
+                                        ui.horizontal(|ui| {
+                                            ui.label(key);
+                                            let v = self.cat_env.entry(key.to_string()).or_default();
+                                            ui.add(
+                                                egui::TextEdit::singleline(v)
+                                                    .password(secret)
+                                                    .desired_width(200.0),
+                                            );
+                                        });
+                                    }
+                                }
                                 for spec in entry.env {
                                     ui.horizontal(|ui| {
                                         ui.label(format!("{}{}", spec.key, if spec.required { format!(" ({})", t("required")) } else { String::new() }));
@@ -805,12 +822,7 @@ fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut S
                 ui.text_edit_singleline(&mut buf.new_mcp);
                 if ui.button("＋").clicked() && !buf.new_mcp.trim().is_empty() {
                     let name = buf.new_mcp.trim().to_string();
-                    buf.cfg.mcp_servers.entry(name.clone()).or_insert(McpServerConf {
-                        command: String::new(),
-                        args: vec![],
-                        env: Default::default(),
-                        enabled: true,
-                    });
+                    buf.cfg.mcp_servers.entry(name.clone()).or_insert_with(McpServerConf::default);
                     buf.sel_mcp = Some(name);
                     buf.new_mcp.clear();
                 }
@@ -821,6 +833,24 @@ fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut S
                         egui::Grid::new("mgrid").num_columns(2).show(ui, |ui| {
                             ui.label(t("command"));
                             ui.text_edit_singleline(&mut s.command);
+                            ui.end_row();
+                            ui.label("url (hosted)");
+                            let mut u = s.url.clone().unwrap_or_default();
+                            if ui.text_edit_singleline(&mut u).changed() {
+                                s.url = if u.trim().is_empty() { None } else { Some(u.trim().to_string()) };
+                            }
+                            ui.end_row();
+                            ui.label("oauth client id");
+                            let mut cid = s.oauth_client_id.clone().unwrap_or_default();
+                            if ui.text_edit_singleline(&mut cid).changed() {
+                                s.oauth_client_id = if cid.trim().is_empty() { None } else { Some(cid.trim().to_string()) };
+                            }
+                            ui.end_row();
+                            ui.label("oauth client secret");
+                            let mut cs = s.oauth_client_secret.clone().unwrap_or_default();
+                            if ui.add(egui::TextEdit::singleline(&mut cs).password(true)).changed() {
+                                s.oauth_client_secret = if cs.trim().is_empty() { None } else { Some(cs.trim().to_string()) };
+                            }
                             ui.end_row();
                             ui.label(t("args (space sep)"));
                             let mut a = s.args.join(" ");

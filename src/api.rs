@@ -269,6 +269,7 @@ async fn mcp_add(
                 args: b.args,
                 env: b.env,
                 enabled: true,
+                ..Default::default()
             },
         );
         cfg.save(&app.cfg_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
