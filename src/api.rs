@@ -34,6 +34,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/mcp-install", post(mcp_install))
         .route("/v1/mcp-auth", post(mcp_auth))
         .route("/v1/mcp-auth/{id}", get(mcp_auth_status))
+        .route("/v1/mcp-keys", post(mcp_keys))
         .layer(middleware::from_fn_with_state(app.clone(), auth))
         .with_state(app)
 }
@@ -342,6 +343,24 @@ async fn mcp_auth_status(State(app): State<Arc<App>>, Path(id): Path<String>) ->
     let running = app.auth.lock().unwrap().get(&id).map(|a| a.running).unwrap_or(false);
     let tail = app.auth_log_tail(&id, 2000).unwrap_or_default();
     Json(json!({"id": id, "running": running, "log_tail": tail}))
+}
+
+#[derive(Deserialize)]
+struct KeysBody {
+    id: String,
+    src: String,
+}
+
+/// Copy a downloaded OAuth keys file to where the catalog server expects it.
+async fn mcp_keys(
+    State(app): State<Arc<App>>,
+    Json(b): Json<KeysBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let dst = crate::catalog::place_keys(&b.id, std::path::Path::new(&b.src))
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    app.mcp.update_servers(app.mcp_servers_map());
+    app.mcp.reconcile().await;
+    Ok(Json(json!({"placed": dst.to_string_lossy()})))
 }
 
 async fn mcp_toggle(

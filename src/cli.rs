@@ -212,6 +212,10 @@ pub async fn run(cmd: crate::Cmd) -> Result<()> {
                 .collect();
             print_json(&post(&base, &tok, "/v1/mcp-install", json!({"id": id, "env": env_map})).await?);
         }
+        Keys { id, src } => {
+            let (base, tok) = runtime_info()?;
+            print_json(&post(&base, &tok, "/v1/mcp-keys", json!({"id": id, "src": src})).await?);
+        }
         Auth { id, status } => {
             let (base, tok) = runtime_info()?;
             if status {

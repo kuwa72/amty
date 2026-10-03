@@ -48,6 +48,11 @@ static JA: &[(&str, &str)] = &[
     ("auth running…", "認証実行中…"),
     ("(browser may open)", "(ブラウザが開きます)"),
     ("auth started", "認証を開始しました"),
+    ("keys json:", "キーファイル:"),
+    ("path to gcp-oauth.keys.json", "gcp-oauth.keys.json のパス"),
+    ("place", "配置"),
+    ("placed:", "配置しました:"),
+    ("place failed:", "配置に失敗:"),
     // settings
     ("settings", "設定"),
     ("providers", "プロバイダ"),

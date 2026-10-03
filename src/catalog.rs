@@ -29,6 +29,14 @@ pub struct Entry {
     pub note_ja: &'static str,
     /// OAuth/auth subcommand runnable as `npx -y <pkg> <cmd>` from the GUI
     pub auth_cmd: Option<&'static str>,
+    /// credentials file the server needs before auth can run
+    pub keys: Option<KeysSpec>,
+}
+
+#[derive(Clone, Copy)]
+pub struct KeysSpec {
+    /// expected file path relative to the home dir
+    pub path: &'static str,
 }
 
 pub const CATALOG: &[Entry] = &[
@@ -48,6 +56,7 @@ pub const CATALOG: &[Entry] = &[
         note: "Create an internal integration at notion.so/profile/integrations, then share target pages with it.",
         note_ja: "notion.so/profile/integrations でインテグレーションを作成し、対象ページに「コネクト」で共有してください。",
         auth_cmd: None,
+        keys: None,
     },
     Entry {
         id: "slack",
@@ -74,6 +83,7 @@ pub const CATALOG: &[Entry] = &[
         note: "Create a Slack app at api.slack.com/apps, add bot scopes (channels:history, chat:write, …), install it, copy the Bot User OAuth Token.",
         note_ja: "api.slack.com/apps でアプリを作成 → Botスコープ (channels:history, chat:write など) を付与 → インストールしてBotトークンをコピー。",
         auth_cmd: None,
+        keys: None,
     },
     Entry {
         id: "gmail",
@@ -85,6 +95,7 @@ pub const CATALOG: &[Entry] = &[
         note: "Requires Google Cloud OAuth keys: place gcp-oauth.keys.json in ~/.gmail-mcp/, then run auth (button below or `npx @gongrzhe/server-gmail-autoauth-mcp auth`).",
         note_ja: "Google CloudのOAuthキーが必要: gcp-oauth.keys.json を ~/.gmail-mcp/ に置き、下の「認証」ボタン(または `npx @gongrzhe/server-gmail-autoauth-mcp auth`)を実行。",
         auth_cmd: Some("auth"),
+        keys: Some(KeysSpec { path: ".gmail-mcp/gcp-oauth.keys.json" }),
     },
     Entry {
         id: "gdrive",
@@ -102,6 +113,7 @@ pub const CATALOG: &[Entry] = &[
         note: "Place Google Cloud OAuth keys as gcp-oauth.keys.json in ~/.config/google-drive-mcp/ (or set the env var), enable Drive/Docs/Sheets/Slides APIs. Browser auth runs on first launch.",
         note_ja: "Google CloudのOAuthキーを gcp-oauth.keys.json として ~/.config/google-drive-mcp/ に配置(または環境変数で指定)し、Drive/Docs/Sheets/Slides APIを有効化。下の「認証」ボタンでブラウザ認証(初回は自動でも開きます)。",
         auth_cmd: Some("auth"),
+        keys: Some(KeysSpec { path: ".config/google-drive-mcp/gcp-oauth.keys.json" }),
     },
     Entry {
         id: "gdocs",
@@ -128,11 +140,29 @@ pub const CATALOG: &[Entry] = &[
         note: "Enable Docs/Sheets/Drive APIs in Google Cloud, create a Desktop-type OAuth client, then run `npx -y @a-bonus/google-docs-mcp auth` once.",
         note_ja: "Google CloudでDocs/Sheets/Drive APIを有効化し、デスクトップ型OAuthクライアントを作成。envにID/SECRETを入れて導入後、「認証」ボタンを実行。",
         auth_cmd: Some("auth"),
+        keys: None,
     },
 ];
 
 pub fn find(id: &str) -> Option<&'static Entry> {
     CATALOG.iter().find(|e| e.id == id)
+}
+
+/// Absolute path of the credentials file a catalog entry expects.
+pub fn keys_path(id: &str) -> Option<std::path::PathBuf> {
+    let entry = find(id)?;
+    let spec = entry.keys?;
+    Some(dirs::home_dir()?.join(spec.path))
+}
+
+/// Copy a downloaded OAuth keys file into the location the server expects.
+pub fn place_keys(id: &str, src: &std::path::Path) -> Result<std::path::PathBuf> {
+    let dst = keys_path(id).context("this server takes no keys file")?;
+    if let Some(dir) = dst.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::copy(src, &dst).with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
+    Ok(dst)
 }
 
 /// Resolve the npx executable. On Windows `npx` may be freshly installed but

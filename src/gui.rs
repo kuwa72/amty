@@ -111,6 +111,8 @@ pub struct GuiApp {
     cat_sel: Option<&'static str>,
     /// env field buffers for the selected catalog entry
     cat_env: HashMap<String, String>,
+    /// keys-file source path inputs, per catalog id
+    cat_keys: HashMap<String, String>,
 }
 
 impl GuiApp {
@@ -136,6 +138,7 @@ impl GuiApp {
             show_mcp: false,
             cat_sel: None,
             cat_env: HashMap::new(),
+            cat_keys: HashMap::new(),
         }
     }
 
@@ -473,6 +476,7 @@ impl eframe::App for GuiApp {
             let t = |k: &'static str| crate::i18n::t(&lang, k);
             let mut install_target: Option<&'static str> = None;
             let mut auth_target: Option<&'static str> = None;
+            let mut keys_target: Option<(&'static str, String)> = None;
             egui::Window::new(t("mcp servers")).open(&mut self.show_mcp).default_size([440.0, 380.0]).show(&ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for (name, status, enabled) in self.app.mcp.statuses() {
@@ -514,6 +518,27 @@ impl eframe::App for GuiApp {
                                 }
                             });
                             ui.weak(if ja { entry.desc_ja } else { entry.desc });
+                            // OAuth keys file placement
+                            if entry.keys.is_some() {
+                                let dst = crate::catalog::keys_path(entry.id);
+                                let have = dst.as_ref().map(|p| p.exists()).unwrap_or(false);
+                                if have {
+                                    ui.weak(format!("✓ {}", dst.unwrap().display()));
+                                } else {
+                                    ui.horizontal(|ui| {
+                                        ui.label(t("keys json:"));
+                                        let v = self.cat_keys.entry(entry.id.to_string()).or_default();
+                                        ui.add(
+                                            egui::TextEdit::singleline(v)
+                                                .desired_width(170.0)
+                                                .hint_text(t("path to gcp-oauth.keys.json")),
+                                        );
+                                        if !v.trim().is_empty() && ui.button(t("place")).clicked() {
+                                            keys_target = Some((entry.id, v.trim().to_string()));
+                                        }
+                                    });
+                                }
+                            }
                             // OAuth/auth runner (google-family servers)
                             if entry.auth_cmd.is_some() {
                                 let running = self.app.auth.lock().unwrap().get(entry.id).map(|a| a.running).unwrap_or(false);
@@ -565,6 +590,17 @@ impl eframe::App for GuiApp {
                 match started.start_auth(id) {
                     Ok(_) => self.toast(t("auth started")),
                     Err(e) => self.toast(format!("{} {e}", t("install failed: "))),
+                }
+            }
+            if let Some((id, src)) = keys_target {
+                match crate::catalog::place_keys(id, std::path::Path::new(&src)) {
+                    Ok(dst) => {
+                        self.app.mcp.update_servers(self.app.mcp_servers_map());
+                        let mcp = self.app.mcp.clone();
+                        self.rt.spawn(async move { mcp.reconcile().await });
+                        self.toast(format!("{} {}", t("placed:"), dst.display()));
+                    }
+                    Err(e) => self.toast(format!("{} {e}", t("place failed:"))),
                 }
             }
         }

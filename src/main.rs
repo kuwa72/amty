@@ -86,6 +86,8 @@ pub enum Cmd {
         /// print log tail instead of starting auth
         #[arg(long)] status: bool,
     },
+    /// Copy a downloaded OAuth keys file to where the server expects it.
+    Keys { id: String, src: String },
     /// Expose the running instance as an MCP server (stdio) for external agents.
     McpServe,
     /// Import mcpServers from claude_desktop_config.json into config.toml.
