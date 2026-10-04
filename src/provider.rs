@@ -678,7 +678,7 @@ impl CommandCode {
 pub fn model_suggestions(kind: crate::config::ProviderKind) -> Vec<String> {
     use crate::config::ProviderKind as K;
     match kind {
-        K::CommandCode => cmdc_models().0,
+        K::CommandCode => FALLBACK_CC_MODELS.iter().map(|s| s.to_string()).collect(),
         K::Anthropic => [
             "claude-sonnet-4-5",
             "claude-opus-4-1",
@@ -691,36 +691,55 @@ pub fn model_suggestions(kind: crate::config::ProviderKind) -> Vec<String> {
     }
 }
 
-/// Returns (models, error) — error=Some(msg) means `cmdc --list-models` failed.
-pub fn cmdc_models() -> (Vec<String>, Option<String>) {
+/// Returns (models, error) — error=Some(msg) means the API fetch failed.
+/// Fetches the live model list from GET {base}/provider/v1/models (no `cmdc`
+/// CLI needed). Cached on success so the GUI doesn't hit the API every frame.
+pub fn cmdc_models(conf: &crate::config::ProviderConf) -> (Vec<String>, Option<String>) {
     static CACHE: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
     if let Some(models) = CACHE.lock().unwrap().clone() {
         return (models, None);
     }
-    let out = cmdc_output(&["--list-models"]);
-    let mut models: Vec<String> = out
-        .as_ref()
-        .map(|s| {
-            s.lines()
-                .map(|l| l.trim())
-                .filter(|l| !l.is_empty())
-                .filter_map(|l| l.split_whitespace().next())
-                // model ids start lowercase/digit and contain - / . _
-                .filter(|tok| tok.chars().next().map(|c| c.is_ascii_lowercase() || c.is_ascii_digit()).unwrap_or(false))
-                .filter(|tok| tok.contains(&['/', '-', '.', '_']))
-                .map(String::from)
-                .collect()
-        })
+    let url = format!("{}/provider/v1/models", conf.resolved_base().trim_end_matches('/'));
+    let key = conf.resolved_key();
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let models = FALLBACK_CC_MODELS.iter().map(|s| s.to_string()).collect();
+            return (models, Some(format!("http client: {e}")));
+        }
+    };
+    let mut req = client.get(&url);
+    if let Some(k) = key {
+        req = req.bearer_auth(k);
+    }
+    let resp = match req.send() {
+        Ok(r) => r,
+        Err(e) => {
+            let models = FALLBACK_CC_MODELS.iter().map(|s| s.to_string()).collect();
+            return (models, Some(format!("fetch {url}: {e}")));
+        }
+    };
+    let value: serde_json::Value = match resp.json() {
+        Ok(v) => v,
+        Err(e) => {
+            let models = FALLBACK_CC_MODELS.iter().map(|s| s.to_string()).collect();
+            return (models, Some(format!("json parse: {e}")));
+        }
+    };
+    let models: Vec<String> = value["data"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect())
         .unwrap_or_default();
-    let err = out.err();
     if models.is_empty() {
-        // do not cache failure — retry next call so a transient cmdc issue
-        // doesn't stick for the whole session
-        models = FALLBACK_CC_MODELS.iter().map(|s| s.to_string()).collect();
+        let models = FALLBACK_CC_MODELS.iter().map(|s| s.to_string()).collect();
+        (models, Some("empty model list".into()))
     } else {
         *CACHE.lock().unwrap() = Some(models.clone());
+        (models, None)
     }
-    (models, err)
 }
 
 /// Last-resort model list when `cmdc` can't be run (e.g. not installed on
@@ -788,14 +807,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // requires cmdc on PATH
+    #[ignore] // requires network + api key
     fn cmdc_models_real() {
-        let out = cmdc_output(&["--list-models"]);
-        match &out {
-            Ok(s) => eprintln!("cmdc raw output ({} bytes):\n{}", s.len(), s),
-            Err(e) => eprintln!("cmdc error: {}", e),
-        }
-        let (models, err) = cmdc_models();
+        let conf = crate::config::ProviderConf {
+            kind: crate::config::ProviderKind::CommandCode,
+            model: "deepseek/deepseek-v4-flash".into(),
+            ..Default::default()
+        };
+        let (models, err) = cmdc_models(&conf);
         eprintln!("parsed {} models (err={:?})", models.len(), err);
         eprintln!("{:?}", models);
     }

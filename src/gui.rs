@@ -414,7 +414,10 @@ impl eframe::App for GuiApp {
                 }
                 let kind = self.app.cfg.read().unwrap().providers.get(&prov).map(|p| p.kind);
                 let (suggestions, err) = match kind {
-                    Some(crate::config::ProviderKind::CommandCode) => crate::provider::cmdc_models(),
+                    Some(crate::config::ProviderKind::CommandCode) => {
+                        let conf = self.app.cfg.read().unwrap().providers.get(&prov).cloned().unwrap_or_default();
+                        crate::provider::cmdc_models(&conf)
+                    }
                     _ => (kind.map(crate::provider::model_suggestions).unwrap_or_default(), None),
                 };
                 if !suggestions.is_empty() {
