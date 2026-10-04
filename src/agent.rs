@@ -171,11 +171,7 @@ async fn run_inner(app: &Arc<App>, sid: &str, text: String) -> Result<()> {
                 continue;
             }
 
-            let out = if name.starts_with("mcp__") {
-                app.mcp.call_tool(&name, input).await
-            } else {
-                tools::execute(app, &name, &input).await
-            };
+            let out = run_tool(app, &name, &input, &cancelled).await;
             match out {
                 Ok(text) => {
                     app.emit(sid, EvKind::ToolEnd {
@@ -219,13 +215,41 @@ async fn run_inner(app: &Arc<App>, sid: &str, text: String) -> Result<()> {
     Ok(())
 }
 
+/// Run a tool call while polling the cancel flag — dropping the future on
+/// cancel aborts the HTTP request / kills the shell child (kill_on_drop).
+/// Hard cap of 5 min so a stuck tool can't wedge the run forever.
+async fn run_tool(
+    app: &Arc<App>,
+    name: &str,
+    input: &serde_json::Value,
+    cancelled: impl Fn() -> bool,
+) -> Result<String, String> {
+    let fut = async {
+        if name.starts_with("mcp__") {
+            app.mcp.call_tool(name, input.clone()).await
+        } else {
+            tools::execute(app, name, input).await
+        }
+    };
+    let out = tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        tokio::pin!(fut);
+        loop {
+            tokio::select! {
+                r = &mut fut => break r,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                    if cancelled() {
+                        break Err("cancelled".into());
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    out.unwrap_or_else(|_| Err("timed out after 300s".into()))
+}
+
 fn preview(s: &str) -> String {
-    let s = s.trim();
-    if s.len() > 400 {
-        format!("{}…", &s[..400])
-    } else {
-        s.to_string()
-    }
+    truncate_preview(s.trim(), 400)
 }
 
 async fn approval_gate(

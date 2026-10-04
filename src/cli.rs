@@ -242,9 +242,5 @@ async fn send_and_print(base: &str, tok: &str, sid: &str, text: String, wait: bo
 }
 
 fn preview(s: &str) -> String {
-    if s.len() > 200 {
-        format!("{}…", &s[..200])
-    } else {
-        s.to_string()
-    }
+    crate::types::truncate_preview(s, 200)
 }

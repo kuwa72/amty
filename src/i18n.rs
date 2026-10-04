@@ -17,6 +17,13 @@ static JA: &[(&str, &str)] = &[
     ("error:", "エラー:"),
     ("you", "あなた"),
     ("assistant", "アシスタント"),
+    ("copy", "コピー"),
+    ("copied", "コピーしました"),
+    ("saved to", "保存しました:"),
+    ("rewind to here", "ここまで巻き戻す"),
+    ("fork from here", "ここから分岐"),
+    ("rewound", "巻き戻しました"),
+    ("forked", "分岐しました"),
     // approvals
     ("approve:", "承認:"),
     ("allow", "許可"),

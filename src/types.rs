@@ -116,6 +116,18 @@ pub fn ensure_tool_results(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     out
 }
 
+/// Byte-length-limited preview that never splits a UTF-8 character.
+pub fn truncate_preview(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
 fn mk_missing_result(id: String) -> Block {
     Block::ToolResult {
         tool_use_id: id,

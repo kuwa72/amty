@@ -75,6 +75,57 @@ pub enum ApprovalMode {
     Allowlist,
 }
 
+/// web_search / web_fetch tool settings.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchConf {
+    /// "duckduckgo" (no key) | "brave" | "tavily" | "searxng"
+    pub backend: String,
+    pub api_key: Option<String>,
+    pub api_key_env: Option<String>,
+    /// SearXNG instance base URL
+    pub base_url: Option<String>,
+    pub max_results: usize,
+    pub fetch_max_chars: usize,
+}
+
+impl Default for SearchConf {
+    fn default() -> Self {
+        Self {
+            backend: "duckduckgo".into(),
+            api_key: None,
+            api_key_env: None,
+            base_url: None,
+            max_results: 5,
+            fetch_max_chars: 20_000,
+        }
+    }
+}
+
+impl SearchConf {
+    /// api_key_env > api_key > the backend's conventional env var.
+    pub fn resolved_key(&self) -> Option<String> {
+        if let Some(env) = &self.api_key_env {
+            if let Ok(v) = std::env::var(env) {
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+        if let Some(k) = &self.api_key {
+            if !k.is_empty() {
+                return Some(k.clone());
+            }
+        }
+        let env = match self.backend.as_str() {
+            "brave" => "BRAVE_API_KEY",
+            "tavily" => "TAVILY_API_KEY",
+            _ => return None,
+        };
+        std::env::var(env).ok().filter(|s| !s.is_empty())
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -124,9 +175,10 @@ impl Default for McpServerConf {
 
 pub const DEFAULT_SYSTEM: &str = "You are amty, a lightweight desktop AI agent. \
 You can read/write files, run shell commands, and change this app's own settings \
-through the provided tools. Ask before destructive actions unless the user already \
-approved them. Keep answers concise. Always reply in the same language the user \
-writes in.";
+through the provided tools. Use web_search to look up current information and \
+web_fetch to read a page; cite source URLs in your answer. Ask before destructive \
+actions unless the user already approved them. Keep answers concise. Always reply \
+in the same language the user writes in.";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -141,6 +193,7 @@ pub struct Config {
     pub system_prompt: String,
     /// UI language: "en" | "ja".
     pub lang: String,
+    pub search: SearchConf,
     pub providers: BTreeMap<String, ProviderConf>,
     /// Same shape as claude_desktop_config.json `mcpServers`.
     pub mcp_servers: BTreeMap<String, McpServerConf>,
@@ -191,6 +244,7 @@ impl Default for Config {
             allow_paths: vec![],
             system_prompt: DEFAULT_SYSTEM.into(),
             lang: "ja".into(),
+            search: SearchConf::default(),
             providers,
             mcp_servers: BTreeMap::new(),
         }
@@ -250,7 +304,8 @@ impl Config {
     /// `config_set` tool / `POST /v1/config` backend.
     /// Keys: provider | model | approval | system_prompt | max_tokens |
     ///       allow_commands | allow_paths | +allow_commands | +allow_paths |
-    ///       provider.<name>.{model,api_key_env,api_key,base_url} | mcp.<name>.enabled
+    ///       provider.<name>.{model,api_key_env,api_key,base_url} | mcp.<name>.enabled |
+    ///       search.{backend,api_key,api_key_env,base_url,max_results,fetch_max_chars}
     pub fn apply_set(&mut self, key: &str, value: &str) -> Result<String> {
         match key {
             "provider" => {
@@ -322,6 +377,24 @@ impl Config {
                 }
                 Ok(format!("{key} updated"))
             }
+            _ if key.starts_with("search.") => {
+                let field = &key["search.".len()..];
+                match field {
+                    "backend" => {
+                        if !["duckduckgo", "brave", "tavily", "searxng"].contains(&value) {
+                            bail!("search.backend must be duckduckgo|brave|tavily|searxng");
+                        }
+                        self.search.backend = value.into();
+                    }
+                    "api_key" => self.search.api_key = Some(value.into()),
+                    "api_key_env" => self.search.api_key_env = Some(value.into()),
+                    "base_url" => self.search.base_url = (!value.is_empty()).then(|| value.into()),
+                    "max_results" => self.search.max_results = value.parse().context("max_results must be a number")?,
+                    "fetch_max_chars" => self.search.fetch_max_chars = value.parse().context("fetch_max_chars must be a number")?,
+                    _ => bail!("unknown search field '{field}'"),
+                }
+                Ok(format!("{key} updated"))
+            }
             _ if key.starts_with("mcp.") => {
                 let parts: Vec<&str> = key.splitn(3, '.').collect();
                 if parts.len() == 3 && parts[2] == "enabled" {
@@ -347,6 +420,19 @@ impl Config {
             "allow_paths" => Ok(self.allow_paths.join(", ")),
             "providers" => Ok(self.providers.keys().cloned().collect::<Vec<_>>().join(", ")),
             "mcp_servers" => Ok(self.mcp_servers.keys().cloned().collect::<Vec<_>>().join(", ")),
+            "search" => Ok(self.search.backend.clone()),
+            _ if key.starts_with("search.") => {
+                let s = &self.search;
+                match &key["search.".len()..] {
+                    "backend" => Ok(s.backend.clone()),
+                    "api_key" => Ok(if s.resolved_key().is_some() { "***set***".into() } else { String::new() }),
+                    "api_key_env" => Ok(s.api_key_env.clone().unwrap_or_default()),
+                    "base_url" => Ok(s.base_url.clone().unwrap_or_default()),
+                    "max_results" => Ok(s.max_results.to_string()),
+                    "fetch_max_chars" => Ok(s.fetch_max_chars.to_string()),
+                    _ => bail!("unknown search field"),
+                }
+            }
             _ if key.starts_with("provider.") => {
                 let parts: Vec<&str> = key.splitn(3, '.').collect();
                 let p = self.providers.get(parts.get(1).copied().unwrap_or("")).ok_or_else(|| anyhow!("unknown provider"))?;

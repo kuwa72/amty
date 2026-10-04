@@ -462,18 +462,83 @@ impl Provider for CommandCode {
     }
 }
 
+/// Locate the `cmdc` CLI. On Windows the npm install drops a `cmdc.cmd` shim
+/// under %APPDATA%\npm that a bare `Command::new("cmdc")` won't resolve
+/// (no .cmd extension lookup), and a GUI process's PATH may predate the
+/// install — probe `where` first, then the well-known locations.
+fn cmdc_exe() -> Option<String> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        Some("cmdc".to_string())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(o) = std::process::Command::new("where").arg("cmdc").output() {
+            if o.status.success() {
+                // npm's dir holds `cmdc` (sh script), `cmdc.cmd`, `cmdc.ps1`;
+                // only the .cmd/.exe forms are spawnable directly
+                if let Some(p) = String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .find(|l| l.ends_with(".cmd") || l.ends_with(".exe") || l.ends_with(".bat"))
+                {
+                    return Some(p);
+                }
+            }
+        }
+        let appdata = std::env::var("APPDATA").unwrap_or_default();
+        let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        let user = std::env::var("USERPROFILE").unwrap_or_default();
+        for p in [
+            format!(r"{appdata}\npm\cmdc.cmd"),
+            format!(r"{local}\Programs\cmdc\cmdc.exe"),
+            format!(r"{user}\scoop\shims\cmdc.exe"),
+            format!(r"{local}\fnm\aliases\default\cmdc.cmd"),
+        ] {
+            if std::path::Path::new(&p).exists() {
+                return Some(p);
+            }
+        }
+        None
+    }
+}
+
+/// `cmdc <args>` → stdout, "" on any failure. When cmdc was resolved to a
+/// fallback path instead of PATH, prepend the nodejs dirs so the .cmd shim
+/// can still find `node`.
+fn cmdc_output(args: &[&str]) -> String {
+    let Some(exe) = cmdc_exe() else { return String::new() };
+    let mut c = std::process::Command::new(&exe);
+    c.args(args);
+    inject_node_path(&exe, &mut c);
+    c.output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default()
+}
+
+/// When cmdc was resolved to a fallback path instead of PATH, prepend the
+/// nodejs dirs so the .cmd shim can still find `node`.
+#[cfg(target_os = "windows")]
+fn inject_node_path(exe: &str, c: &mut std::process::Command) {
+    let mut path = std::env::var("PATH").unwrap_or_default();
+    if let Some(dir) = std::path::Path::new(exe).parent() {
+        path = format!("{};{path}", dir.display());
+    }
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        path = format!(r"{pf}\nodejs;{path}");
+    }
+    c.env("PATH", path);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn inject_node_path(_exe: &str, _c: &mut std::process::Command) {}
+
 fn cmdc_version() -> &'static str {
     static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     V.get_or_init(|| {
-        std::process::Command::new("cmdc")
-            .arg("--version")
-            .output()
-            .ok()
-            .and_then(|o| {
-                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                (!s.is_empty()).then_some(s)
-            })
-            .unwrap_or_else(|| "1.74.0".into())
+        let s = cmdc_output(&["--version"]).trim().to_string();
+        if s.is_empty() { "1.74.0".into() } else { s }
     })
 }
 
@@ -623,25 +688,39 @@ pub fn model_suggestions(kind: crate::config::ProviderKind) -> Vec<String> {
 fn cmdc_models() -> &'static [String] {
     static V: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     V.get_or_init(|| {
-        let out = std::process::Command::new("cmdc")
-            .arg("--list-models")
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_default();
+        let out = cmdc_output(&["--list-models"]);
         let mut models: Vec<String> = out
             .lines()
             .filter_map(|l| l.split_whitespace().next())
             .filter(|tok| tok.contains('/') || tok.starts_with("claude-") || tok.starts_with("gpt-"))
-            .filter(|tok| tok.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.')))
+            .filter(|tok| tok.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | ':')))
             .map(String::from)
             .collect();
         if models.is_empty() {
-            models.push("deepseek/deepseek-v4-flash".into());
+            // cmdc missing/unparseable — offer a usable shortlist anyway
+            models = FALLBACK_CC_MODELS.iter().map(|s| s.to_string()).collect();
         }
         models
     })
 }
+
+/// Last-resort model list when `cmdc` can't be run (e.g. not installed on
+/// Windows). The model field stays free-text; these are just menu entries.
+const FALLBACK_CC_MODELS: &[&str] = &[
+    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-pro",
+    "moonshotai/kimi-k3",
+    "moonshotai/kimi-k2.5",
+    "z-ai/glm-5.3-flash",
+    "zai-org/glm-5.3",
+    "claude-sonnet-5-5",
+    "claude-opus-5-5",
+    "claude-haiku-4-5",
+    "gpt-5.5",
+    "gpt-5.4-mini",
+    "google/gemini-3.8-flash",
+    "xai/grok-4.7",
+];
 
 #[cfg(test)]
 mod tests {

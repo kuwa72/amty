@@ -45,7 +45,7 @@ fn tool_defs() -> Vec<Value> {
     ),
     (
         "amty_set_config",
-        "Change an amty setting. Keys: provider, model, approval, system_prompt, max_tokens, allow_commands, allow_paths, provider.<name>.<field>, mcp.<name>.enabled.",
+        "Change an amty setting. Keys: provider, model, approval, system_prompt, max_tokens, allow_commands, allow_paths, provider.<name>.<field>, mcp.<name>.enabled, search.<field>.",
         json!({"type": "object", "properties": {
             "key": {"type": "string"}, "value": {"type": "string"}}, "required": ["key", "value"]}),
     ),

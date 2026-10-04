@@ -192,6 +192,42 @@ impl SessionStore {
         }
     }
 
+    /// Rewind: keep only the first `keep` messages of the session.
+    pub fn truncate(&self, id: &str, keep: usize) -> bool {
+        let mut map = self.map.write().unwrap();
+        if let Some(s) = map.get_mut(id) {
+            s.messages.truncate(keep);
+            s.updated = now_secs();
+            s.seq = self.next_seq();
+            let s = s.clone();
+            drop(map);
+            self.persist(&s);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Branch: new session containing the first `keep` messages of `id`,
+    /// inheriting its provider/model overrides. Returns the new session id.
+    pub fn fork(&self, id: &str, keep: usize) -> Option<String> {
+        let src = self.get(id)?;
+        let new_id = self.create(src.provider.clone(), src.model.clone());
+        {
+            let mut map = self.map.write().unwrap();
+            if let Some(s) = map.get_mut(&new_id) {
+                s.title = format!("{} (fork)", src.title);
+                s.messages = src.messages[..keep.min(src.messages.len())].to_vec();
+                s.updated = now_secs();
+                s.seq = self.next_seq();
+                let s = s.clone();
+                drop(map);
+                self.persist(&s);
+            }
+        }
+        Some(new_id)
+    }
+
     pub fn delete(&self, id: &str) {
         self.map.write().unwrap().remove(id);
         let _ = std::fs::remove_file(self.dir.join(format!("{id}.jsonl")));
@@ -253,6 +289,30 @@ mod tests {
         assert_eq!(s.messages.len(), 2);
         assert_eq!(s.model.as_deref(), Some("m1"));
         assert!(s.title.contains("hello"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn truncate_and_fork() {
+        let (store, dir) = temp_store();
+        let id = store.create(Some("p".into()), Some("m".into()));
+        store.push_message(&id, ChatMessage::user("one"));
+        store.push_message(&id, ChatMessage {
+            role: Role::Assistant,
+            blocks: vec![Block::Text { text: "a".into() }],
+        });
+        store.push_message(&id, ChatMessage::user("two"));
+        let fork = store.fork(&id, 2).unwrap();
+        let f = store.get(&fork).unwrap();
+        assert_eq!(f.messages.len(), 2);
+        assert_eq!(f.provider.as_deref(), Some("p"));
+        assert!(f.title.contains("fork"));
+        assert!(store.truncate(&id, 1));
+        assert_eq!(store.get(&id).unwrap().messages.len(), 1);
+        drop(store);
+        let store2 = SessionStore::load(dir.clone());
+        assert_eq!(store2.get(&fork).unwrap().messages.len(), 2);
+        assert_eq!(store2.get(&id).unwrap().messages.len(), 1);
         std::fs::remove_dir_all(dir).ok();
     }
 

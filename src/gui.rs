@@ -53,9 +53,25 @@ fn install_cjk_fonts(ctx: &egui::Context) {
     for path in CANDIDATES {
         if let Ok(bytes) = std::fs::read(path) {
             let mut fonts = egui::FontDefinitions::default();
+            let mut data = egui::FontData::from_owned(bytes);
+            // egui centers a fallback face's box rather than sharing the
+            // baseline — compute the y_offset that puts the CJK baseline on
+            // the primary face's, from the fonts' own hhea metrics.
+            if let Some((p, c)) = fonts
+                .families
+                .get(&egui::FontFamily::Proportional)
+                .and_then(|f| f.first())
+                .and_then(|n| fonts.font_data.get(n))
+                .and_then(|d| face_metrics(&d.font))
+                .and_then(|p| face_metrics(&data.font).map(|c| (p, c)))
+            {
+                let hl = p.ascent - p.descent + p.leading;
+                let hc = c.ascent - c.descent + c.leading;
+                data.tweak.y_offset_factor = p.ascent - c.ascent - 0.5 * (hl - hc);
+            }
             fonts
                 .font_data
-                .insert("cjk".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+                .insert("cjk".into(), std::sync::Arc::new(data));
             fonts
                 .families
                 .entry(egui::FontFamily::Proportional)
@@ -70,6 +86,70 @@ fn install_cjk_fonts(ctx: &egui::Context) {
             return;
         }
     }
+}
+
+/// Vertical metrics of a sfnt face (em fractions) read from head/hhea —
+/// enough to align baselines between two fonts. Handles .ttf/.otf and the
+/// first face of a .ttc.
+struct FaceMetrics {
+    ascent: f32,
+    descent: f32,
+    leading: f32,
+}
+
+fn face_metrics(data: &[u8]) -> Option<FaceMetrics> {
+    let mut off = 0usize;
+    if data.get(..4) == Some(b"ttcf") {
+        off = u32::from_be_bytes(data.get(12..16)?.try_into().ok()?) as usize;
+    }
+    let tables = u16::from_be_bytes(data.get(off + 4..off + 6)?.try_into().ok()?) as usize;
+    let (mut head, mut hhea, mut os2) = (None, None, None);
+    for i in 0..tables {
+        let r = off + 12 + i * 16;
+        let toff = u32::from_be_bytes(data.get(r + 8..r + 12)?.try_into().ok()?) as usize;
+        match data.get(r..r + 4) {
+            Some(b"head") => head = Some(toff),
+            Some(b"hhea") => hhea = Some(toff),
+            Some(b"OS/2") => os2 = Some(toff),
+            _ => {}
+        }
+    }
+    let i16at = |p: usize| -> Option<f32> {
+        Some(i16::from_be_bytes(data.get(p..p + 2)?.try_into().ok()?) as f32)
+    };
+    let u16at = |p: usize| -> Option<f32> {
+        Some(u16::from_be_bytes(data.get(p..p + 2)?.try_into().ok()?) as f32)
+    };
+    let upm = u16at(head? + 18)?;
+    let h = hhea?;
+    // mirror skrifa's Metrics: OS/2 typo metrics when USE_TYPO_METRICS
+    // (fsSelection bit 7) is set, else hhea, else OS/2 typo/win as a last
+    // resort when hhea is all zeros.
+    let (mut a, mut d, mut l) = (i16at(h + 4)?, i16at(h + 6)?, i16at(h + 8)?);
+    if let Some(o) = os2 {
+        let use_typo = u16at(o + 62).map(|s| (s as u16) & 0x80 != 0).unwrap_or(false);
+        if use_typo {
+            a = i16at(o + 68)?;
+            d = i16at(o + 70)?;
+            l = i16at(o + 72)?;
+        } else if a == 0.0 && d == 0.0 {
+            let (ta, td) = (i16at(o + 68).unwrap_or(0.0), i16at(o + 70).unwrap_or(0.0));
+            if ta != 0.0 || td != 0.0 {
+                a = ta;
+                d = td;
+                l = i16at(o + 72).unwrap_or(0.0);
+            } else {
+                a = u16at(o + 74).unwrap_or(0.0);
+                d = -u16at(o + 76).unwrap_or(0.0);
+                l = 0.0;
+            }
+        }
+    }
+    Some(FaceMetrics {
+        ascent: a / upm,
+        descent: d / upm,
+        leading: l / upm,
+    })
 }
 
 struct PendingView {
@@ -369,6 +449,37 @@ impl eframe::App for GuiApp {
 
         // ----- bottom: input -----
         egui::Panel::bottom("input").show(ui, |ui| {
+            // pending approvals sit right above the input row so they can't
+            // hide behind the chat or drift off-screen like a floating window
+            let mut resolved: Vec<(String, bool)> = vec![];
+            for p in &self.pending {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 200, 80),
+                            format!("⚠ {} {}", self.tr("approve:"), p.tool),
+                        );
+                        if ui.button(self.tr("allow")).clicked() {
+                            resolved.push((p.id.clone(), true));
+                        }
+                        if ui.button(self.tr("deny")).clicked() {
+                            resolved.push((p.id.clone(), false));
+                        }
+                    });
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(p.detail.chars().take(600).collect::<String>())
+                                .monospace()
+                                .small(),
+                        )
+                        .wrap(),
+                    );
+                });
+            }
+            for (id, allow) in resolved {
+                self.app.approvals.resolve(&id, allow);
+                self.pending.retain(|p| p.id != id);
+            }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let w = (ui.available_width() - 90.0).max(100.0);
@@ -431,9 +542,13 @@ impl eframe::App for GuiApp {
             ui.separator();
             egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
                 let lang = self.app.cfg.read().unwrap().lang.clone();
+                let mut action = None;
+                let running_now = *self.running.get(&self.current).unwrap_or(&false);
                 if let Some(s) = self.view.clone() {
-                    for msg in &s.messages {
-                        render_message(ui, &mut self.mark, msg, &lang);
+                    for (i, msg) in s.messages.iter().enumerate() {
+                        if let Some(a) = render_message(ui, &mut self.mark, msg, &lang, i, running_now) {
+                            action = Some(a);
+                        }
                     }
                 } else {
                     ui.weak(self.tr("send a message to start"));
@@ -441,34 +556,40 @@ impl eframe::App for GuiApp {
                 if let Some(t) = self.live_text.get(&self.current) {
                     if !t.is_empty() {
                         ui.colored_label(ui.visuals().weak_text_color(), self.tr("assistant"));
-                        egui_commonmark::CommonMarkViewer::new().show(ui, &mut self.mark, t);
+                        egui_commonmark::CommonMarkViewer::new().show(ui, &mut self.mark, &linkify(t));
                     }
+                }
+                match action {
+                    Some(MsgAction::Copy(text)) => {
+                        ui.ctx().copy_text(text);
+                        let m = self.tr("copied");
+                        self.toast(m);
+                    }
+                    Some(MsgAction::Save(text)) => {
+                        let m = match export_text(&text) {
+                            Ok(p) => format!("{} {}", self.tr("saved to"), p.display()),
+                            Err(e) => format!("{} {e}", self.tr("save failed:")),
+                        };
+                        self.toast(m);
+                    }
+                    Some(MsgAction::Rewind(i)) => {
+                        self.app.sessions.truncate(&self.current, i + 1);
+                        self.view_dirty = true;
+                        let m = self.tr("rewound");
+                        self.toast(m);
+                    }
+                    Some(MsgAction::Fork(i)) => {
+                        if let Some(id) = self.app.sessions.fork(&self.current, i + 1) {
+                            self.current = id;
+                            self.view_dirty = true;
+                            let m = self.tr("forked");
+                            self.toast(m);
+                        }
+                    }
+                    None => {}
                 }
             });
         });
-
-        // ----- approvals -----
-        let mut resolved: Vec<(String, bool)> = vec![];
-        for p in &self.pending {
-            egui::Window::new(format!("{} {}", self.tr("approve:"), p.tool))
-                .collapsible(false)
-                .resizable(false)
-                .show(&ctx, |ui| {
-                    ui.label(&p.detail);
-                    ui.horizontal(|ui| {
-                        if ui.button(self.tr("allow")).clicked() {
-                            resolved.push((p.id.clone(), true));
-                        }
-                        if ui.button(self.tr("deny")).clicked() {
-                            resolved.push((p.id.clone(), false));
-                        }
-                    });
-                });
-        }
-        for (id, allow) in resolved {
-            self.app.approvals.resolve(&id, allow);
-            self.pending.retain(|p| p.id != id);
-        }
 
         if self.show_mcp {
             let lang = self.app.cfg.read().unwrap().lang.clone();
@@ -682,24 +803,57 @@ impl eframe::App for GuiApp {
     }
 }
 
-fn render_message(ui: &mut egui::Ui, mark: &mut egui_commonmark::CommonMarkCache, msg: &crate::types::ChatMessage, lang: &str) {
+enum MsgAction {
+    Copy(String),
+    Save(String),
+    /// keep messages[..=idx] in this session
+    Rewind(usize),
+    /// new session with messages[..=idx]
+    Fork(usize),
+}
+
+fn render_message(ui: &mut egui::Ui, mark: &mut egui_commonmark::CommonMarkCache, msg: &crate::types::ChatMessage, lang: &str, idx: usize, running: bool) -> Option<MsgAction> {
     let t = |k: &'static str| crate::i18n::t(lang, k);
     let (label, color) = match msg.role {
         Role::User => (t("you"), egui::Color32::from_rgb(120, 180, 255)),
         Role::Assistant => (t("assistant"), egui::Color32::from_rgb(160, 220, 160)),
     };
+    let mut action = None;
     let is_tool_msg = msg.blocks.iter().all(|b| matches!(b, Block::ToolResult { .. }));
     if !is_tool_msg {
-        ui.colored_label(color, label);
+        ui.horizontal(|ui| {
+            ui.colored_label(color, label);
+            let text = msg.text_content();
+            if !text.trim().is_empty() {
+                if ui.small_button(t("copy")).clicked() {
+                    action = Some(MsgAction::Copy(text.clone()));
+                }
+                if ui.small_button(t("save")).clicked() {
+                    action = Some(MsgAction::Save(text));
+                }
+            }
+            ui.menu_button("⋯", |ui| {
+                ui.add_enabled_ui(!running, |ui| {
+                    if ui.button(t("rewind to here")).clicked() {
+                        action = Some(MsgAction::Rewind(idx));
+                        ui.close();
+                    }
+                    if ui.button(t("fork from here")).clicked() {
+                        action = Some(MsgAction::Fork(idx));
+                        ui.close();
+                    }
+                });
+            });
+        });
     }
-    for b in &msg.blocks {
+    for (bi, b) in msg.blocks.iter().enumerate() {
         match b {
             Block::Text { text } => {
-                egui_commonmark::CommonMarkViewer::new().show(ui, mark, text);
+                egui_commonmark::CommonMarkViewer::new().show(ui, mark, &linkify(text));
             }
             Block::ToolUse { name, input, .. } => {
                 egui::CollapsingHeader::new(format!("🔧 {name}"))
-                    .id_salt(format!("tu_{name}_{}", msg.blocks.len()))
+                    .id_salt(format!("tu_{idx}_{bi}"))
                     .show(ui, |ui| {
                         ui.add(egui::Label::new(
                             egui::RichText::new(input.to_string()).monospace().small(),
@@ -709,15 +863,99 @@ fn render_message(ui: &mut egui::Ui, mark: &mut egui_commonmark::CommonMarkCache
             Block::ToolResult { content, is_error, .. } => {
                 let head = if *is_error { t("✗ result (error)") } else { t("✓ result") };
                 egui::CollapsingHeader::new(head)
-                    .id_salt(format!("tr_{}", content.as_ptr() as usize))
+                    .id_salt(format!("tr_{idx}_{bi}"))
                     .show(ui, |ui| {
-                        let t = if content.len() > 3000 { format!("{}…", &content[..3000]) } else { content.clone() };
+                        let t = crate::types::truncate_preview(content, 3000);
                         ui.add(egui::Label::new(egui::RichText::new(t).monospace().small()).wrap());
                     });
             }
         }
     }
     ui.add_space(8.0);
+    action
+}
+
+/// Write a message's text to a file (Downloads dir when known, else home)
+/// and return the path used.
+fn export_text(text: &str) -> std::io::Result<std::path::PathBuf> {
+    let dir = dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let path = dir.join(format!("amty-{secs}.md"));
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
+
+/// Wrap bare http(s) URLs in `<…>` autolinks so the markdown viewer renders
+/// them clickable. Fenced code blocks, inline code spans, and URLs already
+/// inside markdown link/autolink syntax are left untouched.
+fn linkify(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 32);
+    let mut in_fence = false;
+    for line in text.split_inclusive('\n') {
+        let t = line.trim_start();
+        let fence = t.starts_with("```") || t.starts_with("~~~");
+        if in_fence || fence {
+            in_fence ^= fence;
+            out.push_str(line);
+            continue;
+        }
+        out.push_str(&linkify_line(line));
+    }
+    out
+}
+
+fn linkify_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len() + 16);
+    let mut rest = line;
+    let mut backticks = 0usize;
+    loop {
+        let pos = rest
+            .find("http://")
+            .into_iter()
+            .chain(rest.find("https://"))
+            .min();
+        let Some(pos) = pos else {
+            out.push_str(rest);
+            break;
+        };
+        let (before, from) = rest.split_at(pos);
+        backticks += before.matches('`').count();
+        // skip inside `inline code` or when preceded by a markdown link char
+        let skip = backticks % 2 == 1
+            || matches!(before.chars().last(), Some('(' | '[' | '<' | '=' | '"' | '\''));
+        let mut end = from.len();
+        for (i, ch) in from.char_indices() {
+            if matches!(ch, ' ' | '\t' | '\n' | '\r' | '<' | '>' | '"' | '\'') {
+                end = i;
+                break;
+            }
+        }
+        // drop trailing sentence punctuation and unbalanced ')'
+        let mut url = &from[..end];
+        while let Some(c) = url.chars().last() {
+            let unbalanced = c == ')' && url.matches(')').count() > url.matches('(').count();
+            if matches!(c, '.' | ',' | ';' | ':' | '!' | '?') || unbalanced {
+                url = &url[..url.len() - c.len_utf8()];
+            } else {
+                break;
+            }
+        }
+        out.push_str(before);
+        if skip || url.len() <= "https://".len() {
+            out.push_str(url);
+        } else {
+            out.push('<');
+            out.push_str(url);
+            out.push('>');
+        }
+        rest = &from[url.len()..];
+    }
+    out
 }
 
 fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut SettingsBuf, save: &mut bool, import: &mut bool) {
@@ -925,4 +1163,27 @@ fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut S
             }
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linkify_wraps_bare_urls() {
+        assert_eq!(linkify("see https://example.com/x now"), "see <https://example.com/x> now");
+        // url at end of line — newline must not leak into the autolink
+        assert_eq!(linkify("url https://a.b/c\n"), "url <https://a.b/c>\n");
+        assert_eq!(linkify("https://a.b/c"), "<https://a.b/c>");
+        // trailing punctuation stays outside
+        assert_eq!(linkify("see https://a.b/c."), "see <https://a.b/c>.");
+    }
+
+    #[test]
+    fn linkify_leaves_markdown_and_code_alone() {
+        assert_eq!(linkify("[t](https://a.b)"), "[t](https://a.b)");
+        assert_eq!(linkify("<https://a.b>"), "<https://a.b>");
+        assert_eq!(linkify("`https://a.b`"), "`https://a.b`");
+        assert_eq!(linkify("```\nhttps://a.b\n```"), "```\nhttps://a.b\n```");
+    }
 }
