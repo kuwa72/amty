@@ -506,15 +506,21 @@ fn cmdc_exe() -> Option<String> {
 /// `cmdc <args>` → stdout, "" on any failure. When cmdc was resolved to a
 /// fallback path instead of PATH, prepend the nodejs dirs so the .cmd shim
 /// can still find `node`.
-fn cmdc_output(args: &[&str]) -> String {
-    let Some(exe) = cmdc_exe() else { return String::new() };
+fn cmdc_output(args: &[&str]) -> Result<String, String> {
+    let Some(exe) = cmdc_exe() else { return Err("cmdc not found".into()) };
     let mut c = std::process::Command::new(&exe);
     c.args(args);
     inject_node_path(&exe, &mut c);
-    c.output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default()
+    match c.output() {
+        Ok(o) => {
+            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+            if s.is_empty() {
+                s.push_str(&String::from_utf8_lossy(&o.stderr));
+            }
+            Ok(s)
+        }
+        Err(e) => Err(format!("spawn {}: {}", exe, e)),
+    }
 }
 
 /// When cmdc was resolved to a fallback path instead of PATH, prepend the
@@ -537,7 +543,7 @@ fn inject_node_path(_exe: &str, _c: &mut std::process::Command) {}
 fn cmdc_version() -> &'static str {
     static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     V.get_or_init(|| {
-        let s = cmdc_output(&["--version"]).trim().to_string();
+        let s = cmdc_output(&["--version"]).unwrap_or_default().trim().to_string();
         if s.is_empty() { "1.74.0".into() } else { s }
     })
 }
@@ -672,7 +678,7 @@ impl CommandCode {
 pub fn model_suggestions(kind: crate::config::ProviderKind) -> Vec<String> {
     use crate::config::ProviderKind as K;
     match kind {
-        K::CommandCode => cmdc_models().to_vec(),
+        K::CommandCode => cmdc_models().0,
         K::Anthropic => [
             "claude-sonnet-4-5",
             "claude-opus-4-1",
@@ -685,26 +691,36 @@ pub fn model_suggestions(kind: crate::config::ProviderKind) -> Vec<String> {
     }
 }
 
-fn cmdc_models() -> &'static [String] {
-    static V: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    V.get_or_init(|| {
-        let out = cmdc_output(&["--list-models"]);
-        let mut models: Vec<String> = out
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty())
-            .filter_map(|l| l.split_whitespace().next())
-            // model ids start lowercase/digit and contain - / . _
-            .filter(|tok| tok.chars().next().map(|c| c.is_ascii_lowercase() || c.is_ascii_digit()).unwrap_or(false))
-            .filter(|tok| tok.contains(&['/', '-', '.', '_']))
-            .map(String::from)
-            .collect();
-        if models.is_empty() {
-            // cmdc missing/unparseable — offer a usable shortlist anyway
-            models = FALLBACK_CC_MODELS.iter().map(|s| s.to_string()).collect();
-        }
-        models
-    })
+/// Returns (models, error) — error=Some(msg) means `cmdc --list-models` failed.
+pub fn cmdc_models() -> (Vec<String>, Option<String>) {
+    static CACHE: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+    if let Some(models) = CACHE.lock().unwrap().clone() {
+        return (models, None);
+    }
+    let out = cmdc_output(&["--list-models"]);
+    let mut models: Vec<String> = out
+        .as_ref()
+        .map(|s| {
+            s.lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .filter_map(|l| l.split_whitespace().next())
+                // model ids start lowercase/digit and contain - / . _
+                .filter(|tok| tok.chars().next().map(|c| c.is_ascii_lowercase() || c.is_ascii_digit()).unwrap_or(false))
+                .filter(|tok| tok.contains(&['/', '-', '.', '_']))
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let err = out.err();
+    if models.is_empty() {
+        // do not cache failure — retry next call so a transient cmdc issue
+        // doesn't stick for the whole session
+        models = FALLBACK_CC_MODELS.iter().map(|s| s.to_string()).collect();
+    } else {
+        *CACHE.lock().unwrap() = Some(models.clone());
+    }
+    (models, err)
 }
 
 /// Last-resort model list when `cmdc` can't be run (e.g. not installed on
@@ -769,6 +785,19 @@ mod tests {
         assert_eq!(v[2]["tool_calls"][0]["function"]["name"], "fs_read");
         assert_eq!(v[3]["role"], "tool");
         assert_eq!(v[3]["tool_call_id"], "t1");
+    }
+
+    #[test]
+    #[ignore] // requires cmdc on PATH
+    fn cmdc_models_real() {
+        let out = cmdc_output(&["--list-models"]);
+        match &out {
+            Ok(s) => eprintln!("cmdc raw output ({} bytes):\n{}", s.len(), s),
+            Err(e) => eprintln!("cmdc error: {}", e),
+        }
+        let (models, err) = cmdc_models();
+        eprintln!("parsed {} models (err={:?})", models.len(), err);
+        eprintln!("{:?}", models);
     }
 }
 

@@ -11,6 +11,7 @@ static JA: &[(&str, &str)] = &[
     ("send", "送信"),
     ("stop", "停止"),
     ("bypass", "bypass（自動承認）"),
+    ("cmdc --list-models unavailable — showing fallback list", "cmdc --list-models が利用できません — フォールバックリストを表示中"),
     ("message (Enter to send, Shift+Enter for newline)", "メッセージ (Enterで送信 / Shift+Enterで改行)"),
     ("send a message to start", "メッセージを送ると会話が始まります"),
     ("already running in this session", "このセッションは実行中です"),

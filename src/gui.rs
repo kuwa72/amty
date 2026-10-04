@@ -413,9 +413,23 @@ impl eframe::App for GuiApp {
                     self.view_dirty = true;
                 }
                 let kind = self.app.cfg.read().unwrap().providers.get(&prov).map(|p| p.kind);
-                let suggestions = kind.map(crate::provider::model_suggestions).unwrap_or_default();
+                let (suggestions, err) = match kind {
+                    Some(crate::config::ProviderKind::CommandCode) => crate::provider::cmdc_models(),
+                    _ => (kind.map(crate::provider::model_suggestions).unwrap_or_default(), None),
+                };
                 if !suggestions.is_empty() {
-                    ui.menu_button(format!("▾ ({})", suggestions.len()), |ui| {
+                    let label = match err {
+                        None => format!("▾ ({})", suggestions.len()),
+                        Some(_) => format!("▾ ({}) ⚠", suggestions.len()),
+                    };
+                    ui.menu_button(label, |ui| {
+                        if let Some(e) = &err {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 200, 80),
+                                format!("{}: {}", self.tr("cmdc --list-models unavailable — showing fallback list"), e),
+                            );
+                            ui.separator();
+                        }
                         egui::ScrollArea::vertical()
                             .max_height(400.0)
                             .show(ui, |ui| {
