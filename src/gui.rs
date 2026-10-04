@@ -8,14 +8,27 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
+fn app_icon() -> egui::viewport::IconData {
+    let bytes = include_bytes!("../assets/amty-icon.png");
+    let img = image::load_from_memory(bytes).expect("embedded icon");
+    let rgba = img.to_rgba8();
+    egui::viewport::IconData {
+        rgba: rgba.to_vec(),
+        width: img.width(),
+        height: img.height(),
+    }
+}
+
 pub fn run(rt: tokio::runtime::Runtime, app: Arc<App>) -> eframe::Result<()> {
     let handle = rt.handle().clone();
     std::thread::spawn(move || rt.block_on(std::future::pending::<()>()));
+    let icon = app_icon();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 720.0])
             .with_min_inner_size([560.0, 380.0])
-            .with_app_id("amty"),
+            .with_app_id("amty")
+            .with_icon(icon),
         ..Default::default()
     };
     eframe::run_native(
