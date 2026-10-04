@@ -691,9 +691,12 @@ fn cmdc_models() -> &'static [String] {
         let out = cmdc_output(&["--list-models"]);
         let mut models: Vec<String> = out
             .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
             .filter_map(|l| l.split_whitespace().next())
-            .filter(|tok| tok.contains('/') || tok.starts_with("claude-") || tok.starts_with("gpt-"))
-            .filter(|tok| tok.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | ':')))
+            // model ids start lowercase/digit and contain - / . _
+            .filter(|tok| tok.chars().next().map(|c| c.is_ascii_lowercase() || c.is_ascii_digit()).unwrap_or(false))
+            .filter(|tok| tok.contains(&['/', '-', '.', '_']))
             .map(String::from)
             .collect();
         if models.is_empty() {

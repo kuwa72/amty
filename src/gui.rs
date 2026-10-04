@@ -415,15 +415,19 @@ impl eframe::App for GuiApp {
                 let kind = self.app.cfg.read().unwrap().providers.get(&prov).map(|p| p.kind);
                 let suggestions = kind.map(crate::provider::model_suggestions).unwrap_or_default();
                 if !suggestions.is_empty() {
-                    ui.menu_button("▾", |ui| {
-                        for s in suggestions {
-                            if ui.button(&s).clicked() {
-                                let sid = self.ensure_session();
-                                self.app.sessions.set_fields(&sid, None, Some(s));
-                                self.view_dirty = true;
-                                ui.close();
-                            }
-                        }
+                    ui.menu_button(format!("▾ ({})", suggestions.len()), |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(400.0)
+                            .show(ui, |ui| {
+                                for s in suggestions {
+                                    if ui.button(&s).clicked() {
+                                        let sid = self.ensure_session();
+                                        self.app.sessions.set_fields(&sid, None, Some(s));
+                                        self.view_dirty = true;
+                                        ui.close();
+                                    }
+                                }
+                            });
                     });
                 }
             });
