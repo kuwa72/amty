@@ -508,6 +508,17 @@ impl eframe::App for GuiApp {
                     self.app.cancel(&self.current);
                 }
             });
+            ui.horizontal(|ui| {
+                let mut bypass = self.app.cfg.read().unwrap().approval == ApprovalMode::Auto;
+                if ui.checkbox(&mut bypass, self.tr("bypass")).changed() {
+                    let mut cfg = self.app.cfg.write().unwrap();
+                    cfg.approval = if bypass { ApprovalMode::Auto } else { ApprovalMode::Ask };
+                    if let Err(e) = cfg.save(&self.app.cfg_path) {
+                        drop(cfg);
+                        self.toast(format!("{} {e}", self.tr("save failed:")));
+                    }
+                }
+            });
         });
 
         // ----- center: chat -----
