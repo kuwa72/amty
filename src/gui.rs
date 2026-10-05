@@ -177,6 +177,25 @@ struct SettingsBuf {
     sel_mcp: Option<String>,
     new_provider: String,
     new_mcp: String,
+    /// active tab index (providers / mcp / skills / behavior)
+    tab: usize,
+}
+
+/// `YYYY-MM-DD HH:MM` (UTC) from a unix timestamp — no date crate dependency.
+fn stamp(secs: u64) -> String {    let days = (secs / 86_400) as i64;
+    let (h, m) = ((secs / 3600) % 24, (secs / 60) % 60);
+    // days since 1970-01-01 -> civil date (Howard Hinnant's algorithm)
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}")
 }
 
 pub struct GuiApp {
@@ -198,6 +217,11 @@ pub struct GuiApp {
     view_dirty: bool,
     toast: Option<(String, Instant)>,
     mark: egui_commonmark::CommonMarkCache,
+    /// last-frame rect of each message's header row, for hover-reveal actions
+    row_rects: HashMap<usize, egui::Rect>,
+    /// session currently being renamed inline (sidebar)
+    rename_id: Option<String>,
+    rename_buf: String,
     settings: Option<SettingsBuf>,
     show_mcp: bool,
     /// catalog entry selected for install (id into catalog::CATALOG)
@@ -227,8 +251,11 @@ impl GuiApp {
             view_dirty: true,
             toast: None,
             mark: egui_commonmark::CommonMarkCache::default(),
+            row_rects: HashMap::new(),
             settings: None,
             show_mcp: false,
+            rename_id: None,
+            rename_buf: String::new(),
             cat_sel: None,
             cat_env: HashMap::new(),
             cat_keys: HashMap::new(),
@@ -285,6 +312,10 @@ impl GuiApp {
                 self.last_error.insert(ev.session.clone(), message);
                 self.live_text.remove(&ev.session);
                 self.live_tool.remove(&ev.session);
+                self.view_dirty = true;
+            }
+            EvKind::Compacted { dropped } => {
+                self.toast(format!("{} ({dropped})", self.tr("context compacted")));
                 self.view_dirty = true;
             }
             EvKind::Touched | EvKind::Done => {
@@ -422,14 +453,64 @@ impl eframe::App for GuiApp {
             });
             ui.separator();
             egui::ScrollArea::vertical().id_salt("sessions").show(ui, |ui| {
-                for meta in self.app.sessions.list() {
+                let metas = self.app.sessions.list();
+                let mut rename: Option<(String, String)> = None;
+                let mut delete: Option<String> = None;
+                for meta in metas {
                     let selected = meta.id == self.current;
                     let running = *self.running.get(&meta.id).unwrap_or(&false);
+                    if self.rename_id.as_deref() == Some(meta.id.as_str()) {
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.rename_buf)
+                                .desired_width(f32::INFINITY),
+                        );
+                        resp.request_focus();
+                        let done = resp.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if done || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            rename = Some((meta.id.clone(), self.rename_buf.trim().to_string()));
+                        }
+                        continue;
+                    }
                     let label = if running { format!("● {}", meta.title) } else { meta.title.clone() };
-                    if ui.selectable_label(selected, label).clicked() {
+                    let resp = ui.selectable_label(selected, label);
+                    let hint = format!(
+                        "{}\n{} {} · {}",
+                        meta.title,
+                        stamp(meta.updated),
+                        meta.n_messages,
+                        self.tr("messages"),
+                    );
+                    let resp = resp.on_hover_text(hint);
+                    resp.context_menu(|ui| {
+                        if ui.button(self.tr("rename")).clicked() {
+                            self.rename_id = Some(meta.id.clone());
+                            self.rename_buf = meta.title.clone();
+                            ui.close();
+                        }
+                        if ui.button(self.tr("delete")).clicked() {
+                            delete = Some(meta.id.clone());
+                            ui.close();
+                        }
+                    });
+                    if resp.clicked() {
                         self.current = meta.id.clone();
                         self.view_dirty = true;
                     }
+                }
+                if let Some((id, title)) = rename {
+                    self.rename_id = None;
+                    if !title.is_empty() {
+                        self.app.sessions.set_title(&id, &title);
+                        self.view_dirty = true;
+                    }
+                }
+                if let Some(id) = delete {
+                    self.app.sessions.delete(&id);
+                    if self.current == id {
+                        self.current = String::new();
+                    }
+                    self.view_dirty = true;
                 }
             });
             ui.separator();
@@ -504,6 +585,7 @@ impl eframe::App for GuiApp {
                             sel_mcp: None,
                             new_provider: String::new(),
                             new_mcp: String::new(),
+                            tab: 0,
                         });
                     }
                 }
@@ -547,44 +629,60 @@ impl eframe::App for GuiApp {
                 self.pending.retain(|p| p.id != id);
             }
             ui.add_space(4.0);
+            let mut bypass = self.app.cfg.read().unwrap().approval == ApprovalMode::Auto;
+            let frame = if bypass {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(4, 2))
+                    .corner_radius(4)
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 90, 90)))
+                    .fill(egui::Color32::from_rgba_unmultiplied(120, 30, 30, 60))
+            } else {
+                egui::Frame::new()
+            };
             ui.horizontal(|ui| {
-                let w = (ui.available_width() - 90.0).max(100.0);
-                let hint = self.tr("message (Enter to send, Shift+Enter for newline)");
-                let resp = ui.add_sized(
-                    [w, 64.0],
-                    egui::TextEdit::multiline(&mut self.input).hint_text(hint),
-                );
-                let mut do_send = ui.button(self.tr("send")).clicked();
-                let ime = ui.ctx().input(|i| {
-                    i.events.iter().any(|e| matches!(e, egui::Event::Ime(_)))
-                        || i.raw.events.iter().any(|e| matches!(e, egui::Event::Ime(_)))
-                });
-                if resp.has_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
-                    && !ime
-                {
-                    do_send = true;
-                }
-                if do_send {
-                    self.send();
-                    resp.request_focus();
-                }
-                let running = *self.running.get(&self.current).unwrap_or(&false);
-                if running && ui.button(self.tr("stop")).clicked() {
-                    self.app.cancel(&self.current);
-                }
-            });
-            ui.horizontal(|ui| {
-                let mut bypass = self.app.cfg.read().unwrap().approval == ApprovalMode::Auto;
-                if ui.checkbox(&mut bypass, self.tr("bypass")).changed() {
-                    let mut cfg = self.app.cfg.write().unwrap();
-                    cfg.approval = if bypass { ApprovalMode::Auto } else { ApprovalMode::Ask };
-                    if let Err(e) = cfg.save(&self.app.cfg_path) {
-                        drop(cfg);
-                        self.toast(format!("{} {e}", self.tr("save failed:")));
+                // right-to-left: the right-edge widgets claim their width first,
+                // so the text field can use exactly what is left over
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    frame
+                        .show(ui, |ui| {
+                            ui.checkbox(&mut bypass, self.tr("bypass"));
+                        })
+                        .response
+                        .on_hover_text(self.tr("shell and file writes run without asking"));
+                    let running = *self.running.get(&self.current).unwrap_or(&false);
+                    if running && ui.button(self.tr("stop")).clicked() {
+                        self.app.cancel(&self.current);
                     }
-                }
+                    let mut do_send = ui.button(self.tr("send")).clicked();
+                    let hint = self.tr("message (Enter to send, Shift+Enter for newline)");
+                    let resp = ui.add_sized(
+                        [ui.available_width().max(80.0), 64.0],
+                        egui::TextEdit::multiline(&mut self.input).hint_text(hint),
+                    );
+                    let ime = ui.ctx().input(|i| {
+                        i.events.iter().any(|e| matches!(e, egui::Event::Ime(_)))
+                            || i.raw.events.iter().any(|e| matches!(e, egui::Event::Ime(_)))
+                    });
+                    if resp.has_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
+                        && !ime
+                    {
+                        do_send = true;
+                    }
+                    if do_send {
+                        self.send();
+                        resp.request_focus();
+                    }
+                });
             });
+            if bypass != (self.app.cfg.read().unwrap().approval == ApprovalMode::Auto) {
+                let mut cfg = self.app.cfg.write().unwrap();
+                cfg.approval = if bypass { ApprovalMode::Auto } else { ApprovalMode::Ask };
+                if let Err(e) = cfg.save(&self.app.cfg_path) {
+                    drop(cfg);
+                    self.toast(format!("{} {e}", self.tr("save failed:")));
+                }
+            }
         });
 
         // ----- center: chat -----
@@ -597,7 +695,7 @@ impl eframe::App for GuiApp {
                 }
             }
             let (prov, model) = self.session_provider();
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if let Some(s) = &self.view {
                     ui.heading(&s.title);
                 } else {
@@ -605,7 +703,16 @@ impl eframe::App for GuiApp {
                 }
                 ui.weak(format!("{prov} / {model}"));
                 if let Some(t) = self.live_tool.get(&self.current) {
-                    ui.weak(format!("⏳ {t}"));
+                    // mcp__<srv>__<tool> -> <tool>, detail kept but truncated
+                    let shown = match t.split_once(": ") {
+                        Some((n, d)) => format!("{}: {d}", short_tool(n)),
+                        None => short_tool(t).to_string(),
+                    };
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(format!("⏳ {shown}")).weak())
+                            .truncate(),
+                    )
+                    .on_hover_text(t);
                 } else if *self.running.get(&self.current).unwrap_or(&false) {
                     ui.weak(format!("⏳ {}", self.tr("working…")));
                 }
@@ -618,18 +725,34 @@ impl eframe::App for GuiApp {
             }
             ui.separator();
             egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+                // Wrap labels even inside horizontal layouts (markdown table
+                // cells, tool/status rows) — otherwise they clip at the
+                // frame's right edge.
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                 let lang = self.app.cfg.read().unwrap().lang.clone();
                 let mut action = None;
                 let running_now = *self.running.get(&self.current).unwrap_or(&false);
+                let mut row_rects = std::mem::take(&mut self.row_rects);
                 if let Some(s) = self.view.clone() {
-                    for (i, msg) in s.messages.iter().enumerate() {
-                        if let Some(a) = render_message(ui, &mut self.mark, msg, &lang, i, running_now) {
-                            action = Some(a);
+                    let mut i = 0;
+                    while i < s.messages.len() {
+                        if is_tool_only(&s.messages[i]) {
+                            let n = tool_run_len(&s.messages, i);
+                            // only the trailing run is live while the agent works
+                            let live = running_now && i + n == s.messages.len();
+                            render_tool_run(ui, &s.messages, i, n, &lang, live);
+                            i += n;
+                        } else {
+                            if let Some(a) = render_message(ui, &mut self.mark, &mut row_rects, &s.messages[i], &lang, i, running_now) {
+                                action = Some(a);
+                            }
+                            i += 1;
                         }
                     }
                 } else {
                     ui.weak(self.tr("send a message to start"));
                 }
+                self.row_rects = row_rects;
                 if let Some(t) = self.live_text.get(&self.current) {
                     if !t.is_empty() {
                         ui.colored_label(ui.visuals().weak_text_color(), self.tr("assistant"));
@@ -676,50 +799,96 @@ impl eframe::App for GuiApp {
             let mut auth_target: Option<&'static str> = None;
             let mut keys_target: Option<(&'static str, String)> = None;
             let mut cred_prompt: Option<&'static str> = None;
-            egui::Window::new(t("mcp servers")).open(&mut self.show_mcp).default_size([440.0, 380.0]).show(&ctx, |ui| {
+            let mut remove_target: Option<String> = None;
+            let mut toggle_target: Option<(String, bool)> = None;
+            // statuses are collected once so the summary bar and the list agree
+            let statuses = self.app.mcp.statuses();
+            let connected = statuses.iter().filter(|(_, s, e)| *e && matches!(s, crate::mcp::Status::Connected(_))).count();
+            let failed = statuses.iter().filter(|(_, s, e)| *e && matches!(s, crate::mcp::Status::Failed(_))).count();
+            let tools: usize = statuses
+                .iter()
+                .filter_map(|(_, s, _)| match s {
+                    crate::mcp::Status::Connected(n) => Some(*n),
+                    _ => None,
+                })
+                .sum();
+            egui::Window::new(t("mcp servers")).open(&mut self.show_mcp).default_size([520.0, 460.0]).show(&ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (name, status, enabled) in self.app.mcp.statuses() {
+                    // ----- summary: one line for "is anything wrong?" -----
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(t("connected")).strong());
+                        ui.weak(format!("{connected}/{}", statuses.len()));
+                        ui.separator();
+                        ui.weak(format!("{tools} {}", t("tools")));
+                        if failed > 0 {
+                            ui.colored_label(egui::Color32::from_rgb(255, 120, 120), format!("{failed} {}", t("failed:")));
+                        }
+                    });
+                    ui.separator();
+                    ui.strong(t("servers"));
+                    // ----- configured servers: name, status, enable toggle, remove -----
+                    for (name, status, enabled) in &statuses {
                         let st = match status {
                             crate::mcp::Status::Disabled => t("disabled").to_string(),
                             crate::mcp::Status::Connecting => t("connecting…").to_string(),
                             crate::mcp::Status::Connected(n) => format!("{n} {}", t("tools")),
                             crate::mcp::Status::Failed(e) => format!("{} {e}", t("failed:")),
                         };
+                        let bad = matches!(status, crate::mcp::Status::Failed(_));
                         ui.horizontal(|ui| {
-                            ui.label(format!("{name}:"));
-                            ui.weak(st);
-                            ui.weak(if enabled { t("enabled") } else { t("off") });
+                            let mut on = *enabled;
+                            if ui.checkbox(&mut on, "").changed() {
+                                toggle_target = Some((name.clone(), on));
+                            }
+                            ui.label(egui::RichText::new(name).monospace());
+                            if bad {
+                                ui.colored_label(egui::Color32::from_rgb(255, 120, 120), st);
+                            } else {
+                                ui.weak(st);
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("🗑").on_hover_text(t("remove")).clicked() {
+                                    remove_target = Some(name.clone());
+                                }
+                            });
                         });
                     }
+                    if statuses.is_empty() {
+                        ui.weak(t("no servers configured"));
+                    }
                     ui.separator();
-                    ui.heading(t("catalog"));
+                    ui.strong(t("catalog"));
                     if !crate::catalog::node_available() {
                         ui.colored_label(egui::Color32::from_rgb(255, 200, 80), t("Node.js (npx) is required for npm-based entries"));
                     }
                     let installed = self.app.cfg.read().unwrap().mcp_servers.clone();
                     for entry in crate::catalog::CATALOG {
                         let is_installed = installed.contains_key(entry.id);
+                        let open = self.cat_sel == Some(entry.id);
                         ui.group(|ui| {
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new(entry.label).strong());
                                 if is_installed {
                                     ui.weak(t("installed"));
-                                } else {
-                                    ui.weak(match entry.url {
-                                        Some(u) => u.to_string(),
-                                        None => format!("npx {}", entry.package),
-                                    });
-                                    if self.cat_sel == Some(entry.id) {
+                                }
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if is_installed {
+                                        if ui.small_button("🗑").on_hover_text(t("remove")).clicked() {
+                                            remove_target = Some(entry.id.to_string());
+                                        }
+                                    } else if open {
                                         if ui.small_button("✕").clicked() {
                                             self.cat_sel = None;
                                         }
-                                    } else if ui.button(t("install")).clicked() {
+                                    } else if ui.small_button(t("install")).clicked() {
                                         self.cat_sel = Some(entry.id);
                                         self.cat_env.clear();
                                     }
-                                }
+                                });
                             });
-                            ui.weak(if ja { entry.desc_ja } else { entry.desc });
+                            if !is_installed || open {
+                                ui.weak(if ja { entry.desc_ja } else { entry.desc });
+                            }
                             // OAuth keys file placement
                             if entry.keys.is_some() {
                                 let dst = crate::catalog::keys_path(entry.id);
@@ -774,7 +943,7 @@ impl eframe::App for GuiApp {
                                     }
                                 }
                             }
-                            if self.cat_sel == Some(entry.id) {
+                            if open {
                                 // hosted oauth entries that need a user-registered client
                                 if entry.oauth.map(|o| o.needs_client).unwrap_or(false) {
                                     for (key, secret) in [("OAUTH_CLIENT_ID", false), ("OAUTH_CLIENT_SECRET", true)] {
@@ -810,6 +979,35 @@ impl eframe::App for GuiApp {
                     }
                 });
             });
+            if let Some((name, on)) = toggle_target {
+                {
+                    let mut cfg = self.app.cfg.write().unwrap();
+                    if let Some(s) = cfg.mcp_servers.get_mut(&name) {
+                        s.enabled = on;
+                    }
+                    if let Err(e) = cfg.save(&self.app.cfg_path) {
+                        drop(cfg);
+                        self.toast(format!("{} {e}", t("save failed:")));
+                    }
+                }
+                self.app.mcp.update_servers(self.app.mcp_servers_map());
+                let mcp = self.app.mcp.clone();
+                self.rt.spawn(async move { mcp.reconcile().await });
+            }
+            if let Some(name) = remove_target {
+                {
+                    let mut cfg = self.app.cfg.write().unwrap();
+                    cfg.mcp_servers.remove(&name);
+                    if let Err(e) = cfg.save(&self.app.cfg_path) {
+                        drop(cfg);
+                        self.toast(format!("{} {e}", t("save failed:")));
+                    }
+                }
+                self.app.mcp.update_servers(self.app.mcp_servers_map());
+                let mcp = self.app.mcp.clone();
+                self.rt.spawn(async move { mcp.reconcile().await });
+                self.toast(format!("{} {name}", self.tr("removed:")));
+            }
             if let Some(id) = cred_prompt {
                 self.cat_sel = Some(id);
                 self.cat_env.clear();
@@ -897,7 +1095,107 @@ enum MsgAction {
     Fork(usize),
 }
 
-fn render_message(ui: &mut egui::Ui, mark: &mut egui_commonmark::CommonMarkCache, msg: &crate::types::ChatMessage, lang: &str, idx: usize, running: bool) -> Option<MsgAction> {
+/// A tool-only message is part of a run: the assistant message holding only
+/// `tool_use` blocks plus the user message holding the matching results.
+/// Synthetic results backfilled into a text message keep that message out.
+fn is_tool_only(msg: &crate::types::ChatMessage) -> bool {
+    !msg.blocks.is_empty()
+        && msg
+            .blocks
+            .iter()
+            .all(|b| matches!(b, Block::ToolUse { .. } | Block::ToolResult { .. }))
+}
+
+/// Number of messages from `start` belonging to one tool run: every following
+/// message that holds tool calls/results only, i.e. no assistant prose.
+fn tool_run_len(msgs: &[crate::types::ChatMessage], start: usize) -> usize {
+    let mut n = 0;
+    while start + n < msgs.len() && is_tool_only(&msgs[start + n]) {
+        n += 1;
+    }
+    n
+}
+
+fn tool_use_count(msgs: &[crate::types::ChatMessage], start: usize) -> usize {
+    (start..start + tool_run_len(msgs, start))
+        .flat_map(|i| msgs[i].blocks.iter())
+        .filter(|b| matches!(b, Block::ToolUse { .. }))
+        .count()
+}
+
+/// `mcp__<srv>__<tool>` -> `<tool>`, other names pass through.
+fn short_tool(name: &str) -> &str {
+    if let Some(rest) = name.strip_prefix("mcp__") {
+        if let Some((_, tool)) = rest.split_once("__") {
+            return tool;
+        }
+    }
+    name
+}
+
+fn render_tool_msg(ui: &mut egui::Ui, msg: &crate::types::ChatMessage, lang: &str, key: &str) {
+    let t = |k: &'static str| crate::i18n::t(lang, k);
+    for (bi, b) in msg.blocks.iter().enumerate() {
+        match b {
+            Block::Text { .. } => {}
+            Block::ToolUse { name, input, .. } => {
+                egui::CollapsingHeader::new(format!("🔧 {name}"))
+                    .id_salt(format!("{key}_tu_{bi}"))
+                    .show(ui, |ui| {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(input.to_string()).monospace().small(),
+                        ).wrap());
+                    });
+            }
+            Block::ToolResult { content, is_error, .. } => {
+                let head = if *is_error { t("✗ result (error)") } else { t("✓ result") };
+                egui::CollapsingHeader::new(head)
+                    .id_salt(format!("{key}_tr_{bi}"))
+                    .show(ui, |ui| {
+                        let t = crate::types::truncate_preview(content, 3000);
+                        ui.add(egui::Label::new(egui::RichText::new(t).monospace().small()).wrap());
+                    });
+            }
+        }
+    }
+}
+
+/// One run of tool calls collapsed into a single summary row: "🔧 N tools",
+/// the trace of tool names, folded by default. `live` keeps it open and
+/// appends a spinner while the agent is working on it.
+fn render_tool_run(ui: &mut egui::Ui, msgs: &[crate::types::ChatMessage], start: usize, len: usize, lang: &str, live: bool) {
+    let t = |k: &'static str| crate::i18n::t(lang, k);
+    let end = start + len;
+    let count = tool_use_count(msgs, start);
+    let names: Vec<&str> = (start..end)
+        .flat_map(|i| msgs[i].blocks.iter())
+        .filter_map(|b| match b {
+            Block::ToolUse { name, .. } => Some(short_tool(name)),
+            _ => None,
+        })
+        .collect();
+    let mut trace = names.join(", ");
+    if names.len() > 4 {
+        trace = format!("{} +{}", names[..4].join(", "), names.len() - 4);
+    }
+    let head = format!("🔧 {count} {}", t("tools"));
+    egui::CollapsingHeader::new(head)
+        .id_salt(format!("run_{start}"))
+        .default_open(live)
+        .show(ui, |ui| {
+            if live {
+                ui.weak(format!("⏳ {}", t("working…")));
+            }
+            for i in start..end {
+                render_tool_msg(ui, &msgs[i], lang, &format!("{start}_{i}"));
+            }
+        })
+        .header_response
+        .on_hover_text(trace);
+    ui.add_space(8.0);
+}
+
+fn render_message(ui: &mut egui::Ui, mark: &mut egui_commonmark::CommonMarkCache, rows: &mut HashMap<usize, egui::Rect>, msg: &crate::types::ChatMessage, lang: &str, idx: usize, running: bool) -> Option<MsgAction> {
     let t = |k: &'static str| crate::i18n::t(lang, k);
     let (label, color) = match msg.role {
         Role::User => (t("you"), egui::Color32::from_rgb(120, 180, 255)),
@@ -906,10 +1204,17 @@ fn render_message(ui: &mut egui::Ui, mark: &mut egui_commonmark::CommonMarkCache
     let mut action = None;
     let is_tool_msg = msg.blocks.iter().all(|b| matches!(b, Block::ToolResult { .. }));
     if !is_tool_msg {
-        ui.horizontal(|ui| {
+        // actions appear once the header row is hovered: the row's rect is
+        // kept from the previous frame so the buttons don't shift the layout
+        // the moment they show up (defer pattern)
+        let hovered = match rows.get(&idx) {
+            Some(r) => ui.ctx().pointer_hover_pos().map(|p| r.contains(p)).unwrap_or(false),
+            None => false,
+        };
+        let head = ui.horizontal(|ui| {
             ui.colored_label(color, label);
             let text = msg.text_content();
-            if !text.trim().is_empty() {
+            if hovered && !text.trim().is_empty() {
                 if ui.small_button(t("copy")).clicked() {
                     action = Some(MsgAction::Copy(text.clone()));
                 }
@@ -917,19 +1222,29 @@ fn render_message(ui: &mut egui::Ui, mark: &mut egui_commonmark::CommonMarkCache
                     action = Some(MsgAction::Save(text));
                 }
             }
-            ui.menu_button("⋯", |ui| {
-                ui.add_enabled_ui(!running, |ui| {
-                    if ui.button(t("rewind to here")).clicked() {
-                        action = Some(MsgAction::Rewind(idx));
-                        ui.close();
-                    }
-                    if ui.button(t("fork from here")).clicked() {
-                        action = Some(MsgAction::Fork(idx));
-                        ui.close();
-                    }
+            if hovered {
+                ui.menu_button("⋯", |ui| {
+                    ui.add_enabled_ui(!running, |ui| {
+                        if ui.button(t("rewind to here")).clicked() {
+                            action = Some(MsgAction::Rewind(idx));
+                            ui.close();
+                        }
+                        if ui.button(t("fork from here")).clicked() {
+                            action = Some(MsgAction::Fork(idx));
+                            ui.close();
+                        }
+                    });
                 });
-            });
+            }
         });
+        // the row rect is recorded with the full available width so hovering
+        // anywhere on the message's header band reveals the actions
+        let r = head.response.rect;
+        let full = ui.max_rect();
+        rows.insert(idx, egui::Rect::from_min_max(
+            egui::pos2(full.left(), r.top()),
+            egui::pos2(full.right(), r.bottom()),
+        ));
     }
     for (bi, b) in msg.blocks.iter().enumerate() {
         match b {
@@ -1058,11 +1373,44 @@ fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut S
                     });
             });
             ui.separator();
-            ui.heading(t("providers"));
-            ui.horizontal(|ui| {
+            // ----- tabs: providers / mcp / skills / behavior -----
+            let tabs = [t("providers"), t("mcp"), t("skills"), t("behavior")];
+            ui.horizontal_wrapped(|ui| {
+                for (i, label) in tabs.iter().enumerate() {
+                    if ui.selectable_label(buf.tab == i, *label).clicked() {
+                        buf.tab = i;
+                    }
+                }
+            });
+            ui.separator();
+            if buf.tab == 0 {
+            ui.horizontal_wrapped(|ui| {
                 for name in buf.cfg.providers.keys().cloned().collect::<Vec<_>>() {
-                    if ui.selectable_label(buf.sel_provider == name, &name).clicked() {
+                    let is_default = buf.cfg.provider == name;
+                    let mut text = name.clone();
+                    if is_default {
+                        text.push_str(" ★");
+                    }
+                    let resp = ui.selectable_label(buf.sel_provider == name, text);
+                    let resp = if is_default {
+                        resp.on_hover_text(t("default"))
+                    } else {
+                        resp
+                    };
+                    if resp.clicked() {
                         buf.sel_provider = name;
+                    }
+                    if !is_default {
+                        resp.context_menu(|ui| {
+                            if ui.button(t("set as default")).clicked() {
+                                buf.cfg.provider = buf.sel_provider.clone();
+                                ui.close();
+                            }
+                            if ui.button(t("delete")).clicked() {
+                                buf.cfg.providers.remove(&buf.sel_provider);
+                                ui.close();
+                            }
+                        });
                     }
                 }
             });
@@ -1136,26 +1484,39 @@ fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut S
                     }
                 });
             });
-
-            ui.separator();
+            }
+            if buf.tab == 1 {
             ui.heading(t("mcp servers"));
+            if buf.cfg.mcp_servers.is_empty() {
+                ui.weak(t("no servers configured"));
+            }
             for name in buf.cfg.mcp_servers.keys().cloned().collect::<Vec<_>>() {
                 ui.horizontal(|ui| {
                     let mut en = buf.cfg.mcp_servers.get(&name).map(|s| s.enabled).unwrap_or(false);
-                    if ui.checkbox(&mut en, "").changed() {
+                    if ui.checkbox(&mut en, "").on_hover_text(t("enabled")).changed() {
                         if let Some(s) = buf.cfg.mcp_servers.get_mut(&name) {
                             s.enabled = en;
                         }
                     }
-                    if ui.selectable_label(buf.sel_mcp.as_deref() == Some(name.as_str()), &name).clicked() {
+                    let target = buf.cfg.mcp_servers.get(&name).and_then(|s| {
+                        s.url.clone().or_else(|| Some(format!("npx {}", s.command)))
+                    });
+                    let resp = ui.selectable_label(buf.sel_mcp.as_deref() == Some(name.as_str()), &name);
+                    let resp = match &target {
+                        Some(v) => resp.on_hover_text(v),
+                        None => resp,
+                    };
+                    if resp.clicked() {
                         buf.sel_mcp = Some(name.clone());
                     }
-                    if ui.small_button("✕").clicked() {
-                        buf.cfg.mcp_servers.remove(&name);
-                        if buf.sel_mcp.as_deref() == Some(name.as_str()) {
-                            buf.sel_mcp = None;
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("🗑").on_hover_text(t("delete")).clicked() {
+                            buf.cfg.mcp_servers.remove(&name);
+                            if buf.sel_mcp.as_deref() == Some(name.as_str()) {
+                                buf.sel_mcp = None;
+                            }
                         }
-                    }
+                    });
                 });
             }
             ui.horizontal(|ui| {
@@ -1209,7 +1570,8 @@ fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut S
                     });
                 }
             }
-            ui.separator();
+            }
+            if buf.tab == 2 {
             ui.heading(t("skills"));
             for s in crate::config::skills() {
                 ui.horizontal(|ui| {
@@ -1225,8 +1587,9 @@ fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut S
                 );
             }
             ui.weak(t("to add a skill: ask in chat (npx skills add works if Node.js is installed), or drop a SKILL.md in the skills dir"));
-            ui.separator();
-
+            }
+            if buf.tab == 3 {
+            ui.heading(t("behavior"));
             ui.horizontal(|ui| {
                 ui.label(t("approval:"));
                 egui::ComboBox::from_id_salt("ap")
@@ -1253,6 +1616,7 @@ fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut S
             }
             ui.label(t("system prompt:"));
             ui.add(egui::TextEdit::multiline(&mut buf.cfg.system_prompt).desired_rows(4).desired_width(520.0));
+            }
         });
         ui.separator();
         ui.horizontal(|ui| {
@@ -1286,5 +1650,61 @@ mod tests {
         assert_eq!(linkify("<https://a.b>"), "<https://a.b>");
         assert_eq!(linkify("`https://a.b`"), "`https://a.b`");
         assert_eq!(linkify("```\nhttps://a.b\n```"), "```\nhttps://a.b\n```");
+    }
+
+    #[test]
+    fn short_tool_strips_mcp_prefix() {
+        assert_eq!(short_tool("mcp__windows-mcp__Snapshot"), "Snapshot");
+        assert_eq!(short_tool("shell"), "shell");
+    }
+
+    #[test]
+    fn tool_runs_group_calls_with_their_results() {
+        use crate::types::{Block, ChatMessage};
+        let use_msg = ChatMessage {
+            role: crate::types::Role::Assistant,
+            blocks: vec![
+                Block::ToolUse { id: "a".into(), name: "shell".into(), input: serde_json::json!({}) },
+                Block::ToolUse { id: "b".into(), name: "fs_read".into(), input: serde_json::json!({}) },
+            ],
+        };
+        let res_msg = ChatMessage::tool_results(vec![
+            Block::ToolResult { tool_use_id: "a".into(), content: "x".into(), is_error: false },
+            Block::ToolResult { tool_use_id: "b".into(), content: "y".into(), is_error: false },
+        ]);
+        let msgs = vec![ChatMessage::user("hi"), use_msg, res_msg];
+        // the run starts after the user text, covers call+result, and counts 2 tools
+        assert_eq!(tool_run_len(&msgs, 1), 2);
+        assert_eq!(tool_use_count(&msgs, 1), 2);
+        // a plain user message is not part of a run
+        assert!(is_tool_only(&msgs[1]));
+        assert!(!is_tool_only(&msgs[0]));
+    }
+
+    #[test]
+    fn consecutive_tool_rounds_merge_into_one_run() {
+        use crate::types::{Block, ChatMessage};
+        let call = |id: &str| ChatMessage {
+            role: crate::types::Role::Assistant,
+            blocks: vec![Block::ToolUse { id: id.into(), name: "shell".into(), input: serde_json::json!({}) }],
+        };
+        let res = |id: &str| {
+            ChatMessage::tool_results(vec![Block::ToolResult {
+                tool_use_id: id.into(),
+                content: "ok".into(),
+                is_error: false,
+            }])
+        };
+        let msgs = vec![
+            ChatMessage::user("hi"),
+            call("a"),
+            res("a"),
+            call("b"),
+            res("b"),
+            ChatMessage::user("stop"),
+        ];
+        // both rounds plus their results collapse into a single group
+        assert_eq!(tool_run_len(&msgs, 1), 4);
+        assert_eq!(tool_use_count(&msgs, 1), 2);
     }
 }

@@ -27,6 +27,11 @@ static JA: &[(&str, &str)] = &[
     ("fork from here", "ここから分岐"),
     ("rewound", "巻き戻しました"),
     ("forked", "分岐しました"),
+    ("context compacted", "コンテキストを圧縮しました"),
+    ("rename", "名前を変更"),
+    ("delete", "削除"),
+    ("messages", "メッセージ"),
+    ("shell and file writes run without asking", "シェルとファイル書き込みが確認なしで実行されます"),
     // approvals
     ("approve:", "承認:"),
     ("allow", "許可"),

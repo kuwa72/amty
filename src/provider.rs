@@ -29,6 +29,80 @@ pub fn build(conf: &ProviderConf) -> Box<dyn Provider> {
     }
 }
 
+/// Permanent-looking failures (4xx, missing credentials) are not retried.
+fn retryable(e: &str) -> bool {
+    !(e.contains("HTTP 4") || e.contains("no api key") || e.contains("not defined"))
+}
+
+/// Run a provider attempt with retry on transient failures (network resets,
+/// decode errors, 5xx). `f` replays the whole request; already-forwarded
+/// events are deduplicated — text is emitted only as the suffix beyond what
+/// was sent (prefix-matched), tool_use beyond a name+input signature (the
+/// agent layer also dedups execution). Mid-stream divergence after a retry
+/// forwards raw deltas, which may duplicate a few tokens — preferable to a
+/// dead run.
+async fn retry_stream<F, Fut>(mut f: F, tx: &mpsc::UnboundedSender<StreamEvent>)
+where
+    F: FnMut(mpsc::UnboundedSender<StreamEvent>) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    const MAX_ATTEMPTS: usize = 3;
+    let mut forwarded = String::new();
+    let mut cur = String::new();
+    let mut tool_sigs = std::collections::HashSet::new();
+    let mut delay = std::time::Duration::from_millis(400);
+    for attempt in 1..=MAX_ATTEMPTS {
+        let (rtx, mut rrx) = mpsc::unbounded_channel::<StreamEvent>();
+        let mut run = std::pin::pin!(f(rtx));
+        let mut res: Option<Result<()>> = None;
+        let mut ev_err: Option<String> = None;
+        cur.clear();
+        loop {
+            tokio::select! {
+                biased;
+                r = &mut run, if res.is_none() => res = Some(r),
+                ev = rrx.recv() => match ev {
+                    None => break,
+                    Some(StreamEvent::Text(t)) => {
+                        cur.push_str(&t);
+                        if cur.starts_with(&forwarded) && cur.len() > forwarded.len() {
+                            let d = cur[forwarded.len()..].to_string();
+                            forwarded.push_str(&d);
+                            let _ = tx.send(StreamEvent::Text(d));
+                        } else if !cur.starts_with(&forwarded) {
+                            forwarded.push_str(&t);
+                            let _ = tx.send(StreamEvent::Text(t));
+                        }
+                    }
+                    Some(StreamEvent::ToolUse { id, name, input }) => {
+                        if tool_sigs.insert(format!("{name}{input}")) {
+                            let _ = tx.send(StreamEvent::ToolUse { id, name, input });
+                        }
+                    }
+                    Some(StreamEvent::Done) => { let _ = tx.send(StreamEvent::Done); }
+                    Some(StreamEvent::Err(e)) => { ev_err = Some(e); }
+                }
+            }
+        }
+        let res = match res {
+            Some(r) => r,
+            None => run.await,
+        };
+        let err = ev_err.or_else(|| res.err().map(|e| e.to_string()));
+        match err {
+            None => return,
+            Some(e) if attempt == MAX_ATTEMPTS || !retryable(&e) => {
+                let _ = tx.send(StreamEvent::Err(e));
+                return;
+            }
+            Some(_) => {
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(8));
+            }
+        }
+    }
+}
+
 /// Incremental SSE decoder: yields (event, data) pairs.
 struct Sse {
     stream: std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
@@ -131,9 +205,7 @@ fn anthropic_messages(messages: &[ChatMessage]) -> Vec<Value> {
 #[async_trait]
 impl Provider for Anthropic {
     async fn stream(&self, req: &ChatRequest, tx: mpsc::UnboundedSender<StreamEvent>) {
-        if let Err(e) = self.run(req, &tx).await {
-            let _ = tx.send(StreamEvent::Err(e.to_string()));
-        }
+        retry_stream(|rtx| self.run(req, rtx), &tx).await;
     }
 }
 
@@ -186,7 +258,7 @@ fn anthropic_body(req: &ChatRequest) -> Value {
 }
 
 impl Anthropic {
-    async fn run(&self, req: &ChatRequest, tx: &mpsc::UnboundedSender<StreamEvent>) -> Result<()> {
+    async fn run(&self, req: &ChatRequest, tx: mpsc::UnboundedSender<StreamEvent>) -> Result<()> {
         let key = self.conf.resolved_key().ok_or_else(|| anyhow!("no api key for anthropic provider"))?;
         let body = anthropic_body(req);
         let client = http()?;
@@ -339,14 +411,12 @@ fn openai_messages(req: &ChatRequest) -> Vec<Value> {
 #[async_trait]
 impl Provider for OpenAi {
     async fn stream(&self, req: &ChatRequest, tx: mpsc::UnboundedSender<StreamEvent>) {
-        if let Err(e) = self.run(req, &tx).await {
-            let _ = tx.send(StreamEvent::Err(e.to_string()));
-        }
+        retry_stream(|rtx| self.run(req, rtx), &tx).await;
     }
 }
 
 impl OpenAi {
-    async fn run(&self, req: &ChatRequest, tx: &mpsc::UnboundedSender<StreamEvent>) -> Result<()> {
+    async fn run(&self, req: &ChatRequest, tx: mpsc::UnboundedSender<StreamEvent>) -> Result<()> {
         let body = json!({
             "model": req.model,
             "stream": true,
@@ -500,9 +570,7 @@ fn cc_messages(messages: &[ChatMessage]) -> Vec<Value> {
 #[async_trait]
 impl Provider for CommandCode {
     async fn stream(&self, req: &ChatRequest, tx: mpsc::UnboundedSender<StreamEvent>) {
-        if let Err(e) = self.run(req, &tx).await {
-            let _ = tx.send(StreamEvent::Err(e.to_string()));
-        }
+        retry_stream(|rtx| self.run(req, rtx), &tx).await;
     }
 }
 
@@ -517,18 +585,8 @@ fn cmdc_exe() -> Option<String> {
     }
     #[cfg(target_os = "windows")]
     {
-        if let Ok(o) = std::process::Command::new("where").arg("cmdc").output() {
-            if o.status.success() {
-                // npm's dir holds `cmdc` (sh script), `cmdc.cmd`, `cmdc.ps1`;
-                // only the .cmd/.exe forms are spawnable directly
-                if let Some(p) = String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .map(|l| l.trim().to_string())
-                    .find(|l| l.ends_with(".cmd") || l.ends_with(".exe") || l.ends_with(".bat"))
-                {
-                    return Some(p);
-                }
-            }
+        if let Some(p) = crate::catalog::shim_where("cmdc") {
+            return Some(p);
         }
         let appdata = std::env::var("APPDATA").unwrap_or_default();
         let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
@@ -554,6 +612,7 @@ fn cmdc_output(args: &[&str]) -> Result<String, String> {
     let Some(exe) = cmdc_exe() else { return Err("cmdc not found".into()) };
     let mut c = std::process::Command::new(&exe);
     c.args(args);
+    crate::catalog::no_window(&mut c);
     inject_node_path(&exe, &mut c);
     match c.output() {
         Ok(o) => {
@@ -593,7 +652,7 @@ fn cmdc_version() -> &'static str {
 }
 
 impl CommandCode {
-    async fn run(&self, req: &ChatRequest, tx: &mpsc::UnboundedSender<StreamEvent>) -> Result<()> {
+    async fn run(&self, req: &ChatRequest, tx: mpsc::UnboundedSender<StreamEvent>) -> Result<()> {
         let key = self.conf.resolved_key()
             .ok_or_else(|| anyhow!("no Command Code api key — run `cmdc` once to sign in, or set providers.commandcode.api_key"))?;
         let system: Value = match system_full(req) {
@@ -603,8 +662,9 @@ impl CommandCode {
         // Server validates this `config` env block and rejects missing fields.
         let cwd = std::env::current_dir().unwrap_or_default();
         let git = |args: &[&str]| -> String {
-            std::process::Command::new("git")
-                .args(args)
+            let mut c = std::process::Command::new("git");
+            crate::catalog::no_window(&mut c);
+            c.args(args)
                 .current_dir(&cwd)
                 .output()
                 .ok()
@@ -735,12 +795,26 @@ pub fn model_suggestions(kind: crate::config::ProviderKind) -> Vec<String> {
     }
 }
 
-/// Returns (models, error) — error=Some(msg) means the API fetch failed.
-/// Fetches the live model list from GET {base}/provider/v1/models (no `cmdc`
-/// CLI needed). Cached on success so the GUI doesn't hit the API every frame.
-pub fn cmdc_models(conf: &crate::config::ProviderConf) -> (Vec<String>, Option<String>) {
-    static CACHE: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
-    if let Some(models) = CACHE.lock().unwrap().clone() {
+/// A Command Code model entry: id + context window (the API reports a
+/// `context_length` field per model).
+#[derive(Clone)]
+struct CcModel {
+    id: String,
+    context_length: u64,
+}
+
+/// Cached result of GET {base}/provider/v1/models.
+static CC_MODELS: std::sync::Mutex<Option<Vec<CcModel>>> = std::sync::Mutex::new(None);
+
+fn fallback_cc_models() -> Vec<CcModel> {
+    FALLBACK_CC_MODELS
+        .iter()
+        .map(|s| CcModel { id: s.to_string(), context_length: 0 })
+        .collect()
+}
+
+fn cc_models(conf: &crate::config::ProviderConf) -> (Vec<CcModel>, Option<String>) {
+    if let Some(models) = CC_MODELS.lock().unwrap().clone() {
         return (models, None);
     }
     let url = format!("{}/provider/v1/models", conf.resolved_base().trim_end_matches('/'));
@@ -750,10 +824,7 @@ pub fn cmdc_models(conf: &crate::config::ProviderConf) -> (Vec<String>, Option<S
         .build()
     {
         Ok(c) => c,
-        Err(e) => {
-            let models = FALLBACK_CC_MODELS.iter().map(|s| s.to_string()).collect();
-            return (models, Some(format!("http client: {e}")));
-        }
+        Err(e) => return (fallback_cc_models(), Some(format!("http client: {e}"))),
     };
     let mut req = client.get(&url);
     if let Some(k) = key {
@@ -761,28 +832,67 @@ pub fn cmdc_models(conf: &crate::config::ProviderConf) -> (Vec<String>, Option<S
     }
     let resp = match req.send() {
         Ok(r) => r,
-        Err(e) => {
-            let models = FALLBACK_CC_MODELS.iter().map(|s| s.to_string()).collect();
-            return (models, Some(format!("fetch {url}: {e}")));
-        }
+        Err(e) => return (fallback_cc_models(), Some(format!("fetch {url}: {e}"))),
     };
     let value: serde_json::Value = match resp.json() {
         Ok(v) => v,
-        Err(e) => {
-            let models = FALLBACK_CC_MODELS.iter().map(|s| s.to_string()).collect();
-            return (models, Some(format!("json parse: {e}")));
-        }
+        Err(e) => return (fallback_cc_models(), Some(format!("json parse: {e}"))),
     };
-    let models: Vec<String> = value["data"]
+    let models: Vec<CcModel> = value["data"]
         .as_array()
-        .map(|a| a.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| {
+                    Some(CcModel {
+                        id: m["id"].as_str()?.to_string(),
+                        context_length: m["context_length"].as_u64().unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
         .unwrap_or_default();
     if models.is_empty() {
-        let models = FALLBACK_CC_MODELS.iter().map(|s| s.to_string()).collect();
-        (models, Some("empty model list".into()))
+        (fallback_cc_models(), Some("empty model list".into()))
     } else {
-        *CACHE.lock().unwrap() = Some(models.clone());
+        *CC_MODELS.lock().unwrap() = Some(models.clone());
         (models, None)
+    }
+}
+
+/// Populate the Command Code model cache if empty. Blocking HTTP — call via
+/// `tokio::task::spawn_blocking` from async contexts.
+pub fn ensure_cc_models(conf: &crate::config::ProviderConf) {
+    let _ = cc_models(conf);
+}
+
+/// Returns (models, error) — error=Some(msg) means the API fetch failed.
+/// Fetches the live model list from GET {base}/provider/v1/models (no `cmdc`
+/// CLI needed). Cached on success so the GUI doesn't hit the API every frame.
+pub fn cmdc_models(conf: &crate::config::ProviderConf) -> (Vec<String>, Option<String>) {
+    let (models, err) = cc_models(conf);
+    (models.into_iter().map(|m| m.id).collect(), err)
+}
+
+/// Effective context window in tokens for a provider+model, used by
+/// auto-compaction. Config override (`provider.<name>.context_window`) wins;
+/// Command Code uses the cached model list's `context_length` (their smallest
+/// listed model is 200K, which is also the fallback); other providers get a
+/// deliberately low default so compaction triggers before the API rejects.
+pub fn context_window(conf: &ProviderConf, model: &str) -> u64 {
+    if let Some(n) = conf.context_window {
+        return n;
+    }
+    match conf.kind {
+        crate::config::ProviderKind::CommandCode => CC_MODELS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|ms| ms.iter().find(|m| m.id == model))
+            .map(|m| m.context_length)
+            .filter(|n| *n > 0)
+            .unwrap_or(200_000),
+        crate::config::ProviderKind::Anthropic => 200_000,
+        crate::config::ProviderKind::OpenAi => 128_000,
     }
 }
 
@@ -875,6 +985,67 @@ mod tests {
         // newest message's last block holds the history breakpoint
         let last = b["messages"].as_array().unwrap().last().unwrap();
         assert_eq!(last["content"].as_array().unwrap().last().unwrap()["cache_control"]["type"], "ephemeral");
+    }
+
+    #[tokio::test]
+    async fn retry_stream_replays_transient_and_dedups_text() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        retry_stream(
+            move |rtx| {
+                let n = c.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        let _ = rtx.send(StreamEvent::Text("he".into()));
+                        bail!("connection reset")
+                    } else {
+                        let _ = rtx.send(StreamEvent::Text("hello".into()));
+                        let _ = rtx.send(StreamEvent::Done);
+                        Ok(())
+                    }
+                }
+            },
+            &tx,
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let mut text = String::new();
+        let mut done = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                StreamEvent::Text(t) => text.push_str(&t),
+                StreamEvent::Done => done = true,
+                _ => {}
+            }
+        }
+        assert_eq!(text, "hello"); // "he" + suffix "llo" — no duplication
+        assert!(done);
+    }
+
+    #[tokio::test]
+    async fn retry_stream_gives_up_on_permanent_error() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        retry_stream(
+            move |rtx| {
+                c.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let _ = rtx;
+                    bail!("anthropic HTTP 400: bad request")
+                }
+            },
+            &tx,
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        match rx.try_recv() {
+            Ok(StreamEvent::Err(e)) => assert!(e.contains("400")),
+            other => panic!("expected Err, got {:?}", other.map(|_| "event")),
+        }
     }
 
     #[test]

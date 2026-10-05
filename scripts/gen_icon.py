@@ -71,4 +71,8 @@ d.rounded_rectangle(
 )
 
 img.save("assets/amty-icon.png")
-print("wrote assets/amty-icon.png")
+img.save(
+    "assets/amty-icon.ico",
+    sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)],
+)
+print("wrote assets/amty-icon.png / assets/amty-icon.ico")

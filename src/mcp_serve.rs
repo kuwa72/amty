@@ -50,6 +50,18 @@ fn tool_defs() -> Vec<Value> {
             "key": {"type": "string"}, "value": {"type": "string"}}, "required": ["key", "value"]}),
     ),
     (
+        "amty_unset_config",
+        "Delete an amty setting (e.g. mcp.<name>, provider.<name>, provider.<name>.<field>, search.<field>).",
+        json!({"type": "object", "properties": {
+            "key": {"type": "string"}}, "required": ["key"]}),
+    ),
+    (
+        "amty_mcp_remove",
+        "Remove an MCP server from amty's config entirely (disconnects it).",
+        json!({"type": "object", "properties": {
+            "name": {"type": "string"}}, "required": ["name"]}),
+    ),
+    (
         "amty_list_approvals",
         "List pending tool approvals (file writes, shell commands) awaiting a decision.",
         json!({"type": "object", "properties": {}}),
@@ -135,6 +147,14 @@ async fn call_tool(name: &str, args: &Value) -> Result<Value> {
                 "key": args["key"], "value": args["value"],
             }))
             .await
+        }
+        "amty_unset_config" => {
+            let key = args["key"].as_str().unwrap_or("");
+            crate::cli::delete(&base, &tok, &format!("/v1/config/{key}")).await
+        }
+        "amty_mcp_remove" => {
+            let name = args["name"].as_str().unwrap_or("");
+            crate::cli::delete(&base, &tok, &format!("/v1/mcp/{name}")).await
         }
         "amty_list_approvals" => crate::cli::get(&base, &tok, "/v1/approvals").await,
         "amty_resolve_approval" => {

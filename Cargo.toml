@@ -26,6 +26,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.11.0"
 base64 = "0.23.1"
 
+[build-dependencies]
+embed-resource = "3"
+
 [profile.release]
 # thin LTO + default codegen-units: fat LTO + cu=1 made the final crate
 # spend ~5 min in rustc/LLVM; a GUI client doesn't need that last %.

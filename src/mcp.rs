@@ -24,7 +24,11 @@ struct Rpc {
 
 impl Rpc {
     fn spawn(conf: McpServerConf) -> Result<Arc<Self>> {
-        let mut cmd = Command::new(&conf.command);
+        // Windows: bare names like `npx` resolve to .cmd shims CreateProcess
+        // can't launch directly — resolve to a concrete path first.
+        let prog = crate::catalog::resolve_spawn_command(&conf.command);
+        let mut cmd = Command::new(&prog);
+        crate::catalog::no_window_async(&mut cmd);
         cmd.args(&conf.args)
             .envs(&conf.env)
             // servers expect a sane cwd; amty may have been launched from a
@@ -34,7 +38,7 @@ impl Rpc {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let mut child = cmd.spawn().context(format!("spawn '{}'", conf.command))?;
+        let mut child = cmd.spawn().context(format!("spawn '{prog}'"))?;
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         let stderr_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));

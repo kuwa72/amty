@@ -67,16 +67,23 @@ async fn run_inner(app: &Arc<App>, sid: &str, text: String) -> Result<()> {
 
         let mut specs = tools::builtin_specs();
         specs.extend(app.mcp.specs());
+        let max_tokens = prov_conf.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+
+        let prov = provider::build(&prov_conf);
+        // shrink the session with an LLM summary if it's near the context
+        // window; re-fetch afterwards since messages may have been replaced
+        crate::compact::maybe_compact(app, sid, prov.as_ref(), &prov_conf, &model, &format!("{system}{system_tail}"), &specs, max_tokens, &cancelled).await;
+        let session = app.sessions.get(sid).ok_or_else(|| anyhow!("session gone"))?;
+
         let req = ChatRequest {
             model,
-            max_tokens: prov_conf.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            max_tokens,
             system: Some(system),
             system_tail: (!system_tail.is_empty()).then_some(system_tail),
             messages: session.messages,
             tools: specs,
         };
 
-        let prov = provider::build(&prov_conf);
         let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
         let app2 = app.clone();
         let sid2 = sid.to_string();

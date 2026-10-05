@@ -4,7 +4,7 @@ use crate::types::ToolSpec;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -118,15 +118,23 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "config_set".into(),
-            description: "Change an amty setting at runtime (persisted). Keys: provider, model, approval(ask|auto|allowlist), system_prompt, max_tokens, allow_commands, allow_paths, +allow_commands, +allow_paths, provider.<name>.{model,api_key,api_key_env,base_url}, mcp.<name>.enabled, search.{backend,api_key,api_key_env,base_url,max_results,fetch_max_chars}.".into(),
+            description: "Change an amty setting at runtime (persisted). Keys: provider, model, approval(ask|auto|allowlist), system_prompt, max_tokens, allow_commands, allow_paths, +allow_commands, +allow_paths, provider.<name>.{model,api_key,api_key_env,base_url,context_window}, mcp.<name>.enabled, search.{backend,api_key,api_key_env,base_url,max_results,fetch_max_chars}.".into(),
             schema: schema(
                 json!({"key": {"type": "string"}, "value": {"type": "string"}}),
                 &["key", "value"],
             ),
         },
         ToolSpec {
+            name: "config_unset".into(),
+            description: "Delete an amty setting (persisted) — the removal counterpart of config_set. Keys: mcp.<name> | provider.<name> | provider.<name>.{api_key,api_key_env,base_url,max_tokens,context_window} | search.{api_key,api_key_env,base_url}.".into(),
+            schema: schema(
+                json!({"key": {"type": "string", "description": "e.g. mcp._probe_github"}}),
+                &["key"],
+            ),
+        },
+        ToolSpec {
             name: "mcp".into(),
-            description: "Manage MCP servers. actions: list | tools | enable <name> | disable <name> | reconnect <name>.".into(),
+            description: "Manage MCP servers. actions: list | tools | enable <name> | disable <name> | reconnect <name> | remove <name>.".into(),
             schema: schema(
                 json!({
                     "action": {"type": "string"},
@@ -172,6 +180,7 @@ pub fn summarize(name: &str, input: &Value) -> String {
         "web_search" => format!("web_search: {}", input["query"].as_str().unwrap_or("")),
         "web_fetch" => format!("web_fetch: {}", input["url"].as_str().unwrap_or("")),
         "config_set" => format!("config_set: {} = {}", input["key"].as_str().unwrap_or(""), input["value"].as_str().unwrap_or("")),
+        "config_unset" => format!("config_unset: {}", input["key"].as_str().unwrap_or("")),
         "mcp" => format!("mcp: {} {}", input["action"].as_str().unwrap_or(""), input["server"].as_str().unwrap_or("")),
         "mcp_search" => format!("mcp_search: {}", input["query"].as_str().unwrap_or("")),
         "mcp_install" => format!("mcp_install: {} ({})", input["id"].as_str().unwrap_or(""), input["package"].as_str().unwrap_or("")),
@@ -184,7 +193,10 @@ pub fn summarize(name: &str, input: &Value) -> String {
 
 /// Decide whether `input` needs interactive approval under `cfg`.
 pub fn needs_approval(cfg: &Config, name: &str, input: &Value) -> bool {
-    match risk_of(name) {
+    // `mcp` is Safe only for read actions; mutations count as Write.
+    let mutating_mcp = name == "mcp"
+        && !matches!(input["action"].as_str().unwrap_or("list"), "list" | "tools");
+    match if mutating_mcp { Risk::Write } else { risk_of(name) } {
         Risk::Safe => false,
         _ => match cfg.approval {
             ApprovalMode::Auto => false,
@@ -283,32 +295,8 @@ pub async fn execute(app: &App, name: &str, input: &Value) -> Result<String, Str
         "shell" => {
             let command = input["command"].as_str().ok_or("command required")?;
             let timeout = input["timeout"].as_u64().unwrap_or(60).clamp(1, 300);
-            let (prog, flag, command) = wrap_shell(command);
-            let mut cmd = tokio::process::Command::new(prog);
-            cmd.args([flag, &command]).kill_on_drop(true);
-            if let Some(wd) = input["workdir"].as_str() {
-                cmd.current_dir(wd);
-            }
-            // kill_on_drop: if the agent run is cancelled mid-tool, dropping
-            // this future kills the child instead of leaving it running
-            let child = cmd.spawn().map_err(|e| e.to_string())?;
-            let run = child.wait_with_output();
-            match tokio::time::timeout(Duration::from_secs(timeout), run).await {
-                Ok(Ok(out)) => {
-                    let mut s = String::new();
-                    s.push_str(&String::from_utf8_lossy(&out.stdout));
-                    if !out.stderr.is_empty() {
-                        s.push_str("\n[stderr]\n");
-                        s.push_str(&String::from_utf8_lossy(&out.stderr));
-                    }
-                    if !out.status.success() {
-                        s.push_str(&format!("\n[exit {}]", out.status.code().unwrap_or(-1)));
-                    }
-                    Ok(truncate(s))
-                }
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(_) => Err(format!("timed out after {timeout}s")),
-            }
+            let workdir = input["workdir"].as_str();
+            run_shell(command, workdir, timeout).await
         }
         "config_get" => {
             let cfg = app.cfg.read().map_err(|e| e.to_string())?;
@@ -327,6 +315,21 @@ pub async fn execute(app: &App, name: &str, input: &Value) -> Result<String, Str
                 msg
             };
             if key.starts_with("mcp.") {
+                app.mcp.update_servers(app.mcp_servers_map());
+                let mcp = app.mcp.clone();
+                tokio::spawn(async move { mcp.reconcile().await; });
+            }
+            Ok(msg)
+        }
+        "config_unset" => {
+            let key = input["key"].as_str().ok_or("key required")?.to_string();
+            let msg = {
+                let mut cfg = app.cfg.write().map_err(|e| e.to_string())?;
+                let msg = cfg.apply_unset(&key).map_err(|e| e.to_string())?;
+                cfg.save(&app.cfg_path).map_err(|e| e.to_string())?;
+                msg
+            };
+            if key.starts_with("mcp") {
                 app.mcp.update_servers(app.mcp_servers_map());
                 let mcp = app.mcp.clone();
                 tokio::spawn(async move { mcp.reconcile().await; });
@@ -366,6 +369,19 @@ pub async fn execute(app: &App, name: &str, input: &Value) -> Result<String, Str
                     app.mcp.reconcile().await;
                     Ok(format!("{action} {server}: done"))
                 }
+                "remove" => {
+                    let server = input["server"].as_str().ok_or("server required")?.to_string();
+                    {
+                        let mut cfg = app.cfg.write().map_err(|e| e.to_string())?;
+                        if cfg.mcp_servers.remove(&server).is_none() {
+                            return Err(format!("unknown server '{server}'"));
+                        }
+                        cfg.save(&app.cfg_path).map_err(|e| e.to_string())?;
+                    }
+                    app.mcp.update_servers(app.mcp_servers_map());
+                    app.mcp.reconcile().await;
+                    Ok(format!("removed '{server}' from config and disconnected"))
+                }
                 _ => Err(format!("unknown action '{action}'")),
             }
         }
@@ -398,6 +414,7 @@ pub async fn execute(app: &App, name: &str, input: &Value) -> Result<String, Str
                     .collect::<BTreeMap<_, _>>()
             }).unwrap_or_default();
             let (name, conf) = crate::catalog::build_dynamic(id, package, command, args, env).map_err(|e| e.to_string())?;
+            let warnings = crate::catalog::spawn_warnings(&conf);
             {
                 let mut cfg = app.cfg.write().map_err(|e| e.to_string())?;
                 cfg.mcp_servers.insert(name.clone(), conf);
@@ -405,7 +422,11 @@ pub async fn execute(app: &App, name: &str, input: &Value) -> Result<String, Str
             }
             app.mcp.update_servers(app.mcp_servers_map());
             app.mcp.reconcile().await;
-            Ok(format!("installed '{name}' and saved to config; use mcp enable/disable or config_set mcp.{name}.enabled to toggle"))
+            let mut msg = format!("installed '{name}' and saved to config; use mcp enable/disable or config_set mcp.{name}.enabled to toggle");
+            for w in warnings {
+                msg.push_str(&format!("\nwarning: {w}"));
+            }
+            Ok(msg)
         }
         _ => Err(format!("unknown builtin tool '{name}'")),
     }
@@ -422,6 +443,71 @@ fn wrap_shell(command: &str) -> (&'static str, &'static str, String) {
 #[cfg(windows)]
 fn wrap_shell(command: &str) -> (&'static str, &'static str, String) {
     ("cmd", "/C", format!("chcp 65001 >nul & {command}"))
+}
+
+#[cfg(windows)]
+fn is_unc(p: &Path) -> bool {
+    p.to_string_lossy().starts_with("\\\\")
+}
+
+#[cfg(not(windows))]
+fn is_unc(_p: &Path) -> bool {
+    false
+}
+
+/// Run a shell command, capturing stdout+stderr. stdio MUST be piped
+/// explicitly: `wait_with_output` only captures what was piped at spawn —
+/// the spawn default (inherit) silently returns empty output.
+async fn run_shell(command: &str, workdir: Option<&str>, timeout: u64) -> Result<String, String> {
+    let (prog, flag, command) = wrap_shell(command);
+    let mut cmd = tokio::process::Command::new(prog);
+    cmd.args([flag, &command])
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    crate::catalog::no_window_async(&mut cmd);
+    let wd = workdir
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok());
+    // cmd.exe cannot start in a UNC dir, so fall back to home
+    let mut note = String::new();
+    let wd = wd.map(|p| {
+        if is_unc(&p) {
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            note = format!(
+                "[amty] cwd {} is unusable for cmd.exe; running in {}\n",
+                p.display(),
+                home.display()
+            );
+            home
+        } else {
+            p
+        }
+    });
+    if let Some(wd) = wd {
+        cmd.current_dir(wd);
+    }
+    // kill_on_drop: if the agent run is cancelled mid-tool, dropping
+    // this future kills the child instead of leaving it running
+    let child = cmd.spawn().map_err(|e| e.to_string())?;
+    let run = child.wait_with_output();
+    match tokio::time::timeout(Duration::from_secs(timeout), run).await {
+        Ok(Ok(out)) => {
+            let mut s = note;
+            s.push_str(&String::from_utf8_lossy(&out.stdout));
+            if !out.stderr.is_empty() {
+                s.push_str("\n[stderr]\n");
+                s.push_str(&String::from_utf8_lossy(&out.stderr));
+            }
+            if !out.status.success() {
+                s.push_str(&format!("\n[exit {}]", out.status.code().unwrap_or(-1)));
+            }
+            Ok(truncate(s))
+        }
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!("timed out after {timeout}s")),
+    }
 }
 
 // ---------- web_search / web_fetch ----------
@@ -1027,6 +1113,20 @@ mod tests {
         assert!(!needs_approval(&al, "shell", &json!({"command": "ls -la"})));
         assert!(needs_approval(&al, "shell", &json!({"command": "rm x"})));
         assert!(needs_approval(&al, "shell", &json!({"command": "lsblk"}))); // prefix boundary
+    }
+
+    /// Regression: without Stdio::piped(), wait_with_output returns empty
+    /// output on every platform — and on Windows the child's stdio lands on
+    /// the hidden CREATE_NO_WINDOW console buffer instead.
+    #[tokio::test]
+    async fn shell_captures_stdout_and_stderr() {
+        #[cfg(unix)]
+        let cmd = "echo aaa-out; echo bbb-err 1>&2";
+        #[cfg(windows)]
+        let cmd = "echo aaa-out & echo bbb-err 1>&2";
+        let out = run_shell(cmd, None, 30).await.unwrap();
+        assert!(out.contains("aaa-out"), "stdout missing: {out:?}");
+        assert!(out.contains("bbb-err"), "stderr missing: {out:?}");
     }
 
     #[test]
