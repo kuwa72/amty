@@ -1,6 +1,6 @@
 [package]
 name = "amty"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "amty - lightweight scriptable AI chat & agent client"
 license = "MIT OR Apache-2.0"
@@ -25,6 +25,9 @@ toml = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.11.0"
 base64 = "0.23.1"
+
+[build-dependencies]
+embed-resource = "3"
 
 [profile.release]
 # thin LTO + default codegen-units: fat LTO + cu=1 made the final crate

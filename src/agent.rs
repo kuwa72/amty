@@ -52,12 +52,14 @@ async fn run_inner(app: &Arc<App>, sid: &str, text: String) -> Result<()> {
         }
 
         let session = app.sessions.get(sid).ok_or_else(|| anyhow!("session gone"))?;
-        let (prov_name, prov_conf, model, system) = {
+        let (prov_name, prov_conf, model, system, system_tail) = {
             let cfg = app.cfg.read().unwrap();
             let name = session.provider.clone().unwrap_or_else(|| cfg.provider.clone());
             let conf = cfg.providers.get(&name).cloned().ok_or_else(|| anyhow!("provider '{name}' not defined"))?;
             let model = session.model.clone().unwrap_or_else(|| conf.model.clone());
-            (name, conf, model, cfg.system_prompt.clone())
+            // skills index is volatile (re-scanned each turn): send it as a
+            // tail so the static system_prompt stays cache-stable
+            (name, conf, model, cfg.system_prompt.clone(), crate::config::skills_prompt())
         };
         if model.is_empty() {
             anyhow::bail!("no model configured for provider '{prov_name}'");
@@ -65,15 +67,23 @@ async fn run_inner(app: &Arc<App>, sid: &str, text: String) -> Result<()> {
 
         let mut specs = tools::builtin_specs();
         specs.extend(app.mcp.specs());
+        let max_tokens = prov_conf.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+
+        let prov = provider::build(&prov_conf);
+        // shrink the session with an LLM summary if it's near the context
+        // window; re-fetch afterwards since messages may have been replaced
+        crate::compact::maybe_compact(app, sid, prov.as_ref(), &prov_conf, &model, &format!("{system}{system_tail}"), &specs, max_tokens, &cancelled).await;
+        let session = app.sessions.get(sid).ok_or_else(|| anyhow!("session gone"))?;
+
         let req = ChatRequest {
             model,
-            max_tokens: prov_conf.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            max_tokens,
             system: Some(system),
+            system_tail: (!system_tail.is_empty()).then_some(system_tail),
             messages: session.messages,
             tools: specs,
         };
 
-        let prov = provider::build(&prov_conf);
         let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
         let app2 = app.clone();
         let sid2 = sid.to_string();

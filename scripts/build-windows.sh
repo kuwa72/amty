@@ -22,6 +22,10 @@ command -v x86_64-w64-mingw32-gcc >/dev/null || {
     echo "error: x86_64-w64-mingw32-gcc not found (apt install gcc-mingw-w64 / brew install mingw-w64)" >&2
     exit 1
 }
+command -v x86_64-w64-mingw32-windres >/dev/null || {
+    echo "error: x86_64-w64-mingw32-windres not found (apt install binutils-mingw-w64 / brew install mingw-w64) — needed to embed the exe icon" >&2
+    exit 1
+}
 rustup target list --installed | grep -qx "$TARGET" || rustup target add "$TARGET"
 
 win_amty_running() {

@@ -150,6 +150,104 @@ pub fn place_keys(id: &str, src: &std::path::Path) -> Result<std::path::PathBuf>
     Ok(dst)
 }
 
+/// A windows-subsystem GUI app has no console, so every console-subsystem
+/// child (cmd, powershell, where, npx.cmd…) would briefly pop a console
+/// window. `CREATE_NO_WINDOW` suppresses it — apply to every Command spawned.
+#[cfg(target_os = "windows")]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Set CREATE_NO_WINDOW on a std Command (no-op off Windows).
+pub fn no_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// Same for a tokio Command (creation_flags is an inherent method there).
+pub fn no_window_async(cmd: &mut tokio::process::Command) -> &mut tokio::process::Command {
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
+/// `where` lookup for a bare command name on Windows. CreateProcess only
+/// auto-appends ".exe", so PATHEXT shims (`npx.cmd`, `npm.cmd`, …) must be
+/// resolved explicitly — Rust then spawns .cmd/.bat via cmd.exe internally.
+/// Prefers .exe over .cmd/.bat; skips extensionless scripts and .ps1.
+#[cfg(target_os = "windows")]
+pub fn shim_where(name: &str) -> Option<String> {
+    let mut c = std::process::Command::new("where");
+    c.arg(name);
+    no_window(&mut c);
+    let out = c.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let hits: Vec<String> = stdout
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    hits.iter()
+        .find(|p| p.to_lowercase().ends_with(".exe"))
+        .or_else(|| {
+            hits.iter().find(|p| {
+                let l = p.to_lowercase();
+                l.ends_with(".cmd") || l.ends_with(".bat")
+            })
+        })
+        .cloned()
+}
+
+/// Resolve a bare command name to a spawnable path for MCP stdio servers.
+/// Only needed on Windows; elsewhere the name goes through unchanged.
+pub fn resolve_spawn_command(command: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        let bare = !command.contains(['\\', '/']) && !command.contains('.');
+        if bare {
+            if let Some(p) = shim_where(command) {
+                return p;
+            }
+        }
+    }
+    command.to_string()
+}
+
+/// Warnings about how this server def will actually spawn (Windows shim
+/// quirks). Surfaced in mcp_install/mcp_add results so bad invocations are
+/// caught at install time instead of failing silently at connect.
+pub fn spawn_warnings(conf: &McpServerConf) -> Vec<String> {
+    let mut w: Vec<String> = vec![];
+    #[cfg(target_os = "windows")]
+    {
+        let cmd = conf.command.to_lowercase();
+        if cmd.contains("powershell") || cmd.contains("pwsh") {
+            if let Some(i) = conf.args.iter().position(|a| a == "-File") {
+                match conf.args.get(i + 1) {
+                    Some(f) if f.to_lowercase().ends_with(".ps1") => {}
+                    Some(f) => w.push(format!("powershell -File only accepts .ps1 scripts — '{f}' will fail")),
+                    None => w.push("powershell -File needs a script path argument".into()),
+                }
+            }
+        }
+        let bare = !conf.command.contains(['\\', '/']) && !conf.command.contains('.');
+        if bare && !conf.command.is_empty() && conf.url.is_none() {
+            match shim_where(&conf.command) {
+                Some(p) => w.push(format!("'{}' resolves to '{p}'", conf.command)),
+                None => w.push(format!("'{}' not found on PATH — spawn will fail", conf.command)),
+            }
+        }
+    }
+    let _ = &conf;
+    let _ = &mut w; // unix: nothing pushed
+    w
+}
+
 /// Resolve the npx executable. On Windows `npx` may be freshly installed but
 /// missing from this process's (stale) PATH — fall back to the standard
 /// installer location. Rust spawns .cmd shims via cmd.exe internally.
@@ -160,13 +258,8 @@ fn npx_exe() -> Option<String> {
     }
     #[cfg(target_os = "windows")]
     {
-        let on_path = std::process::Command::new("where")
-            .arg("npx")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if on_path {
-            return Some("npx".to_string());
+        if let Some(p) = shim_where("npx") {
+            return Some(p);
         }
         let pf = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
         for p in [
@@ -187,7 +280,12 @@ pub fn node_available() -> bool {
     static OK: OnceLock<bool> = OnceLock::new();
     *OK.get_or_init(|| {
         npx_exe()
-            .and_then(|npx| std::process::Command::new(npx).arg("--version").output().ok())
+            .and_then(|npx| {
+                let mut c = std::process::Command::new(npx);
+                c.arg("--version");
+                no_window(&mut c);
+                c.output().ok()
+            })
             .map(|o| o.status.success())
             .unwrap_or(false)
     })

@@ -178,11 +178,19 @@ pub async fn run(cmd: crate::Cmd) -> Result<()> {
                 crate::ConfigCmd::Set { key, value } => {
                     print_json(&post(&base, &tok, "/v1/config", json!({"key": key, "value": value})).await?);
                 }
+                crate::ConfigCmd::Unset { key } => {
+                    print_json(&delete(&base, &tok, &format!("/v1/config/{key}")).await?);
+                }
             }
         }
-        Mcp => {
+        Mcp { sub } => {
             let (base, tok) = runtime_info()?;
-            print_json(&get(&base, &tok, "/v1/mcp").await?);
+            match sub {
+                None => print_json(&get(&base, &tok, "/v1/mcp").await?),
+                Some(crate::McpCmd::Remove { name }) => {
+                    print_json(&delete(&base, &tok, &format!("/v1/mcp/{name}")).await?)
+                }
+            }
         }
         Catalog => {
             let (base, tok) = runtime_info()?;
@@ -215,6 +223,26 @@ pub async fn run(cmd: crate::Cmd) -> Result<()> {
         Keys { id, src } => {
             let (base, tok) = runtime_info()?;
             print_json(&post(&base, &tok, "/v1/mcp-keys", json!({"id": id, "src": src})).await?);
+        }
+        Skills { sub } => {
+            let (base, tok) = runtime_info()?;
+            match sub {
+                None => {
+                    let v = get(&base, &tok, "/v1/skills").await?;
+                    if let Some(arr) = v["skills"].as_array() {
+                        for s in arr {
+                            let name = s["name"].as_str().unwrap_or("");
+                            let managed = s["managed"].as_bool().unwrap_or(false);
+                            println!("{} {:24} {}", if managed { "*" } else { " " }, name, s["desc"].as_str().unwrap_or(""));
+                            println!("      {}", s["path"].as_str().unwrap_or(""));
+                        }
+                        println!("(* = managed under {}; others are shared/read-only)", crate::config::skills_dir().display());
+                    }
+                }
+                Some(crate::SkillCmd::Remove { name }) => {
+                    print_json(&delete(&base, &tok, &format!("/v1/skills/{name}")).await?)
+                }
+            }
         }
         Auth { id, status } => {
             let (base, tok) = runtime_info()?;

@@ -8,7 +8,7 @@ use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::Response;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -26,15 +26,18 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/sessions/{id}/cancel", post(cancel))
         .route("/v1/sessions/{id}/events", get(events))
         .route("/v1/config", get(get_config).post(set_config))
+        .route("/v1/config/{key}", delete(unset_config))
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{id}", post(resolve_approval))
         .route("/v1/mcp", get(mcp_status).post(mcp_add))
-        .route("/v1/mcp/{name}", post(mcp_toggle))
+        .route("/v1/mcp/{name}", post(mcp_toggle).delete(mcp_remove))
         .route("/v1/mcp-catalog", get(mcp_catalog))
         .route("/v1/mcp-install", post(mcp_install))
         .route("/v1/mcp-auth", post(mcp_auth))
         .route("/v1/mcp-auth/{id}", get(mcp_auth_status))
         .route("/v1/mcp-keys", post(mcp_keys))
+        .route("/v1/skills", get(skills_list))
+        .route("/v1/skills/{name}", delete(skill_remove))
         .layer(middleware::from_fn_with_state(app.clone(), auth))
         .with_state(app)
 }
@@ -205,6 +208,26 @@ async fn set_config(State(app): State<Arc<App>>, Json(b): Json<SetConfig>) -> Re
     Ok(Json(json!({"ok": msg})))
 }
 
+/// `DELETE /v1/config/{key}` — removal counterpart of set_config
+/// (e.g. `mcp._probe_github`, `provider.ollama.api_key`).
+async fn unset_config(
+    State(app): State<Arc<App>>,
+    Path(key): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let msg = {
+        let mut cfg = app.cfg.write().unwrap();
+        let msg = cfg.apply_unset(&key).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        cfg.save(&app.cfg_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        msg
+    };
+    if key.starts_with("mcp") {
+        app.mcp.update_servers(app.mcp_servers_map());
+        app.mcp.reconcile().await;
+    }
+    app.emit("", EvKind::Touched);
+    Ok(Json(json!({"ok": msg})))
+}
+
 async fn list_approvals(State(app): State<Arc<App>>) -> Json<Value> {
     Json(json!(app.approvals.list()))
 }
@@ -260,23 +283,75 @@ async fn mcp_add(
     if b.name.is_empty() || b.command.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name and command required".into()));
     }
+    let conf = crate::config::McpServerConf {
+        command: b.command,
+        args: b.args,
+        env: b.env,
+        enabled: true,
+        ..Default::default()
+    };
+    let warnings = crate::catalog::spawn_warnings(&conf);
     {
         let mut cfg = app.cfg.write().unwrap();
-        cfg.mcp_servers.insert(
-            b.name.clone(),
-            crate::config::McpServerConf {
-                command: b.command,
-                args: b.args,
-                env: b.env,
-                enabled: true,
-                ..Default::default()
-            },
-        );
+        cfg.mcp_servers.insert(b.name.clone(), conf);
         cfg.save(&app.cfg_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
     app.mcp.update_servers(app.mcp_servers_map());
     app.mcp.reconcile().await;
-    Ok(Json(json!({"added": b.name})))
+    Ok(Json(json!({"added": b.name, "warnings": warnings})))
+}
+
+async fn skills_list() -> Json<Value> {
+    let arr: Vec<Value> = crate::config::skills()
+        .iter()
+        .map(|s| {
+            json!({
+                "name": s.name,
+                "desc": s.desc,
+                "path": s.path.display().to_string(),
+                "managed": s.managed,
+            })
+        })
+        .collect();
+    Json(json!({"skills": arr}))
+}
+
+async fn skill_remove(
+    Path(name): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // only ever delete inside amty's own skills dir — shared dirs
+    // (~/.claude/skills etc.) belong to other agents
+    if name.contains('/') || name.contains('\\') || name.contains("..") || name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "invalid skill name".into()));
+    }
+    let dir = crate::config::skills_dir().join(&name);
+    if !dir.join("SKILL.md").exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no managed skill '{name}' (shared skills can only be removed by deleting their files)"),
+        ));
+    }
+    std::fs::remove_dir_all(&dir).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({"removed": name})))
+}
+
+/// `DELETE /v1/mcp/{name}` — remove a server from the config entirely
+/// (disconnects it); the delete verb the agent previously lacked.
+async fn mcp_remove(
+    State(app): State<Arc<App>>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    {
+        let mut cfg = app.cfg.write().unwrap();
+        if cfg.mcp_servers.remove(&name).is_none() {
+            return Err((StatusCode::NOT_FOUND, format!("no such server '{name}'")));
+        }
+        cfg.save(&app.cfg_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+    app.mcp.update_servers(app.mcp_servers_map());
+    app.mcp.reconcile().await;
+    app.emit("", EvKind::Touched);
+    Ok(Json(json!({"removed": name})))
 }
 
 #[derive(Deserialize)]

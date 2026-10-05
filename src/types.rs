@@ -62,7 +62,13 @@ pub struct ToolSpec {
 pub struct ChatRequest {
     pub model: String,
     pub max_tokens: u32,
+    /// Static system prompt. Kept byte-stable across turns so provider prompt
+    /// caches (Anthropic `cache_control`, OpenAI automatic prefix caching) hit.
     pub system: Option<String>,
+    /// Volatile system suffix (e.g. the skills index, re-scanned every turn).
+    /// Providers append it after the cacheable static prefix so churn here
+    /// doesn't invalidate the cached system/tools prefix.
+    pub system_tail: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ToolSpec>,
 }
@@ -164,6 +170,8 @@ pub enum EvKind {
     Running { running: bool },
     Done,
     Error { message: String },
+    /// Auto-compaction replaced `dropped` messages with a summary.
+    Compacted { dropped: usize },
     Touched,
 }
 

@@ -179,8 +179,23 @@ impl SessionStore {
         }
     }
 
-    pub fn set_fields(&self, id: &str, provider: Option<String>, model: Option<String>) {
+    /// Retitle a session (sidebar rename).
+    pub fn set_title(&self, id: &str, title: &str) -> bool {
         let mut map = self.map.write().unwrap();
+        if let Some(s) = map.get_mut(id) {
+            s.title = title.to_string();
+            s.updated = now_secs();
+            s.seq = self.next_seq();
+            let s = s.clone();
+            drop(map);
+            self.persist(&s);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn set_fields(&self, id: &str, provider: Option<String>, model: Option<String>) {        let mut map = self.map.write().unwrap();
         if let Some(s) = map.get_mut(id) {
             s.provider = provider.or(s.provider.take());
             s.model = model.or(s.model.take());
@@ -189,6 +204,23 @@ impl SessionStore {
             let s = s.clone();
             drop(map);
             self.persist(&s);
+        }
+    }
+
+    /// Replace the whole message list in place — used by auto-compaction,
+    /// which swaps the older span for a single summary message.
+    pub fn replace_messages(&self, id: &str, messages: Vec<ChatMessage>) -> bool {
+        let mut map = self.map.write().unwrap();
+        if let Some(s) = map.get_mut(id) {
+            s.messages = messages;
+            s.updated = now_secs();
+            s.seq = self.next_seq();
+            let s = s.clone();
+            drop(map);
+            self.persist(&s);
+            true
+        } else {
+            false
         }
     }
 

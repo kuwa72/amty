@@ -20,6 +20,9 @@ pub struct ProviderConf {
     pub api_key_env: Option<String>,
     pub base_url: Option<String>,
     pub max_tokens: Option<u32>,
+    /// Context window size in tokens for auto-compaction. None = per-provider
+    /// detection (Command Code model list) or a low-safe default.
+    pub context_window: Option<u64>,
     pub headers: BTreeMap<String, String>,
 }
 
@@ -32,6 +35,7 @@ impl Default for ProviderConf {
             api_key_env: None,
             base_url: None,
             max_tokens: None,
+            context_window: None,
             headers: BTreeMap::new(),
         }
     }
@@ -274,6 +278,120 @@ pub fn runtime_path() -> PathBuf {
     data_dir().join("runtime.json")
 }
 
+/// `<config_dir>/skills/<name>/SKILL.md` — agent-run documentation the model
+/// reads on demand via fs_read.
+pub fn skills_dir() -> PathBuf {
+    config_dir().join("skills")
+}
+
+/// All directories scanned for skills, highest priority first. The amty dir
+/// is managed by us; the rest are read-only shares of other agents' skills
+/// (`npx skills add`, `~/.claude`, project-local dirs).
+pub fn skills_dirs() -> Vec<PathBuf> {
+    let mut v = vec![skills_dir()];
+    if let Some(home) = dirs::home_dir() {
+        v.push(home.join(".claude").join("skills"));
+        v.push(home.join(".agents").join("skills"));
+        v.push(home.join(".config").join("devin").join("skills"));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        v.push(cwd.join(".devin").join("skills"));
+        v.push(cwd.join(".claude").join("skills"));
+    }
+    v
+}
+
+pub struct SkillInfo {
+    pub name: String,
+    pub desc: String,
+    pub path: PathBuf,
+    /// true when the skill lives in amty's own skills dir (deletable)
+    pub managed: bool,
+}
+
+/// Extract a one-line description: frontmatter `description:`/`when_to_use:`
+/// first, else the first non-heading line of the body.
+fn skill_desc(text: &str) -> String {
+    let text = text.trim_start_matches('\u{feff}');
+    let mut in_front = false;
+    let mut first_line = String::new();
+    for (i, raw) in text.lines().enumerate() {
+        let l = raw.trim();
+        if i == 0 && l == "---" {
+            in_front = true;
+            continue;
+        }
+        if in_front {
+            if l == "---" || l == "..." {
+                in_front = false;
+                continue;
+            }
+            if let Some((k, v)) = l.split_once(':') {
+                let k = k.trim();
+                if k == "description" || k == "when_to_use" {
+                    let d = v.trim().trim_matches('"').trim_matches('\'');
+                    if !d.is_empty() {
+                        return d.chars().take(160).collect();
+                    }
+                }
+            }
+            continue;
+        }
+        if !l.is_empty() && !l.starts_with('#') && first_line.is_empty() {
+            first_line = l.trim_matches(|c| c == '*' || c == '_').to_string();
+        }
+    }
+    first_line.chars().take(160).collect()
+}
+
+/// All installed skills, deduplicated by name (first dir wins).
+pub fn skills() -> Vec<SkillInfo> {
+    let own = skills_dir();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = vec![];
+    for dir in skills_dirs() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if seen.contains(&name) {
+                continue;
+            }
+            let path = e.path().join("SKILL.md");
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            seen.insert(name.clone());
+            out.push(SkillInfo {
+                name,
+                desc: skill_desc(&text),
+                managed: e.path().parent() == Some(own.as_path()),
+                path,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Index of installed skills appended to the system prompt. Rebuilt on every
+/// turn, so newly installed skills apply to all sessions immediately.
+/// Returns "" when no skills exist so the prompt stays identical.
+pub fn skills_prompt() -> String {
+    let list = skills();
+    if list.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = list
+        .iter()
+        .map(|s| format!("- {} — {} ({})", s.name, s.desc, s.path.display()))
+        .collect();
+    format!(
+        "\n\nSkills — when a task matches, fs_read the SKILL.md first:\n{}\n\
+         To install a skill: `npx skills add <owner/repo@name>` (needs Node), \
+         or write a SKILL.md under {}.",
+        lines.join("\n"),
+        skills_dir().display()
+    )
+}
+
 impl Config {
     /// Load config, writing a default file on first run.
     pub fn load() -> Result<(Self, PathBuf)> {
@@ -304,7 +422,8 @@ impl Config {
     /// `config_set` tool / `POST /v1/config` backend.
     /// Keys: provider | model | approval | system_prompt | max_tokens |
     ///       allow_commands | allow_paths | +allow_commands | +allow_paths |
-    ///       provider.<name>.{model,api_key_env,api_key,base_url} | mcp.<name>.enabled |
+    ///       provider.<name>.{model,api_key_env,api_key,base_url,context_window} |
+    ///       mcp.<name>.enabled |
     ///       search.{backend,api_key,api_key_env,base_url,max_results,fetch_max_chars}
     pub fn apply_set(&mut self, key: &str, value: &str) -> Result<String> {
         match key {
@@ -373,6 +492,7 @@ impl Config {
                     "api_key" => p.api_key = Some(value.into()),
                     "api_key_env" => p.api_key_env = Some(value.into()),
                     "base_url" => p.base_url = Some(value.into()),
+                    "context_window" => p.context_window = Some(value.parse().context("context_window must be a number")?),
                     _ => bail!("unknown provider field '{}'", parts[2]),
                 }
                 Ok(format!("{key} updated"))
@@ -409,6 +529,60 @@ impl Config {
         }
     }
 
+    /// `config_unset` tool / `DELETE /v1/config/{key}` backend — removal is the
+    /// one thing apply_set cannot express. Keys:
+    ///       mcp.<name> | mcp_servers.<name> | provider.<name> |
+    ///       provider.<name>.{api_key,api_key_env,base_url,max_tokens,context_window} |
+    ///       search.{api_key,api_key_env,base_url}
+    pub fn apply_unset(&mut self, key: &str) -> Result<String> {
+        if let Some(name) = key.strip_prefix("mcp.").or_else(|| key.strip_prefix("mcp_servers.")) {
+            if name.is_empty() || name.contains('.') {
+                bail!("usage: mcp.<name>");
+            }
+            return match self.mcp_servers.remove(name) {
+                Some(_) => Ok(format!("removed mcp server '{name}'")),
+                None => bail!("unknown mcp server '{name}'"),
+            };
+        }
+        if let Some(rest) = key.strip_prefix("provider.") {
+            let parts: Vec<&str> = rest.splitn(2, '.').collect();
+            match parts.as_slice() {
+                [name] => {
+                    if *name == self.provider {
+                        bail!("cannot remove active provider '{name}'");
+                    }
+                    return match self.providers.remove(*name) {
+                        Some(_) => Ok(format!("removed provider '{name}'")),
+                        None => bail!("unknown provider '{name}'"),
+                    };
+                }
+                [name, field] => {
+                    let p = self.providers.get_mut(*name).ok_or_else(|| anyhow!("unknown provider '{name}'"))?;
+                    match *field {
+                        "api_key" => p.api_key = None,
+                        "api_key_env" => p.api_key_env = None,
+                        "base_url" => p.base_url = None,
+                        "max_tokens" => p.max_tokens = None,
+                        "context_window" => p.context_window = None,
+                        _ => bail!("provider field '{field}' is not removable"),
+                    }
+                    return Ok(format!("{key} cleared"));
+                }
+                _ => bail!("usage: provider.<name>[.<field>]"),
+            }
+        }
+        if let Some(field) = key.strip_prefix("search.") {
+            match field {
+                "api_key" => self.search.api_key = None,
+                "api_key_env" => self.search.api_key_env = None,
+                "base_url" => self.search.base_url = None,
+                _ => bail!("search field '{field}' is not removable"),
+            }
+            return Ok(format!("{key} cleared"));
+        }
+        bail!("unknown key '{key}'")
+    }
+
     pub fn get(&self, key: &str) -> Result<String> {
         match key {
             "provider" => Ok(self.provider.clone()),
@@ -441,6 +615,7 @@ impl Config {
                     Some("base_url") => Ok(p.base_url.clone().unwrap_or_default()),
                     Some("api_key_env") => Ok(p.api_key_env.clone().unwrap_or_default()),
                     Some("api_key") => Ok(if p.api_key.is_some() { "***set***".into() } else { "".into() }),
+                    Some("context_window") => Ok(p.context_window.map(|n| n.to_string()).unwrap_or_default()),
                     _ => bail!("unknown provider field"),
                 }
             }
@@ -530,6 +705,38 @@ mod tests {
         });
         cfg.apply_set("mcp.srv.enabled", "false").unwrap();
         assert!(!cfg.mcp_servers["srv"].enabled);
+    }
+
+    #[test]
+    fn apply_unset_removes_mcp_and_provider() {
+        let mut cfg = Config::default();
+        cfg.mcp_servers.insert("probe".into(), McpServerConf {
+            command: "npx".into(), ..Default::default()
+        });
+        cfg.apply_unset("mcp.probe").unwrap();
+        assert!(!cfg.mcp_servers.contains_key("probe"));
+        assert!(cfg.apply_unset("mcp.probe").is_err()); // already gone
+        assert!(cfg.apply_unset("mcp.a.b").is_err()); // not a plain name
+        assert!(cfg.apply_unset("provider.anthropic").is_err()); // active provider
+        cfg.apply_unset("provider.ollama.base_url").unwrap();
+        assert!(cfg.providers["ollama"].base_url.is_none());
+        cfg.search.api_key = Some("k".into());
+        cfg.apply_unset("search.api_key").unwrap();
+        assert!(cfg.search.api_key.is_none());
+    }
+
+    #[test]
+    fn skill_desc_parses_frontmatter() {
+        let fm = "---\nname: x\ndescription: \"does the thing\"\n---\n# Heading\nbody";
+        assert_eq!(skill_desc(fm), "does the thing");
+        let fm2 = "---\nname: x\nwhen_to_use: 'when y'\n---\n# H\nbody";
+        assert_eq!(skill_desc(fm2), "when y");
+        let plain = "\n\n# Title\n*emphasized desc*\nmore";
+        assert_eq!(skill_desc(plain), "emphasized desc");
+        let empty = "# only headings\n## more";
+        assert_eq!(skill_desc(empty), "");
+        let bom = "\u{feff}---\ndescription: \"bom file\"\n---\n# H";
+        assert_eq!(skill_desc(bom), "bom file");
     }
 
     #[test]

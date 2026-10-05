@@ -208,7 +208,9 @@ impl App {
         let log = crate::config::data_dir().join(format!("auth-{id}.log"));
         let file = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&log)?;
         let file_err = file.try_clone()?;
-        let mut child = std::process::Command::new(&cmd)
+        let mut c = std::process::Command::new(&cmd);
+        crate::catalog::no_window(&mut c);
+        let mut child = c
             .args(&args)
             .envs(&env)
             .current_dir(dirs::home_dir().unwrap_or_default())
