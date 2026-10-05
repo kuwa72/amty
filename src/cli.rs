@@ -216,6 +216,29 @@ pub async fn run(cmd: crate::Cmd) -> Result<()> {
             let (base, tok) = runtime_info()?;
             print_json(&post(&base, &tok, "/v1/mcp-keys", json!({"id": id, "src": src})).await?);
         }
+        Skills { sub } => {
+            let (base, token) = runtime_info()?;
+            match sub {
+                Some(crate::SkillCmd::Remove { name }) => {
+                    let v = delete(&base, &token, &format!("/v1/skills/{name}")).await?;
+                    println!("{}", v["removed"].as_str().unwrap_or("?"));
+                }
+                None => {
+                    let v = get(&base, &token, "/v1/skills").await?;
+                    let empty: Vec<Value> = vec![];
+                    let list = v["skills"].as_array().unwrap_or(&empty);
+                    if list.is_empty() {
+                        println!("(no skills — drop a SKILL.md into {})", crate::config::skills_dir().display());
+                    }
+                    for s in list {
+                        let mark = if s["managed"].as_bool().unwrap_or(false) { "*" } else { " " };
+                        println!("{mark} {:<28} {}", s["name"].as_str().unwrap_or("?"), s["desc"].as_str().unwrap_or(""));
+                        println!("    {}", s["path"].as_str().unwrap_or(""));
+                    }
+                    println!("(* = managed by amty)");
+                }
+            }
+        }
         Auth { id, status } => {
             let (base, tok) = runtime_info()?;
             if status {

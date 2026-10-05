@@ -39,6 +39,17 @@ do via `config_set`, a script can do via `POST /v1/config`, and vice versa.
 
 - config: `$XDG_CONFIG_HOME/amty/config.toml` (auto-created; `mcp_servers` uses the
   same shape as `claude_desktop_config.json`'s `mcpServers`)
+- skills: `<config_dir>/skills/<name>/SKILL.md` — scanned alongside shared
+  ecosystem dirs (`~/.claude/skills`, `~/.agents/skills`,
+  `~/.config/devin/skills`, `<cwd>/.devin/skills`, `<cwd>/.claude/skills`;
+  first dir wins on name collisions). Auto-indexed into the system prompt each
+  turn (`config::skills_prompt`), so newly installed skills apply to all
+  sessions on the next message — no restart. Description comes from frontmatter
+  `description:`/`when_to_use:` else the first non-heading line. Management:
+  `amty skills` / `amty skills remove <name>` (CLI), `GET/DELETE /v1/skills`
+  (API), and the Settings window (GUI); removal only applies to amty's own dir,
+  shared dirs are read-only. Install via chat (`npx skills add`, or have the
+  agent drop a SKILL.md into the managed dir).
 - sessions: `$XDG_DATA_HOME/amty/sessions/<id>.jsonl` (meta line + messages)
 - runtime discovery: `$XDG_DATA_HOME/amty/runtime.json` (0600)
 

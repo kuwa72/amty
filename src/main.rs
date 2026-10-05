@@ -89,6 +89,11 @@ pub enum Cmd {
     },
     /// Copy a downloaded OAuth keys file to where the server expects it.
     Keys { id: String, src: String },
+    /// List installed skills (or `skills remove <name>`).
+    Skills {
+        #[command(subcommand)]
+        sub: Option<SkillCmd>,
+    },
     /// Expose the running instance as an MCP server (stdio) for external agents.
     McpServe,
     /// Import mcpServers from claude_desktop_config.json into config.toml.
@@ -99,6 +104,12 @@ pub enum Cmd {
 pub enum ConfigCmd {
     Get { key: Option<String> },
     Set { key: String, value: String },
+}
+
+#[derive(Subcommand)]
+pub enum SkillCmd {
+    /// Remove a skill from amty's own skills dir (shared dirs are read-only).
+    Remove { name: String },
 }
 
 /// Linux/WSL display fixups: point XDG_RUNTIME_DIR at WSLg's socket dir when

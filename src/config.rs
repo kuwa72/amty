@@ -274,6 +274,120 @@ pub fn runtime_path() -> PathBuf {
     data_dir().join("runtime.json")
 }
 
+/// `<config_dir>/skills/<name>/SKILL.md` — agent-run documentation the model
+/// reads on demand via fs_read.
+pub fn skills_dir() -> PathBuf {
+    config_dir().join("skills")
+}
+
+/// All directories scanned for skills, highest priority first. The amty dir
+/// is managed by us; the rest are read-only shares of other agents' skills
+/// (`npx skills add`, `~/.claude`, project-local dirs).
+pub fn skills_dirs() -> Vec<PathBuf> {
+    let mut v = vec![skills_dir()];
+    if let Some(home) = dirs::home_dir() {
+        v.push(home.join(".claude").join("skills"));
+        v.push(home.join(".agents").join("skills"));
+        v.push(home.join(".config").join("devin").join("skills"));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        v.push(cwd.join(".devin").join("skills"));
+        v.push(cwd.join(".claude").join("skills"));
+    }
+    v
+}
+
+pub struct SkillInfo {
+    pub name: String,
+    pub desc: String,
+    pub path: PathBuf,
+    /// true when the skill lives in amty's own skills dir (deletable)
+    pub managed: bool,
+}
+
+/// Extract a one-line description: frontmatter `description:`/`when_to_use:`
+/// first, else the first non-heading line of the body.
+fn skill_desc(text: &str) -> String {
+    let text = text.trim_start_matches('\u{feff}');
+    let mut in_front = false;
+    let mut first_line = String::new();
+    for (i, raw) in text.lines().enumerate() {
+        let l = raw.trim();
+        if i == 0 && l == "---" {
+            in_front = true;
+            continue;
+        }
+        if in_front {
+            if l == "---" || l == "..." {
+                in_front = false;
+                continue;
+            }
+            if let Some((k, v)) = l.split_once(':') {
+                let k = k.trim();
+                if k == "description" || k == "when_to_use" {
+                    let d = v.trim().trim_matches('"').trim_matches('\'');
+                    if !d.is_empty() {
+                        return d.chars().take(160).collect();
+                    }
+                }
+            }
+            continue;
+        }
+        if !l.is_empty() && !l.starts_with('#') && first_line.is_empty() {
+            first_line = l.trim_matches(|c| c == '*' || c == '_').to_string();
+        }
+    }
+    first_line.chars().take(160).collect()
+}
+
+/// All installed skills, deduplicated by name (first dir wins).
+pub fn skills() -> Vec<SkillInfo> {
+    let own = skills_dir();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = vec![];
+    for dir in skills_dirs() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if seen.contains(&name) {
+                continue;
+            }
+            let path = e.path().join("SKILL.md");
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            seen.insert(name.clone());
+            out.push(SkillInfo {
+                name,
+                desc: skill_desc(&text),
+                managed: e.path().parent() == Some(own.as_path()),
+                path,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Index of installed skills appended to the system prompt. Rebuilt on every
+/// turn, so newly installed skills apply to all sessions immediately.
+/// Returns "" when no skills exist so the prompt stays identical.
+pub fn skills_prompt() -> String {
+    let list = skills();
+    if list.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = list
+        .iter()
+        .map(|s| format!("- {} — {} ({})", s.name, s.desc, s.path.display()))
+        .collect();
+    format!(
+        "\n\nSkills — when a task matches, fs_read the SKILL.md first:\n{}\n\
+         To install a skill: `npx skills add <owner/repo@name>` (needs Node), \
+         or write a SKILL.md under {}.",
+        lines.join("\n"),
+        skills_dir().display()
+    )
+}
+
 impl Config {
     /// Load config, writing a default file on first run.
     pub fn load() -> Result<(Self, PathBuf)> {
@@ -530,6 +644,20 @@ mod tests {
         });
         cfg.apply_set("mcp.srv.enabled", "false").unwrap();
         assert!(!cfg.mcp_servers["srv"].enabled);
+    }
+
+    #[test]
+    fn skill_desc_parses_frontmatter() {
+        let fm = "---\nname: x\ndescription: \"does the thing\"\n---\n# Heading\nbody";
+        assert_eq!(skill_desc(fm), "does the thing");
+        let fm2 = "---\nname: x\nwhen_to_use: 'when y'\n---\n# H\nbody";
+        assert_eq!(skill_desc(fm2), "when y");
+        let plain = "\n\n# Title\n*emphasized desc*\nmore";
+        assert_eq!(skill_desc(plain), "emphasized desc");
+        let empty = "# only headings\n## more";
+        assert_eq!(skill_desc(empty), "");
+        let bom = "\u{feff}---\ndescription: \"bom file\"\n---\n# H";
+        assert_eq!(skill_desc(bom), "bom file");
     }
 
     #[test]

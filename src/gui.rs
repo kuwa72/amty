@@ -843,8 +843,16 @@ impl eframe::App for GuiApp {
             let mut open = true;
             let mut save = false;
             let mut import = false;
+            let mut skill_rm: Option<String> = None;
             let lang = self.app.cfg.read().unwrap().lang.clone();
-            settings_window(&ctx, &lang, &mut open, &mut buf, &mut save, &mut import);
+            settings_window(&ctx, &lang, &mut open, &mut buf, &mut save, &mut import, &mut skill_rm);
+            if let Some(name) = skill_rm {
+                let dir = crate::config::skills_dir().join(&name);
+                match std::fs::remove_dir_all(&dir) {
+                    Ok(_) => self.toast(format!("{} {name}", self.tr("removed:"))),
+                    Err(e) => self.toast(format!("{} {e}", self.tr("remove failed:"))),
+                }
+            }
             if import {
                 match crate::config::import_claude(&mut buf.cfg) {
                     Ok(added) => self.toast(format!("{} {}", added.len(), self.tr("server(s) imported:"))),
@@ -1035,7 +1043,7 @@ fn linkify_line(line: &str) -> String {
     out
 }
 
-fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut SettingsBuf, save: &mut bool, import: &mut bool) {
+fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut SettingsBuf, save: &mut bool, import: &mut bool, skill_rm: &mut Option<String>) {
     let t = |k: &'static str| crate::i18n::t(lang, k);
     egui::Window::new(t("settings")).open(open).default_size([560.0, 480.0]).show(ctx, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1202,7 +1210,23 @@ fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut S
                 }
             }
             ui.separator();
-            ui.heading(t("behavior"));
+            ui.heading(t("skills"));
+            for s in crate::config::skills() {
+                ui.horizontal(|ui| {
+                    ui.label(&s.name);
+                    ui.weak(if s.managed { "amty" } else { t("shared") });
+                    if s.managed && ui.small_button("✕").clicked() {
+                        *skill_rm = Some(s.name.clone());
+                    }
+                });
+                ui.add(
+                    egui::Label::new(egui::RichText::new(format!("{} — {}", s.desc, s.path.display())).weak().small())
+                        .wrap(),
+                );
+            }
+            ui.weak(t("to add a skill: ask in chat (npx skills add works if Node.js is installed), or drop a SKILL.md in the skills dir"));
+            ui.separator();
+
             ui.horizontal(|ui| {
                 ui.label(t("approval:"));
                 egui::ComboBox::from_id_salt("ap")

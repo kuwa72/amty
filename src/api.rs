@@ -8,7 +8,7 @@ use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::Response;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -35,6 +35,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/mcp-auth", post(mcp_auth))
         .route("/v1/mcp-auth/{id}", get(mcp_auth_status))
         .route("/v1/mcp-keys", post(mcp_keys))
+        .route("/v1/skills", get(skills_list))
+        .route("/v1/skills/{name}", delete(skill_remove))
         .layer(middleware::from_fn_with_state(app.clone(), auth))
         .with_state(app)
 }
@@ -362,6 +364,28 @@ async fn mcp_keys(
     app.mcp.update_servers(app.mcp_servers_map());
     app.mcp.reconcile().await;
     Ok(Json(json!({"placed": dst.to_string_lossy()})))
+}
+
+/// List skills from amty's own dir plus shared skill dirs (claude/agents/devin).
+async fn skills_list() -> Json<Value> {
+    let skills: Vec<Value> = crate::config::skills()
+        .iter()
+        .map(|s| json!({"name": s.name, "desc": s.desc, "path": s.path, "managed": s.managed}))
+        .collect();
+    Json(json!({"skills": skills}))
+}
+
+/// Delete a skill from amty's own skills dir only; shared dirs are read-only.
+async fn skill_remove(Path(name): Path<String>) -> Result<Json<Value>, (StatusCode, String)> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err((StatusCode::BAD_REQUEST, "invalid skill name".into()));
+    }
+    let dir = crate::config::skills_dir().join(&name);
+    if !dir.is_dir() {
+        return Err((StatusCode::NOT_FOUND, "skill not found in amty's own dir (shared dirs are read-only)".into()));
+    }
+    std::fs::remove_dir_all(&dir).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({"removed": name})))
 }
 
 async fn mcp_toggle(

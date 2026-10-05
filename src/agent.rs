@@ -57,7 +57,7 @@ async fn run_inner(app: &Arc<App>, sid: &str, text: String) -> Result<()> {
             let name = session.provider.clone().unwrap_or_else(|| cfg.provider.clone());
             let conf = cfg.providers.get(&name).cloned().ok_or_else(|| anyhow!("provider '{name}' not defined"))?;
             let model = session.model.clone().unwrap_or_else(|| conf.model.clone());
-            (name, conf, model, cfg.system_prompt.clone())
+            (name, conf, model, format!("{}{}", cfg.system_prompt, crate::config::skills_prompt()))
         };
         if model.is_empty() {
             anyhow::bail!("no model configured for provider '{prov_name}'");
