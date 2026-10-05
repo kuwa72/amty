@@ -373,6 +373,38 @@ impl eframe::App for GuiApp {
         }
         self.refresh_view();
 
+        // drag & drop: dropped file paths are appended to the input box;
+        // paint a drop hint while files are hovered over the window
+        let (dropped, hovering) = ctx.input(|i| {
+            (
+                i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect::<Vec<_>>(),
+                !i.raw.hovered_files.is_empty(),
+            )
+        });
+        for p in &dropped {
+            let s = p.display().to_string();
+            let s = if s.contains(char::is_whitespace) { format!("\"{s}\"") } else { s };
+            if !self.input.is_empty() && !self.input.ends_with(char::is_whitespace) {
+                self.input.push(' ');
+            }
+            self.input.push_str(&s);
+        }
+        if hovering {
+            let rect = ctx.content_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("dnd_hint"),
+            ));
+            painter.rect_filled(rect, 4.0, egui::Color32::from_rgba_unmultiplied(30, 60, 120, 80));
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                self.tr("drop files to insert their paths"),
+                egui::FontId::proportional(18.0),
+                egui::Color32::WHITE,
+            );
+        }
+
         let any_running = self.running.values().any(|r| *r);
         let auth_running = self.app.auth.lock().unwrap().values().any(|a| a.running);
         if any_running || auth_running || !self.pending.is_empty() {
