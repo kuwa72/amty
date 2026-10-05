@@ -137,29 +137,73 @@ impl Provider for Anthropic {
     }
 }
 
+/// system + volatile tail combined for providers without block-level caching.
+fn system_full(req: &ChatRequest) -> Option<String> {
+    let mut s = req.system.clone().unwrap_or_default();
+    if let Some(t) = &req.system_tail {
+        s.push_str(t);
+    }
+    (!s.is_empty()).then_some(s)
+}
+
+/// Prompt-cache-aware request body: Anthropic caches everything up to each
+/// `cache_control` breakpoint (order: tools → system → messages). Breakpoints
+/// sit at the end of the tools list, on the static system block, and on the
+/// last message, so the tools+static-system prefix stays cached while the
+/// volatile skills tail and new messages roll forward.
+fn anthropic_body(req: &ChatRequest) -> Value {
+    let mut tools: Vec<Value> = req
+        .tools
+        .iter()
+        .map(|t| json!({"name": t.name, "description": t.description, "input_schema": t.schema}))
+        .collect();
+    if let Some(last) = tools.last_mut() {
+        last["cache_control"] = json!({"type": "ephemeral"});
+    }
+    let mut system: Vec<Value> = Vec::new();
+    if let Some(s) = req.system.as_deref().filter(|s| !s.is_empty()) {
+        system.push(json!({"type": "text", "text": s, "cache_control": {"type": "ephemeral"}}));
+    }
+    if let Some(t) = req.system_tail.as_deref().filter(|t| !t.is_empty()) {
+        system.push(json!({"type": "text", "text": t}));
+    }
+    let mut messages = anthropic_messages(&req.messages);
+    if let Some(b) = messages
+        .last_mut()
+        .and_then(|m| m["content"].as_array_mut())
+        .and_then(|c| c.last_mut())
+    {
+        b["cache_control"] = json!({"type": "ephemeral"});
+    }
+    json!({
+        "model": req.model,
+        "max_tokens": req.max_tokens,
+        "stream": true,
+        "system": if system.is_empty() { Value::Null } else { json!(system) },
+        "messages": messages,
+        "tools": tools,
+    })
+}
+
 impl Anthropic {
     async fn run(&self, req: &ChatRequest, tx: &mpsc::UnboundedSender<StreamEvent>) -> Result<()> {
         let key = self.conf.resolved_key().ok_or_else(|| anyhow!("no api key for anthropic provider"))?;
-        let body = json!({
-            "model": req.model,
-            "max_tokens": req.max_tokens,
-            "stream": true,
-            "system": req.system,
-            "messages": anthropic_messages(&req.messages),
-            "tools": req.tools.iter().map(|t| json!({
-                "name": t.name, "description": t.description, "input_schema": t.schema,
-            })).collect::<Vec<_>>(),
-        });
+        let body = anthropic_body(req);
         let client = http()?;
+        // prompt caching is GA but older gateways still want the beta header
+        let beta = if key.starts_with("sk-ant-oat") {
+            "prompt-caching-2024-07-31,oauth-2025-04-20"
+        } else {
+            "prompt-caching-2024-07-31"
+        };
         let mut rb = client
             .post(format!("{}/v1/messages", self.conf.resolved_base()))
             .header("x-api-key", &key)
             .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", beta)
             .header("content-type", "application/json");
         if key.starts_with("sk-ant-oat") {
-            rb = rb
-                .bearer_auth(&key)
-                .header("anthropic-beta", "oauth-2025-04-20");
+            rb = rb.bearer_auth(&key);
         }
         for (k, v) in &self.conf.headers {
             rb = rb.header(k.as_str(), v.as_str());
@@ -235,7 +279,7 @@ struct OpenAi {
 
 fn openai_messages(req: &ChatRequest) -> Vec<Value> {
     let mut out = Vec::new();
-    if let Some(sys) = &req.system {
+    if let Some(sys) = system_full(req) {
         out.push(json!({"role": "system", "content": sys}));
     }
     for m in &ensure_tool_results(&req.messages) {
@@ -552,7 +596,7 @@ impl CommandCode {
     async fn run(&self, req: &ChatRequest, tx: &mpsc::UnboundedSender<StreamEvent>) -> Result<()> {
         let key = self.conf.resolved_key()
             .ok_or_else(|| anyhow!("no Command Code api key — run `cmdc` once to sign in, or set providers.commandcode.api_key"))?;
-        let system: Value = match &req.system {
+        let system: Value = match system_full(req) {
             Some(s) => json!([{ "type": "text", "text": s }]),
             None => Value::Null,
         };
@@ -795,6 +839,7 @@ mod tests {
     fn openai_shape() {
         let r = ChatRequest {
             model: "m".into(), max_tokens: 1, system: Some("sys".into()),
+            system_tail: None,
             messages: req_msgs(), tools: vec![],
         };
         let v = openai_messages(&r);
@@ -804,6 +849,32 @@ mod tests {
         assert_eq!(v[2]["tool_calls"][0]["function"]["name"], "fs_read");
         assert_eq!(v[3]["role"], "tool");
         assert_eq!(v[3]["tool_call_id"], "t1");
+    }
+
+    #[test]
+    fn anthropic_body_cache_breakpoints() {
+        let r = ChatRequest {
+            model: "m".into(), max_tokens: 1,
+            system: Some("static".into()),
+            system_tail: Some("skills index".into()),
+            messages: req_msgs(),
+            tools: vec![
+                ToolSpec { name: "a".into(), description: "d".into(), schema: json!({}) },
+                ToolSpec { name: "b".into(), description: "d".into(), schema: json!({}) },
+            ],
+        };
+        let b = anthropic_body(&r);
+        // last tool carries the tools-prefix breakpoint
+        assert!(b["tools"][0]["cache_control"].is_null());
+        assert_eq!(b["tools"][1]["cache_control"]["type"], "ephemeral");
+        // static system block cached; volatile tail block is not
+        assert_eq!(b["system"][0]["text"], "static");
+        assert_eq!(b["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(b["system"][1]["text"], "skills index");
+        assert!(b["system"][1]["cache_control"].is_null());
+        // newest message's last block holds the history breakpoint
+        let last = b["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["content"].as_array().unwrap().last().unwrap()["cache_control"]["type"], "ephemeral");
     }
 
     #[test]
@@ -841,6 +912,7 @@ mod live_tests {
             model: "mock-model".into(),
             max_tokens: 100,
             system: None,
+            system_tail: None,
             messages: vec![ChatMessage::user("hi")],
             tools: vec![],
         };

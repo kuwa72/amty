@@ -436,7 +436,9 @@ impl Manager {
         Ok(Client { rpc, tools })
     }
 
-    /// All MCP tool specs, namespaced as `mcp__<server>__<tool>`.
+    /// All MCP tool specs, namespaced as `mcp__<server>__<tool>`, sorted for a
+    /// stable order — hash-map iteration would otherwise shuffle the tools
+    /// prefix and defeat prompt caching.
     pub fn specs(&self) -> Vec<ToolSpec> {
         let mut out = vec![];
         for (srv, client) in self.clients.lock().unwrap().iter() {
@@ -449,6 +451,7 @@ impl Manager {
                 let _ = orig;
             }
         }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
 
