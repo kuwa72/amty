@@ -5,6 +5,7 @@ use crate::session::Session;
 use crate::types::{AppEvent, Block, EvKind, Role};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
@@ -31,14 +32,78 @@ pub fn run(rt: tokio::runtime::Runtime, app: Arc<App>) -> eframe::Result<()> {
             .with_icon(icon),
         ..Default::default()
     };
-    eframe::run_native(
-        "amty",
-        options,
-        Box::new(move |cc| {
-            install_cjk_fonts(&cc.egui_ctx);
-            Ok(Box::new(GuiApp::new(handle, app)))
-        }),
-    )
+    let gpu_lost = Arc::new(AtomicBool::new(false));
+    let flag = gpu_lost.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        eframe::run_native(
+            "amty",
+            options,
+            Box::new(move |cc| {
+                install_cjk_fonts(&cc.egui_ctx);
+                guard_gpu_loss(cc, flag.clone());
+                Ok(Box::new(GuiApp::new(handle, app)))
+            }),
+        )
+    }));
+    match result {
+        Ok(r) => r,
+        Err(payload) => {
+            if gpu_lost.load(Ordering::SeqCst) {
+                // A panic escaping wgpu-hal on device removal gets the same
+                // treatment as the orderly path: relaunch, exit cleanly.
+                respawn_self();
+                Ok(())
+            } else {
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+}
+
+/// Spawn a fresh copy of this binary (GUI mode). Used when the GPU device is
+/// lost: wgpu can't migrate a device to another adapter, so the only way to
+/// keep running is a new process. Sessions persist continuously, so the new
+/// instance picks up where this one left off.
+fn respawn_self() {
+    // Both the device-lost callback and the panic path below may try to
+    // restart us — make sure only the first one does.
+    static RESPAWNED: AtomicBool = AtomicBool::new(false);
+    if RESPAWNED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe).spawn();
+    }
+}
+
+/// A removed dGPU/eGPU (or a driver reset) kills the wgpu device; without
+/// these hooks wgpu panics on the first uncaptured error and the app dies.
+/// On a real loss (`Unknown` reason — `Destroyed` is normal teardown) we
+/// relaunch ourselves and close. Errors from the dying device are then
+/// swallowed instead of panicking; errors with no device loss still panic,
+/// preserving the default "loud failure" behavior for genuine bugs.
+fn guard_gpu_loss(cc: &eframe::CreationContext, gpu_lost: Arc<AtomicBool>) {
+    let Some(state) = &cc.wgpu_render_state else {
+        return;
+    };
+    let ctx = cc.egui_ctx.clone();
+    let lost = gpu_lost.clone();
+    state.device.set_device_lost_callback(move |reason, msg| {
+        if reason != eframe::wgpu::DeviceLostReason::Unknown {
+            return;
+        }
+        lost.store(true, Ordering::SeqCst);
+        eprintln!("amty: GPU device lost ({msg}); restarting");
+        respawn_self();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    });
+    state.device.on_uncaptured_error(Arc::new(move |err| {
+        if gpu_lost.load(Ordering::SeqCst) {
+            eprintln!("amty: ignoring wgpu error after device loss: {err}");
+        } else {
+            panic!("{err}");
+        }
+    }));
 }
 
 /// egui's bundled fonts have no CJK glyphs; attach an OS font when found.
@@ -163,6 +228,61 @@ fn face_metrics(data: &[u8]) -> Option<FaceMetrics> {
         descent: d / upm,
         leading: l / upm,
     })
+}
+
+/// If the window ended up fully off-screen — e.g. the monitor it was on was
+/// unplugged while running, or a display arrangement changed — recenter it on
+/// the nearest monitor. eframe already clamps the position it restores at
+/// startup; this catches disconnects that happen later. Runs on a 1 s repaint
+/// heartbeat so a monitor removal rescues the window even if no winit event
+/// reaches us.
+#[cfg(target_os = "windows")]
+fn rescue_offscreen_window(ctx: &egui::Context) {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+        MONITOR_DEFAULTTONULL,
+    };
+
+    ctx.request_repaint_after(Duration::from_secs(1));
+
+    let (outer, minimized) =
+        ctx.input(|i| (i.viewport().outer_rect, i.viewport().minimized));
+    let Some(outer) = outer else { return };
+    if minimized == Some(true) {
+        return; // iconic rect (-32000,-32000) is not the real position
+    }
+    let ppp = ctx.pixels_per_point();
+    let px = |v: f32| (v * ppp).round() as i32;
+    let rect = RECT {
+        left: px(outer.min.x),
+        top: px(outer.min.y),
+        right: px(outer.max.x),
+        bottom: px(outer.max.y),
+    };
+    unsafe {
+        if !MonitorFromRect(&rect, MONITOR_DEFAULTTONULL).is_null() {
+            return; // still intersects some display
+        }
+        let hmon = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
+        if hmon.is_null() {
+            return;
+        }
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(hmon, &mut mi) == 0 {
+            return;
+        }
+        let w = mi.rcWork;
+        let x = w.left + (w.right - w.left - (rect.right - rect.left)) / 2;
+        let y = w.top + (w.bottom - w.top - (rect.bottom - rect.top)) / 2;
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+            x as f32 / ppp,
+            y as f32 / ppp,
+        )));
+    }
 }
 
 struct PendingView {
@@ -399,6 +519,8 @@ impl GuiApp {
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        #[cfg(target_os = "windows")]
+        rescue_offscreen_window(&ctx);
         while let Ok(ev) = self.rx.try_recv() {
             self.on_event(ev);
         }
@@ -655,10 +777,26 @@ impl eframe::App for GuiApp {
                     }
                     let mut do_send = ui.button(self.tr("send")).clicked();
                     let hint = self.tr("message (Enter to send, Shift+Enter for newline)");
-                    let resp = ui.add_sized(
-                        [ui.available_width().max(80.0), 64.0],
-                        egui::TextEdit::multiline(&mut self.input).hint_text(hint),
-                    );
+                    // Multiline TextEdit grows with content and has no internal
+                    // scrolling — wrap it in a capped ScrollArea so a huge paste
+                    // can't push the bottom panel (and the buttons) off-screen.
+                    // The cap tracks window height so tall windows get a taller
+                    // input before it starts scrolling.
+                    let input_max_h = (ui.ctx().content_rect().height() * 0.3).clamp(120.0, 320.0);
+                    let resp = egui::ScrollArea::vertical()
+                        .id_salt("input_scroll")
+                        .max_height(input_max_h)
+                        .auto_shrink([false, true])
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.input)
+                                    .hint_text(hint)
+                                    .desired_rows(3)
+                                    .desired_width(f32::INFINITY),
+                            )
+                        })
+                        .inner;
                     let ime = ui.ctx().input(|i| {
                         i.events.iter().any(|e| matches!(e, egui::Event::Ime(_)))
                             || i.raw.events.iter().any(|e| matches!(e, egui::Event::Ime(_)))
@@ -1398,16 +1536,21 @@ fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut S
                         resp
                     };
                     if resp.clicked() {
-                        buf.sel_provider = name;
+                        buf.sel_provider = name.clone();
                     }
                     if !is_default {
                         resp.context_menu(|ui| {
                             if ui.button(t("set as default")).clicked() {
-                                buf.cfg.provider = buf.sel_provider.clone();
+                                buf.cfg.provider = name.clone();
                                 ui.close();
                             }
                             if ui.button(t("delete")).clicked() {
-                                buf.cfg.providers.remove(&buf.sel_provider);
+                                buf.cfg.providers.remove(&name);
+                                if buf.sel_provider == name {
+                                    if let Some(first) = buf.cfg.providers.keys().next().cloned() {
+                                        buf.sel_provider = first;
+                                    }
+                                }
                                 ui.close();
                             }
                         });
@@ -1469,6 +1612,12 @@ fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut S
                         let mut v = p.max_tokens.map(|n| n.to_string()).unwrap_or_default();
                         if ui.text_edit_singleline(&mut v).changed() {
                             p.max_tokens = v.parse().ok();
+                        }
+                        ui.end_row();
+                        ui.label("context_window");
+                        let mut v = p.context_window.map(|n| n.to_string()).unwrap_or_default();
+                        if ui.text_edit_singleline(&mut v).changed() {
+                            p.context_window = v.parse().ok();
                         }
                         ui.end_row();
                     });
