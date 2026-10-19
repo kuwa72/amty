@@ -324,10 +324,18 @@ pub struct GuiApp {
     rx: broadcast::Receiver<AppEvent>,
     current: String,
     input: String,
+    /// images attached to the next message (clipboard paste / file drop),
+    /// shown as thumbnails under the input box and sent with the text
+    pending_images: Vec<PendingImage>,
+    /// decoded textures for images in the session view, keyed by content id
+    /// (base64 length + size) so we decode each image only once
+    image_tex: HashMap<String, egui::TextureHandle>,
     /// streamed text not yet persisted into the session
     live_text: HashMap<String, String>,
     /// currently executing tool label per session
     live_tool: HashMap<String, String>,
+    /// running token totals for the session's current turn (header display)
+    live_usage: HashMap<String, crate::types::Usage>,
     running: HashMap<String, bool>,
     /// last error per session, shown in the header until cleared
     last_error: HashMap<String, String>,
@@ -350,20 +358,36 @@ pub struct GuiApp {
     cat_env: HashMap<String, String>,
     /// keys-file source path inputs, per catalog id
     cat_keys: HashMap<String, String>,
+    /// Windows: Ctrl+V is currently held (rising-edge debounce for image paste)
+    paste_hot: bool,
 }
 
 impl GuiApp {
     fn new(rt: tokio::runtime::Handle, app: Arc<App>) -> Self {
         let rx = app.events.subscribe();
-        let current = app.sessions.list().first().map(|s| s.id.clone()).unwrap_or_default();
+        // Reopen the session that was selected when we last closed (falls back
+        // to the most recently updated one). That session carries its own
+        // provider/model, so the same pair comes back with it.
+        let current = app
+            .cfg
+            .read()
+            .unwrap()
+            .last_session
+            .clone()
+            .and_then(|id| app.sessions.resolve(&id))
+            .or_else(|| app.sessions.list().first().map(|s| s.id.clone()))
+            .unwrap_or_default();
         Self {
             app,
             rt,
             rx,
             current,
             input: String::new(),
+            pending_images: Vec::new(),
+            image_tex: HashMap::new(),
             live_text: HashMap::new(),
             live_tool: HashMap::new(),
+            live_usage: HashMap::new(),
             running: HashMap::new(),
             last_error: HashMap::new(),
             pending: vec![],
@@ -379,6 +403,7 @@ impl GuiApp {
             cat_sel: None,
             cat_env: HashMap::new(),
             cat_keys: HashMap::new(),
+            paste_hot: false,
         }
     }
 
@@ -434,6 +459,11 @@ impl GuiApp {
                 self.live_tool.remove(&ev.session);
                 self.view_dirty = true;
             }
+            EvKind::Usage { cumulative, .. } => {
+                // show running session spend in the status/toast line
+                self.live_usage.insert(ev.session.clone(), cumulative);
+                self.view_dirty = true;
+            }
             EvKind::Compacted { dropped } => {
                 self.toast(format!("{} ({dropped})", self.tr("context compacted")));
                 self.view_dirty = true;
@@ -460,6 +490,7 @@ impl GuiApp {
                 self.current = v.id.clone();
             }
             self.view_dirty = false;
+            self.remember_last_session();
         }
     }
 
@@ -471,16 +502,36 @@ impl GuiApp {
         crate::i18n::t(&self.app.cfg.read().unwrap().lang, key)
     }
 
+    /// Remember which session is selected, so the next launch reopens it (and
+    /// with it the session's provider/model). `last_session` holds the *id*;
+    /// `sessions.resolve` accepts a unique prefix too, so a stale id simply
+    /// falls back to the most recent session on startup.
+    fn remember_last_session(&mut self) {
+        if self.current.is_empty() {
+            return;
+        }
+        let mut cfg = self.app.cfg.write().unwrap();
+        if cfg.last_session.as_deref() == Some(self.current.as_str()) {
+            return;
+        }
+        cfg.last_session = Some(self.current.clone());
+        if let Err(e) = cfg.save(&self.app.cfg_path) {
+            eprintln!("amty: could not save last_session: {e}");
+        }
+    }
+
     fn ensure_session(&mut self) -> String {
         if self.current.is_empty() {
-            self.current = self.app.sessions.create(None, None);
+            let (p, m) = self.session_provider();
+            self.current = self.app.sessions.create(Some(p), Some(m));
+            self.remember_last_session();
         }
         self.current.clone()
     }
 
     fn send(&mut self) {
         let text = self.input.trim().to_string();
-        if text.is_empty() {
+        if text.is_empty() && self.pending_images.is_empty() {
             return;
         }
         let sid = self.ensure_session();
@@ -491,18 +542,21 @@ impl GuiApp {
             self.toast("already running in this session");
             return;
         }
+        let images = std::mem::take(&mut self.pending_images);
+        let blocks = message_blocks(&text, images);
         self.input.clear();
         self.last_error.remove(&sid);
         self.view_dirty = true;
         let app_ref = self.app.clone();
         let sid_err = sid.clone();
         self.rt.spawn(async move {
-            if let Err(e) = crate::agent::start_run(&app, &sid2, text) {
+            if let Err(e) = crate::agent::start_run_blocks(&app, &sid2, blocks) {
                 app_ref.emit(&sid_err, EvKind::Error { message: e.to_string() });
             }
         });
     }
 
+    /// Attach a clipboard image result: push on success, toast on failure.
     fn session_provider(&self) -> (String, String) {
         let cfg = self.app.cfg.read().unwrap();
         let (p, m) = self
@@ -535,12 +589,65 @@ impl eframe::App for GuiApp {
             )
         });
         for p in &dropped {
+            // an image file is attached as an image, everything else becomes a path
+            if is_image_path(p) {
+                match std::fs::read(p).map_err(|e| e.to_string()).and_then(|b| PendingImage::from_bytes(&b)) {
+                    Ok(img) => self.pending_images.push(img),
+                    Err(e) => self.toast(format!("{} {e}", self.tr("image load failed:"))),
+                }
+                continue;
+            }
             let s = p.display().to_string();
             let s = if s.contains(char::is_whitespace) { format!("\"{s}\"") } else { s };
             if !self.input.is_empty() && !self.input.ends_with(char::is_whitespace) {
                 self.input.push(' ');
             }
             self.input.push_str(&s);
+        }
+
+        // Ctrl+V with an image on the clipboard (a screenshot) attaches it.
+        // egui's Paste event only carries text, and egui-winit swallows the raw
+        // Key::V event entirely when the clipboard holds no text (image-only
+        // paste), so key_pressed(V) never fires. On Windows we therefore poll
+        // the keyboard directly: the rising edge of Ctrl+V with an image on
+        // the clipboard attaches it (a rising-edge latch debounces repeats).
+        // On other platforms the egui event still works for image-only
+        // clipboards there because egui-winit emits Paste for the physical
+        // key fallback path; the key_pressed check stays for non-Windows.
+        let attach_now = if cfg!(target_os = "windows") {
+            #[cfg(target_os = "windows")]
+            {
+                use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+                    GetAsyncKeyState, VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_SHIFT, VK_V,
+                };
+                let down = |vk: i32| unsafe { GetAsyncKeyState(vk) } as u16 & 0x8000 != 0;
+                let ctrl_held = down(VK_CONTROL as _)
+                    || down(VK_LCONTROL as _)
+                    || down(VK_RCONTROL as _);
+                let held = ctrl_held && down(VK_V as _);
+                let rising = held && !self.paste_hot;
+                self.paste_hot = held;
+                rising && ctrl_held && !down(VK_SHIFT as _)
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                false
+            }
+        } else {
+            ctx.input(|i| {
+                i.key_pressed(egui::Key::V) && (i.modifiers.command || i.modifiers.ctrl)
+            })
+        };
+        if attach_now {
+            match clipboard_image() {
+                Some(Ok(img)) => self.pending_images.push(img),
+                Some(Err(e)) => {
+                    self.toast(format!("{} {e}", self.tr("image load failed:")));
+                }
+                // no image on the clipboard (or clipboard unreadable): let the
+                // normal text paste path do its thing
+                None => {}
+            }
         }
         if hovering {
             let rect = ctx.content_rect();
@@ -565,16 +672,145 @@ impl eframe::App for GuiApp {
         }
 
         // ----- left: sessions -----
-        egui::Panel::left("side").min_size(200.0).show(ui, |ui| {
+        // 250 outer keeps the provider combo + model row readable; users can
+        // still drag narrower down to 180 without the footer breaking.
+        egui::Panel::left("side").default_size(250.0).min_size(180.0).show(ui, |ui| {
+            // The provider/model/settings footer is claimed FIRST (as a nested
+            // bottom panel) and the session list then gets whatever height is
+            // left. Previously the list was an unbounded ScrollArea in the same
+            // top-down flow, so it grew with the content and pushed the footer
+            // off the bottom of the screen instead of scrolling.
+            egui::Panel::bottom("side_footer")
+                .show_separator_line(false)
+                .show(ui, |ui| {
+                    ui.separator();
+                    // provider / model quick switch (per-session override)
+                    let (prov, model) = self.session_provider();
+                    let names: Vec<String> = self.app.cfg.read().unwrap().providers.keys().cloned().collect();
+                    let mut sel = prov.clone();
+                    // size the combo to the leftover room after its label, so
+                    // it never crosses the panel edge on narrow sidebars
+                    let label_w = {
+                        let galley = ui.painter().layout_no_wrap(
+                            self.tr("provider").to_owned(),
+                            egui::TextStyle::Body.resolve(ui.style()),
+                            egui::Color32::WHITE,
+                        );
+                        galley.size().x + ui.spacing().item_spacing.x
+                    };
+                    egui::ComboBox::from_label(self.tr("provider"))
+                        .width((ui.available_width() - label_w).max(ui.spacing().combo_width))
+                        .selected_text(&sel)
+                        .show_ui(ui, |ui| {
+                            for n in &names {
+                                ui.selectable_value(&mut sel, n.clone(), n);
+                            }
+                        });
+                    if sel != prov {
+                        let sid = self.ensure_session();
+                        self.app.sessions.set_fields(&sid, Some(sel), None);
+                        self.view_dirty = true;
+                    }
+                    // model suggestions are fetched before the row so the
+                    // ▾ button's real width can be measured and reserved
+                    let kind = self.app.cfg.read().unwrap().providers.get(&prov).map(|p| p.kind);
+                    let (suggestions, err) = match kind {
+                        Some(crate::config::ProviderKind::CommandCode) => {
+                            let conf = self.app.cfg.read().unwrap().providers.get(&prov).cloned().unwrap_or_default();
+                            crate::provider::cmdc_models(&conf)
+                        }
+                        _ => (kind.map(crate::provider::model_suggestions).unwrap_or_default(), None),
+                    };
+                    let suggestions_label = if suggestions.is_empty() {
+                        None
+                    } else {
+                        Some(match &err {
+                            None => format!("▾ ({})", suggestions.len()),
+                            Some(_) => format!("▾ ({}) ⚠", suggestions.len()),
+                        })
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(self.tr("model"));
+                        // keep room for the model-suggestions button, no matter
+                        // how narrow the user dragged the side panel — measure
+                        // the real text instead of guessing a fixed reserve
+                        let menu_w = match &suggestions_label {
+                            Some(lbl) => {
+                                let galley = ui.painter().layout_no_wrap(
+                                    lbl.clone(),
+                                    egui::TextStyle::Button.resolve(ui.style()),
+                                    egui::Color32::WHITE,
+                                );
+                                galley.size().x + ui.spacing().button_padding.x * 2.0 + 4.0
+                            }
+                            None => 0.0,
+                        };
+                        let edit_w = (ui.available_width() - menu_w).max(50.0);
+                        let mut m = model.clone();
+                        if ui.add(egui::TextEdit::singleline(&mut m).desired_width(edit_w)).lost_focus() && m != model {
+                            let sid = self.ensure_session();
+                            self.app.sessions.set_fields(&sid, None, Some(m));
+                            self.view_dirty = true;
+                        }
+                        if let Some(lbl) = &suggestions_label {
+                            ui.menu_button(lbl, |ui| {
+                                if let Some(e) = &err {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 200, 80),
+                                        format!("{}: {}", self.tr("cmdc --list-models unavailable — showing fallback list"), e),
+                                    );
+                                    ui.separator();
+                                }
+                                egui::ScrollArea::vertical()
+                                    .max_height(400.0)
+                                    .show(ui, |ui| {
+                                        for s in suggestions {
+                                            if ui.button(&s).clicked() {
+                                                let sid = self.ensure_session();
+                                                self.app.sessions.set_fields(&sid, None, Some(s));
+                                                self.view_dirty = true;
+                                                ui.close();
+                                            }
+                                        }
+                                    });
+                            });
+                        }
+                    });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button(self.tr("⚙ settings")).clicked() {
+                            if self.settings.is_none() {
+                                let cfg = self.app.cfg.read().unwrap().clone();
+                                self.settings = Some(SettingsBuf {
+                                    sel_provider: cfg.provider.clone(),
+                                    cfg,
+                                    sel_mcp: None,
+                                    new_provider: String::new(),
+                                    new_mcp: String::new(),
+                                    tab: 0,
+                                });
+                            }
+                        }
+                        if ui.button(self.tr("mcp")).clicked() {
+                            self.show_mcp = !self.show_mcp;
+                        }
+                    });
+                });
+
             ui.horizontal(|ui| {
                 ui.heading("amty");
                 if ui.button(self.tr("＋ new")).clicked() {
-                    self.current = self.app.sessions.create(None, None);
+                    let (p, m) = self.session_provider();
+                    self.current = self.app.sessions.create(Some(p), Some(m));
                     self.view_dirty = true;
+                    self.remember_last_session();
                 }
             });
             ui.separator();
-            egui::ScrollArea::vertical().id_salt("sessions").show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("sessions")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
                 let metas = self.app.sessions.list();
                 let mut rename: Option<(String, String)> = None;
                 let mut delete: Option<String> = None;
@@ -618,6 +854,7 @@ impl eframe::App for GuiApp {
                     if resp.clicked() {
                         self.current = meta.id.clone();
                         self.view_dirty = true;
+                        self.remember_last_session();
                     }
                 }
                 if let Some((id, title)) = rename {
@@ -633,86 +870,6 @@ impl eframe::App for GuiApp {
                         self.current = String::new();
                     }
                     self.view_dirty = true;
-                }
-            });
-            ui.separator();
-            // provider / model quick switch (per-session override)
-            let (prov, model) = self.session_provider();
-            let names: Vec<String> = self.app.cfg.read().unwrap().providers.keys().cloned().collect();
-            let mut sel = prov.clone();
-            egui::ComboBox::from_label(self.tr("provider"))
-                .selected_text(&sel)
-                .show_ui(ui, |ui| {
-                    for n in &names {
-                        ui.selectable_value(&mut sel, n.clone(), n);
-                    }
-                });
-            if sel != prov {
-                let sid = self.ensure_session();
-                self.app.sessions.set_fields(&sid, Some(sel), None);
-                self.view_dirty = true;
-            }
-            ui.horizontal(|ui| {
-                ui.label(self.tr("model"));
-                let mut m = model.clone();
-                if ui.add(egui::TextEdit::singleline(&mut m).desired_width(150.0)).lost_focus() && m != model {
-                    let sid = self.ensure_session();
-                    self.app.sessions.set_fields(&sid, None, Some(m));
-                    self.view_dirty = true;
-                }
-                let kind = self.app.cfg.read().unwrap().providers.get(&prov).map(|p| p.kind);
-                let (suggestions, err) = match kind {
-                    Some(crate::config::ProviderKind::CommandCode) => {
-                        let conf = self.app.cfg.read().unwrap().providers.get(&prov).cloned().unwrap_or_default();
-                        crate::provider::cmdc_models(&conf)
-                    }
-                    _ => (kind.map(crate::provider::model_suggestions).unwrap_or_default(), None),
-                };
-                if !suggestions.is_empty() {
-                    let label = match err {
-                        None => format!("▾ ({})", suggestions.len()),
-                        Some(_) => format!("▾ ({}) ⚠", suggestions.len()),
-                    };
-                    ui.menu_button(label, |ui| {
-                        if let Some(e) = &err {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(255, 200, 80),
-                                format!("{}: {}", self.tr("cmdc --list-models unavailable — showing fallback list"), e),
-                            );
-                            ui.separator();
-                        }
-                        egui::ScrollArea::vertical()
-                            .max_height(400.0)
-                            .show(ui, |ui| {
-                                for s in suggestions {
-                                    if ui.button(&s).clicked() {
-                                        let sid = self.ensure_session();
-                                        self.app.sessions.set_fields(&sid, None, Some(s));
-                                        self.view_dirty = true;
-                                        ui.close();
-                                    }
-                                }
-                            });
-                    });
-                }
-            });
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button(self.tr("⚙ settings")).clicked() {
-                    if self.settings.is_none() {
-                        let cfg = self.app.cfg.read().unwrap().clone();
-                        self.settings = Some(SettingsBuf {
-                            sel_provider: cfg.provider.clone(),
-                            cfg,
-                            sel_mcp: None,
-                            new_provider: String::new(),
-                            new_mcp: String::new(),
-                            tab: 0,
-                        });
-                    }
-                }
-                if ui.button(self.tr("mcp")).clicked() {
-                    self.show_mcp = !self.show_mcp;
                 }
             });
         });
@@ -749,6 +906,26 @@ impl eframe::App for GuiApp {
             for (id, allow) in resolved {
                 self.app.approvals.resolve(&id, allow);
                 self.pending.retain(|p| p.id != id);
+            }
+            // thumbnails of images queued for the next message, each removable
+            if !self.pending_images.is_empty() {
+                let mut remove: Option<usize> = None;
+                ui.horizontal_wrapped(|ui| {
+                    for (i, img) in self.pending_images.iter_mut().enumerate() {
+                        ui.vertical(|ui| {
+                            let handle = img.texture(ui.ctx());
+                            let (w, h) = (handle.size()[0] as f32, handle.size()[1] as f32);
+                            let scale = (96.0 / w.max(1.0)).min(96.0 / h.max(1.0)).min(1.0);
+                            ui.add(egui::Image::new((handle.id(), egui::vec2(w * scale, h * scale))).corner_radius(3.0));
+                            if ui.small_button("✕").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    }
+                });
+                if let Some(i) = remove {
+                    self.pending_images.remove(i);
+                }
             }
             ui.add_space(4.0);
             let mut bypass = self.app.cfg.read().unwrap().approval == ApprovalMode::Auto;
@@ -854,6 +1031,20 @@ impl eframe::App for GuiApp {
                 } else if *self.running.get(&self.current).unwrap_or(&false) {
                     ui.weak(format!("⏳ {}", self.tr("working…")));
                 }
+                // running token usage: the number that explains the bill, since
+                // a long turn re-reads its (cached) prefix on every step
+                if let Some(u) = self.live_usage.get(&self.current).filter(|u| !u.is_zero()) {
+                    let total = u.input + u.output + u.cache_write;
+                    let pct = if total > 0 { 100.0 * u.cache_read as f64 / total as f64 } else { 0.0 };
+                    ui.weak(format!(
+                        "↑{} ↓{} ⚡{:.0}%",
+                        fmt_tokens(u.input), fmt_tokens(u.output), pct
+                    ))
+                    .on_hover_text(format!(
+                        "in {} ({} uncached)\nout {}\ncache read {}\ncache write {}\nreasoning {}",
+                        u.input, u.uncached_input(), u.output, u.cache_read, u.cache_write, u.reasoning
+                    ));
+                }
             });
             if let Some(err) = self.last_error.get(&self.current) {
                 ui.colored_label(
@@ -867,6 +1058,9 @@ impl eframe::App for GuiApp {
                 // cells, tool/status rows) — otherwise they clip at the
                 // frame's right edge.
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                // egui's default scroll bar floats and allocates no width, so it
+                // is drawn *over* the rightmost glyphs; reserve space instead.
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::thin();
                 let lang = self.app.cfg.read().unwrap().lang.clone();
                 let mut action = None;
                 let running_now = *self.running.get(&self.current).unwrap_or(&false);
@@ -878,10 +1072,19 @@ impl eframe::App for GuiApp {
                             let n = tool_run_len(&s.messages, i);
                             // only the trailing run is live while the agent works
                             let live = running_now && i + n == s.messages.len();
-                            render_tool_run(ui, &s.messages, i, n, &lang, live);
+                            egui::Frame::new()
+                                .inner_margin(egui::Margin { left: 0, right: 12, top: 0, bottom: 0 })
+                                .show(ui, |ui| render_tool_run(ui, &s.messages, i, n, &lang, live));
                             i += n;
                         } else {
-                            if let Some(a) = render_message(ui, &mut self.mark, &mut row_rects, &s.messages[i], &lang, i, running_now) {
+                            // keep glyphs clear of the right edge / scroll bar
+                            let a = egui::Frame::new()
+                                .inner_margin(egui::Margin { left: 0, right: 12, top: 0, bottom: 0 })
+                                .show(ui, |ui| {
+                                    render_message(ui, &mut self.mark, &mut self.image_tex, &mut row_rects, &s.messages[i], &lang, i, running_now)
+                                })
+                                .inner;
+                            if let Some(a) = a {
                                 action = Some(a);
                             }
                             i += 1;
@@ -894,7 +1097,15 @@ impl eframe::App for GuiApp {
                 if let Some(t) = self.live_text.get(&self.current) {
                     if !t.is_empty() {
                         ui.colored_label(ui.visuals().weak_text_color(), self.tr("assistant"));
-                        egui_commonmark::CommonMarkViewer::new().show(ui, &mut self.mark, &linkify(t));
+                        egui::Frame::new()
+                            .inner_margin(egui::Margin { left: 0, right: 12, top: 0, bottom: 0 })
+                            .show(ui, |ui| {
+                                let ix = table_col_width(t, ui.available_width());
+                                ui.scope(|ui| {
+                                    ui.spacing_mut().interact_size.x = ix;
+                                    egui_commonmark::CommonMarkViewer::new().show(ui, &mut self.mark, &linkify(t));
+                                });
+                            });
                     }
                 }
                 match action {
@@ -920,6 +1131,7 @@ impl eframe::App for GuiApp {
                         if let Some(id) = self.app.sessions.fork(&self.current, i + 1) {
                             self.current = id;
                             self.view_dirty = true;
+                            self.remember_last_session();
                             let m = self.tr("forked");
                             self.toast(m);
                         }
@@ -1262,6 +1474,19 @@ fn tool_use_count(msgs: &[crate::types::ChatMessage], start: usize) -> usize {
 }
 
 /// `mcp__<srv>__<tool>` -> `<tool>`, other names pass through.
+/// Compact token counts for the header: 1234 → 1.2k, 1234567 → 1.2M.
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 10_000 {
+        format!("{:.0}k", n as f64 / 1_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 fn short_tool(name: &str) -> &str {
     if let Some(rest) = name.strip_prefix("mcp__") {
         if let Some((_, tool)) = rest.split_once("__") {
@@ -1276,6 +1501,7 @@ fn render_tool_msg(ui: &mut egui::Ui, msg: &crate::types::ChatMessage, lang: &st
     for (bi, b) in msg.blocks.iter().enumerate() {
         match b {
             Block::Text { .. } => {}
+            Block::Image { .. } => {}
             Block::ToolUse { name, input, .. } => {
                 egui::CollapsingHeader::new(format!("🔧 {name}"))
                     .id_salt(format!("{key}_tu_{bi}"))
@@ -1333,7 +1559,8 @@ fn render_tool_run(ui: &mut egui::Ui, msgs: &[crate::types::ChatMessage], start:
     ui.add_space(8.0);
 }
 
-fn render_message(ui: &mut egui::Ui, mark: &mut egui_commonmark::CommonMarkCache, rows: &mut HashMap<usize, egui::Rect>, msg: &crate::types::ChatMessage, lang: &str, idx: usize, running: bool) -> Option<MsgAction> {
+#[allow(clippy::too_many_arguments)]
+fn render_message(ui: &mut egui::Ui, mark: &mut egui_commonmark::CommonMarkCache, tex: &mut HashMap<String, egui::TextureHandle>, rows: &mut HashMap<usize, egui::Rect>, msg: &crate::types::ChatMessage, lang: &str, idx: usize, running: bool) -> Option<MsgAction> {
     let t = |k: &'static str| crate::i18n::t(lang, k);
     let (label, color) = match msg.role {
         Role::User => (t("you"), egui::Color32::from_rgb(120, 180, 255)),
@@ -1360,6 +1587,7 @@ fn render_message(ui: &mut egui::Ui, mark: &mut egui_commonmark::CommonMarkCache
                     action = Some(MsgAction::Save(text));
                 }
             }
+                        // action handlers below in the same function
             if hovered {
                 ui.menu_button("⋯", |ui| {
                     ui.add_enabled_ui(!running, |ui| {
@@ -1387,7 +1615,15 @@ fn render_message(ui: &mut egui::Ui, mark: &mut egui_commonmark::CommonMarkCache
     for (bi, b) in msg.blocks.iter().enumerate() {
         match b {
             Block::Text { text } => {
-                egui_commonmark::CommonMarkViewer::new().show(ui, mark, &linkify(text));
+                // see `table_col_width`: size table columns from the row width
+                let ix = table_col_width(text, ui.available_width());
+                ui.scope(|ui| {
+                    ui.spacing_mut().interact_size.x = ix;
+                    egui_commonmark::CommonMarkViewer::new().show(ui, mark, &linkify(text));
+                });
+            }
+            Block::Image { media_type, data, width, height } => {
+                render_attached_image(ui, tex, media_type, data, *width, *height);
             }
             Block::ToolUse { name, input, .. } => {
                 egui::CollapsingHeader::new(format!("🔧 {name}"))
@@ -1426,6 +1662,217 @@ fn export_text(text: &str) -> std::io::Result<std::path::PathBuf> {
     let path = dir.join(format!("amty-{secs}.md"));
     std::fs::write(&path, text)?;
     Ok(path)
+}
+
+/// Column min-width for the markdown tables in `text`, given the width the
+/// message row has available.
+///
+/// egui_commonmark renders tables with `egui::Grid`, whose column width is
+/// driven by `spacing.interact_size.x` (40 pt by default) — so a 5-column
+/// table only ever gets ~250 pt inside a ~880 pt row and looks cramped. The
+/// same value is the *cell* width cap, so raising it globally would push wide
+/// tables (and code blocks, which size at the same width) past the right edge.
+/// Instead scale it per message from the table's own column count: wide tables
+/// fill the row, narrow ones stay readable, and `>= 0.92` keeps the last column
+/// inside the row.
+fn table_col_width(text: &str, avail: f32) -> f32 {
+    let mut max_cols = 0usize;
+    let mut prev: Option<&str> = None;
+    let mut in_fence = false;
+    for line in text.lines() {
+        let l = line.trim();
+        if l.starts_with("```") || l.starts_with("~~~") {
+            in_fence = !in_fence;
+            prev = None;
+            continue;
+        }
+        if !in_fence {
+            if let Some(header) = prev {
+                // a table is a `| … |` line followed by a `|---|:--|` ruler
+                let is_ruler = l.starts_with('|')
+                    && l.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+                    && l.contains('-');
+                if header.starts_with('|') && is_ruler {
+                    max_cols = max_cols.max(header.trim_matches('|').split('|').count());
+                }
+            }
+        }
+        prev = if in_fence { None } else { Some(l) };
+    }
+    if max_cols == 0 || !avail.is_finite() {
+        return 40.0; // egui's default min_col_width
+    }
+    (avail * 0.92 / max_cols as f32).clamp(40.0, 280.0)
+}
+
+/// An image waiting to be sent: base64 PNG bytes plus its natural size.
+struct PendingImage {
+    media_type: String,
+    /// base64 (no data: prefix) — this is what goes into Block::Image
+    data: String,
+    width: u32,
+    height: u32,
+    /// texture handle for the thumbnail, created lazily
+    tex: Option<egui::TextureHandle>,
+}
+
+/// Safety cap so a huge screenshot can't blow up memory / the request body.
+const MAX_IMAGE_EDGE: u32 = 4096;
+
+/// Encode an already-decoded image once: downscale if needed, then PNG → base64.
+fn encode_image(img: image::DynamicImage) -> Result<PendingImage, String> {
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h == 0 {
+        return Err("image has zero size".into());
+    }
+    let img = if w.max(h) > MAX_IMAGE_EDGE {
+        let scale = MAX_IMAGE_EDGE as f32 / w.max(h) as f32;
+        // Triangle is plenty for model input and much faster than Lanczos3 on
+        // a 4K screenshot, which matters because this runs on the UI thread.
+        img.resize(
+            ((w as f32 * scale) as u32).max(1),
+            ((h as f32 * scale) as u32).max(1),
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        img
+    };
+    let (nw, nh) = (img.width(), img.height());
+    let mut png = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut png, image::ImageFormat::Png)
+        .map_err(|e| format!("png encode failed: {e}"))?;
+    use base64::Engine as _;
+    Ok(PendingImage {
+        media_type: "image/png".into(),
+        data: base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
+        width: nw,
+        height: nh,
+        tex: None,
+    })
+}
+
+/// Decode arbitrary image bytes and (re-)encode them as a sendable PNG.
+/// Decoding here is also the validation step: pasting non-image clipboard data
+/// (e.g. an HTML fragment) or dropping a mislabelled file fails cleanly.
+fn decode_image(bytes: &[u8]) -> Result<PendingImage, String> {
+    let img = image::load_from_memory(bytes).map_err(|e| format!("not an image: {e}"))?;
+    encode_image(img)
+}
+
+impl PendingImage {
+    /// Build from encoded file bytes (drag & drop of an image file).
+    fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        decode_image(bytes)
+    }
+
+    /// Decoded RGBA for the thumbnail / pasted-image preview.
+    fn rgba(&self) -> Option<(u32, u32, Vec<u8>)> {
+        use base64::Engine as _;
+        let png = base64::engine::general_purpose::STANDARD.decode(&self.data).ok()?;
+        let img = image::load_from_memory(&png).ok()?.to_rgba8();
+        Some((img.width(), img.height(), img.into_raw()))
+    }
+
+    fn texture(&mut self, ctx: &egui::Context) -> &egui::TextureHandle {
+        if self.tex.is_none() {
+            if let Some((w, h, rgba)) = self.rgba() {
+                let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+                self.tex = Some(ctx.load_texture(
+                    format!("paste-{}x{}-{}", w, h, self.data.len()),
+                    ci,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
+        self.tex.as_ref().expect("image failed to decode")
+    }
+}
+
+/// Cache key for a decoded session image.
+fn image_key(media_type: &str, data: &str, w: u32, h: u32) -> String {
+    format!("{media_type}:{w}x{h}:{}", data.len())
+}
+
+/// Render an image block inside a chat message as a clickable thumbnail.
+fn render_attached_image(
+    ui: &mut egui::Ui,
+    tex: &mut HashMap<String, egui::TextureHandle>,
+    media_type: &str,
+    data: &str,
+    width: u32,
+    height: u32,
+) {
+    let key = image_key(media_type, data, width, height);
+    if !tex.contains_key(&key) {
+        let Some((w, h, rgba)) = rgba_from_b64(data) else {
+            ui.weak(format!("[image {width}x{height} — could not decode]"));
+            return;
+        };
+        let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+        tex.insert(key.clone(), ui.ctx().load_texture(&key, ci, egui::TextureOptions::LINEAR));
+    }
+    let handle = tex.get(&key).expect("just inserted");
+    let (w, h) = (handle.size()[0] as f32, handle.size()[1] as f32);
+    let avail = ui.available_width().max(64.0);
+    let scale = (avail / w).min(1.0).min(220.0 / h.max(1.0));
+    let size = egui::vec2((w * scale).max(32.0), (h * scale).max(32.0));
+    let resp = ui.add(
+        egui::Image::new((handle.id(), size))
+            .corner_radius(4.0)
+            .sense(egui::Sense::click()),
+    );
+    // clicking opens the full-size viewer
+    if resp.clicked() {
+        ui.ctx().memory_mut(|m| m.data.insert_temp(egui::Id::new("amty_viewer"), key.clone()));
+    }
+    resp.on_hover_text(format!("{w:.0} x {h:.0} (click to enlarge)"));
+}
+
+/// Decode base64 PNG bytes to RGBA.
+fn rgba_from_b64(data: &str) -> Option<(u32, u32, Vec<u8>)> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    Some((img.width(), img.height(), img.into_raw()))
+}
+
+/// Extensions we treat as images when a file is dropped on the window.
+fn is_image_path(p: &std::path::Path) -> bool {
+    matches!(
+        p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        Some("png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp")
+    )
+}
+
+/// Build the blocks for an outgoing user message. Images come first so the
+/// model sees them before the question, matching the common convention.
+fn message_blocks(text: &str, images: Vec<PendingImage>) -> Vec<crate::types::Block> {
+    let mut blocks: Vec<crate::types::Block> = images
+        .into_iter()
+        .map(|i| crate::types::Block::Image {
+            media_type: i.media_type,
+            data: i.data,
+            width: i.width,
+            height: i.height,
+        })
+        .collect();
+    if !text.trim().is_empty() {
+        blocks.push(crate::types::Block::Text { text: text.to_string() });
+    } else if blocks.is_empty() {
+        // tool/API callers may still pass empty text; keep the message valid
+        blocks.push(crate::types::Block::Text { text: String::new() });
+    }
+    blocks
+}
+
+/// Grab an image from the OS clipboard, if any.
+fn clipboard_image() -> Option<Result<PendingImage, String>> {
+    let mut cb = arboard::Clipboard::new().ok()?;
+    let img = cb.get_image().ok()?;
+    // the raw clipboard RGBA is already an image — encode it directly instead
+    // of PNG-encoding and re-decoding it again
+    let rgba = image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned())?;
+    Some(encode_image(image::DynamicImage::ImageRgba8(rgba)))
 }
 
 /// Wrap bare http(s) URLs in `<…>` autolinks so the markdown viewer renders
@@ -1784,6 +2231,96 @@ mod tests {
     use super::*;
 
     #[test]
+    fn image_blocks_roundtrip_and_encode() {
+        // build a real PNG in memory, then run it through the same path a
+        // clipboard paste takes (decode -> maybe resize -> re-encode -> base64)
+        let mut src = image::RgbaImage::new(64, 32);
+        for (x, y, p) in src.enumerate_pixels_mut() {
+            *p = image::Rgba([(x % 256) as u8, (y % 256) as u8, 128, 255]);
+        }
+        let mut png = std::io::Cursor::new(Vec::new());
+        src.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let png = png.into_inner();
+
+        let img = PendingImage::from_bytes(&png).expect("clipboard PNG should decode");
+        assert_eq!((img.width, img.height), (64, 32));
+        assert_eq!(img.media_type, "image/png");
+
+        // the stored bytes must be valid image data again (thumbnail + resend)
+        let (w, h, rgba) = img.rgba().expect("stored base64 must decode");
+        assert_eq!((w, h), (64, 32));
+        assert_eq!(rgba.len(), 64 * 32 * 4);
+
+        // and it must survive being written to the session log and read back
+        let msg = crate::types::ChatMessage::user_blocks(message_blocks("look at this", vec![img]));
+        let line = serde_json::to_string(&msg).unwrap();
+        let back: crate::types::ChatMessage = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.blocks.len(), 2);
+        match &back.blocks[0] {
+            crate::types::Block::Image { media_type, data, width, height } => {
+                assert_eq!(media_type, "image/png");
+                assert_eq!((*width, *height), (64, 32));
+                assert!(rgba_from_b64(data).is_some(), "reloaded image must decode");
+            }
+            other => panic!("expected Image block first, got {other:?}"),
+        }
+        assert_eq!(back.text_content(), "[image]look at this");
+    }
+
+    #[test]
+    fn non_image_bytes_are_rejected() {
+        // pasting e.g. an HTML fragment must fail, not produce a broken block
+        assert!(PendingImage::from_bytes(b"<html><body>hi</body></html>").is_err());
+        assert!(PendingImage::from_bytes(b"").is_err());
+    }
+
+    #[test]
+    fn oversized_images_are_downscaled() {
+        // an image above the cap is resized so it can't blow up requests
+        let big = image::RgbaImage::new(MAX_IMAGE_EDGE + 500, 100);
+        let mut png = std::io::Cursor::new(Vec::new());
+        big.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let img = PendingImage::from_bytes(&png.into_inner()).unwrap();
+        // `image::resize` keeps the aspect ratio with integer rounding, so the
+        // long edge lands at or just below the cap — never above it.
+        assert!(img.width <= MAX_IMAGE_EDGE, "width {} exceeded cap", img.width);
+        assert!(img.width > MAX_IMAGE_EDGE / 2, "unexpectedly shrunk to {}", img.width);
+        assert!(img.height >= 1);
+        assert!(img.height < 100, "aspect ratio not preserved: height {}", img.height);
+    }
+
+    #[test]
+    fn message_blocks_text_only_and_image_only() {
+        // text only -> single Text block (unchanged behaviour)
+        let b = message_blocks("hello", vec![]);
+        assert_eq!(b.len(), 1);
+        assert!(matches!(b[0], crate::types::Block::Text { .. }));
+
+        // image only -> no empty Text block appended
+        let img = PendingImage { media_type: "image/png".into(), data: "AAAA".into(), width: 1, height: 1, tex: None };
+        let b = message_blocks("   ", vec![img]);
+        assert_eq!(b.len(), 1);
+        assert!(matches!(b[0], crate::types::Block::Image { .. }));
+
+        // both -> image first, then the text
+        let img = PendingImage { media_type: "image/png".into(), data: "AAAA".into(), width: 1, height: 1, tex: None };
+        let b = message_blocks("what is this?", vec![img]);
+        assert_eq!(b.len(), 2);
+        assert!(matches!(b[0], crate::types::Block::Image { .. }));
+        assert!(matches!(b[1], crate::types::Block::Text { .. }));
+    }
+
+    #[test]
+    fn image_file_extensions_recognised() {
+        for p in ["a.png", "b.JPG", "c.jpeg", "d.webp", "e.gif", "f.bmp"] {
+            assert!(is_image_path(std::path::Path::new(p)), "{p} should count as an image");
+        }
+        for p in ["a.txt", "b.rs", "c.md", "noext"] {
+            assert!(!is_image_path(std::path::Path::new(p)), "{p} should not count as an image");
+        }
+    }
+
+    #[test]
     fn linkify_wraps_bare_urls() {
         assert_eq!(linkify("see https://example.com/x now"), "see <https://example.com/x> now");
         // url at end of line — newline must not leak into the autolink
@@ -1799,6 +2336,48 @@ mod tests {
         assert_eq!(linkify("<https://a.b>"), "<https://a.b>");
         assert_eq!(linkify("`https://a.b`"), "`https://a.b`");
         assert_eq!(linkify("```\nhttps://a.b\n```"), "```\nhttps://a.b\n```");
+    }
+
+    #[test]
+    fn table_col_width_scales_with_column_count() {
+        let avail = 867.0;
+        // no table -> egui's default, so prose layout is unchanged
+        assert_eq!(table_col_width("just prose\n", avail), 40.0);
+        // fenced code is not a table even when it contains pipes/rulers
+        assert_eq!(table_col_width("```\n| a | b |\n|---|---|\n```\n", avail), 40.0);
+        // a pipe line without a ruler is not a table
+        assert_eq!(table_col_width("| not a table |\n| still not |\n", avail), 40.0);
+        // wider tables get narrower columns, but all stay above the default
+        let w3 = table_col_width("| a | b | c |\n|---|---|---|\n| 1 | 2 | 3 |\n", avail);
+        let w8 = table_col_width(
+            "| # | Tool | What | Params | Returns | Notes | Risk | Seen |\n\
+             |---|---|---|---|---|---|---|---|\n| 1 | x | y | z | w | v | u | t |\n",
+            avail,
+        );
+        assert!(w3 > 40.0 && w8 > 40.0);
+        assert!(w3 > w8, "3 columns should get wider columns than 8 ({w3} vs {w8})");
+        assert!(w8 >= 1.0);
+        // a table must not overflow the row: n * ix <= avail
+        for cols in [1usize, 3, 5, 8, 12, 20] {
+            let mut md = String::from("|");
+            for i in 0..cols {
+                md.push_str(&format!(" c{i} |"));
+            }
+            md.push_str("\n|");
+            for _ in 0..cols {
+                md.push_str("---|");
+            }
+            md.push('\n');
+            let ix = table_col_width(&md, avail);
+            let total = ix * cols as f32;
+            assert!(
+                total <= avail + 1.0,
+                "{cols} cols: {total} > {avail} (ix={ix})"
+            );
+        }
+        // degenerate inputs fall back to the default
+        assert_eq!(table_col_width("| a | b |\n|---|---|\n", 0.0), 40.0);
+        assert_eq!(table_col_width("| a | b |\n|---|---|\n", f32::NAN), 40.0);
     }
 
     #[test]

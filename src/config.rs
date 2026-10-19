@@ -201,6 +201,9 @@ pub struct Config {
     pub providers: BTreeMap<String, ProviderConf>,
     /// Same shape as claude_desktop_config.json `mcpServers`.
     pub mcp_servers: BTreeMap<String, McpServerConf>,
+    /// Session id selected when the app last closed; restored on startup so the
+    /// chat reopens where the user left off (with that session's provider/model).
+    pub last_session: Option<String>,
 }
 
 impl Default for Config {
@@ -251,6 +254,7 @@ impl Default for Config {
             search: SearchConf::default(),
             providers,
             mcp_servers: BTreeMap::new(),
+            last_session: None,
         }
     }
 }
@@ -421,6 +425,7 @@ impl Config {
 
     /// `config_set` tool / `POST /v1/config` backend.
     /// Keys: provider | model | approval | system_prompt | max_tokens |
+    ///       lang | last_session |
     ///       allow_commands | allow_paths | +allow_commands | +allow_paths |
     ///       provider.<name>.{model,api_key_env,api_key,base_url,context_window} |
     ///       mcp.<name>.enabled |
@@ -463,6 +468,10 @@ impl Config {
                 }
                 self.lang = value.into();
                 Ok(format!("lang = {value}"))
+            }
+            "last_session" => {
+                self.last_session = if value.is_empty() { None } else { Some(value.into()) };
+                Ok(format!("last_session = {value}"))
             }
             "allow_commands" | "allow_paths" | "+allow_commands" | "+allow_paths" => {
                 let (append, field) = if key.starts_with('+') {
@@ -590,6 +599,7 @@ impl Config {
             "approval" => Ok(format!("{:?}", self.approval).to_lowercase()),
             "system_prompt" => Ok(self.system_prompt.clone()),
             "lang" => Ok(self.lang.clone()),
+            "last_session" => Ok(self.last_session.clone().unwrap_or_default()),
             "allow_commands" => Ok(self.allow_commands.join(", ")),
             "allow_paths" => Ok(self.allow_paths.join(", ")),
             "providers" => Ok(self.providers.keys().cloned().collect::<Vec<_>>().join(", ")),
@@ -692,6 +702,23 @@ mod tests {
         cfg.apply_set("allow_commands", "ls, git status").unwrap();
         cfg.apply_set("+allow_commands", "cargo test").unwrap();
         assert!(cfg.allow_commands.contains(&"cargo test".to_string()));
+    }
+
+    #[test]
+    fn last_session_roundtrips_and_clears() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.get("last_session").unwrap(), "");
+        cfg.apply_set("last_session", "abc123").unwrap();
+        assert_eq!(cfg.get("last_session").unwrap(), "abc123");
+        assert_eq!(cfg.last_session.as_deref(), Some("abc123"));
+        // an empty value clears it, so "no session remembered" is representable
+        cfg.apply_set("last_session", "").unwrap();
+        assert_eq!(cfg.last_session, None);
+        // and it survives a toml round-trip (it is written on every switch)
+        cfg.apply_set("last_session", "zz").unwrap();
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.last_session.as_deref(), Some("zz"));
     }
 
     #[test]

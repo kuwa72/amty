@@ -24,6 +24,16 @@ pub enum Block {
         #[serde(default)]
         is_error: bool,
     },
+    /// An image attached to a user message (clipboard paste / file drop).
+    /// Bytes are stored as base64 PNG so the session log stays text-only.
+    Image {
+        media_type: String,
+        data: String,
+        #[serde(default)]
+        width: u32,
+        #[serde(default)]
+        height: u32,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,6 +46,10 @@ impl ChatMessage {
     pub fn user(text: impl Into<String>) -> Self {
         Self { role: Role::User, blocks: vec![Block::Text { text: text.into() }] }
     }
+    /// A user message built from explicit blocks (text and/or images).
+    pub fn user_blocks(blocks: Vec<Block>) -> Self {
+        Self { role: Role::User, blocks }
+    }
     pub fn tool_results(results: Vec<Block>) -> Self {
         Self { role: Role::User, blocks: results }
     }
@@ -44,6 +58,7 @@ impl ChatMessage {
             .iter()
             .filter_map(|b| match b {
                 Block::Text { text } => Some(text.as_str()),
+                Block::Image { .. } => Some("[image]"),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -142,11 +157,51 @@ fn mk_missing_result(id: String) -> Block {
     }
 }
 
+/// Token accounting for one provider call, as reported by the provider.
+/// Cache fields are what make Command Code (and Anthropic) usage legible: a
+/// long agent turn re-reads its whole prefix every step, so `cache_read`
+/// usually dwarfs `input` and is the only number that explains the bill.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Usage {
+    #[serde(default)]
+    pub input: u64,
+    #[serde(default)]
+    pub output: u64,
+    #[serde(default)]
+    pub cache_read: u64,
+    #[serde(default)]
+    pub cache_write: u64,
+    #[serde(default)]
+    pub reasoning: u64,
+}
+
+impl Usage {
+    /// Input tokens actually paid at the input rate (uncached only).
+    pub fn uncached_input(&self) -> u64 {
+        self.input.saturating_sub(self.cache_read)
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0
+    }
+
+    /// Sum another call's usage into this running total.
+    pub fn add(&mut self, o: &Usage) {
+        self.input += o.input;
+        self.output += o.output;
+        self.cache_read += o.cache_read;
+        self.cache_write += o.cache_write;
+        self.reasoning += o.reasoning;
+    }
+}
+
 /// Events flowing out of a streaming provider call.
 #[derive(Clone, Debug)]
 pub enum StreamEvent {
     Text(String),
     ToolUse { id: String, name: String, input: serde_json::Value },
+    /// Per-call token usage, emitted by providers that report it.
+    Usage(Usage),
     Done,
     Err(String),
 }
@@ -168,6 +223,8 @@ pub enum EvKind {
     ApprovalNeeded { approval_id: String, tool: String, detail: String },
     ApprovalResolved { approval_id: String, allowed: bool },
     Running { running: bool },
+    /// Token usage for the whole turn so far (emitted per provider call).
+    Usage { usage: Usage, turns: u32, cumulative: Usage },
     Done,
     Error { message: String },
     /// Auto-compaction replaced `dropped` messages with a summary.

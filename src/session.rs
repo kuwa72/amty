@@ -1,4 +1,4 @@
-use crate::types::{ChatMessage, Role};
+use crate::types::{ChatMessage, Role, Usage};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -18,6 +18,10 @@ pub struct Session {
     pub seq: u64,
     #[serde(default)]
     pub messages: Vec<ChatMessage>,
+    /// Cumulative provider-reported token usage for the whole session,
+    /// accumulated across turns and persisted in the meta line.
+    #[serde(default)]
+    pub usage: Usage,
 }
 
 impl Session {
@@ -32,6 +36,7 @@ impl Session {
             updated: now,
             seq,
             messages: vec![],
+            usage: crate::types::Usage::default(),
         }
     }
 }
@@ -44,6 +49,8 @@ pub struct SessionMeta {
     pub model: Option<String>,
     pub updated: u64,
     pub n_messages: usize,
+    /// Session-lifetime token totals (persisted in the meta line).
+    pub usage: crate::types::Usage,
 }
 
 pub fn now_secs() -> u64 {
@@ -155,6 +162,7 @@ impl SessionStore {
                 model: s.model.clone(),
                 updated: s.updated,
                 n_messages: s.messages.len(),
+                usage: s.usage,
             })
             .collect();
         v.sort_by(|a, b| b.updated.cmp(&a.updated));
@@ -195,7 +203,8 @@ impl SessionStore {
         }
     }
 
-    pub fn set_fields(&self, id: &str, provider: Option<String>, model: Option<String>) {        let mut map = self.map.write().unwrap();
+    pub fn set_fields(&self, id: &str, provider: Option<String>, model: Option<String>) {
+        let mut map = self.map.write().unwrap();
         if let Some(s) = map.get_mut(id) {
             s.provider = provider.or(s.provider.take());
             s.model = model.or(s.model.take());
@@ -222,6 +231,20 @@ impl SessionStore {
         } else {
             false
         }
+    }
+
+    /// Fold one provider call's usage into the session total and persist it.
+    pub fn add_usage(&self, id: &str, u: &crate::types::Usage) -> bool {
+        if u.is_zero() {
+            return false;
+        }
+        let mut map = self.map.write().unwrap();
+        let Some(s) = map.get_mut(id) else { return false };
+        s.usage.add(u);
+        let s = s.clone();
+        drop(map);
+        self.persist(&s);
+        true
     }
 
     /// Rewind: keep only the first `keep` messages of the session.
@@ -276,6 +299,9 @@ struct MetaOnly {
     created: u64,
     updated: u64,
     seq: u64,
+    /// Session-lifetime token totals (see `Session::usage`).
+    #[serde(default)]
+    usage: crate::types::Usage,
 }
 
 impl From<&Session> for MetaOnly {
@@ -288,6 +314,7 @@ impl From<&Session> for MetaOnly {
             created: s.created,
             updated: s.updated,
             seq: s.seq,
+            usage: s.usage,
         }
     }
 }
@@ -321,6 +348,59 @@ mod tests {
         assert_eq!(s.messages.len(), 2);
         assert_eq!(s.model.as_deref(), Some("m1"));
         assert!(s.title.contains("hello"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn usage_accumulates_and_survives_reload() {
+        let (store, dir) = temp_store();
+        let id = store.create(Some("commandcode".into()), Some("m".into()));
+        let a = crate::types::Usage {
+            input: 3000, output: 20, cache_read: 2900, cache_write: 10, reasoning: 5,
+        };
+        let b = crate::types::Usage { input: 1000, output: 40, cache_read: 900, ..Default::default() };
+        assert!(store.add_usage(&id, &a));
+        assert!(store.add_usage(&id, &b));
+        // a zero-usage call must not rewrite the session
+        assert!(!store.add_usage(&id, &crate::types::Usage::default()));
+
+        let total = store.get(&id).unwrap().usage;
+        assert_eq!(total.input, 4000);
+        assert_eq!(total.output, 60);
+        assert_eq!(total.cache_read, 3800);
+        assert_eq!(total.uncached_input(), 200);
+        // and the listing exposes it
+        let meta = store.list().into_iter().find(|m| m.id == id).unwrap();
+        assert_eq!(meta.usage, total);
+
+        // totals must come back from disk (they live in the meta line)
+        drop(store);
+        let store2 = SessionStore::load(dir.clone());
+        assert_eq!(store2.get(&id).unwrap().usage, total);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Old session files have no `usage` in the meta line and must still load.
+    #[test]
+    fn sessions_without_usage_field_still_load() {
+        let dir = std::env::temp_dir().join(format!("amty-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("legacy1.jsonl"),
+            serde_json::json!({"meta": {
+                "id": "legacy1", "title": "old", "provider": null, "model": null,
+                "created": 1, "updated": 2, "seq": 1,
+            }})
+            .to_string()
+                + "\n"
+                + &serde_json::to_string(&ChatMessage::user("hi")).unwrap()
+                + "\n",
+        )
+        .unwrap();
+        let store = SessionStore::load(dir.clone());
+        let s = store.get("legacy1").expect("legacy session loads");
+        assert_eq!(s.messages.len(), 1);
+        assert!(s.usage.is_zero());
         std::fs::remove_dir_all(dir).ok();
     }
 

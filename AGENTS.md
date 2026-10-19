@@ -18,6 +18,10 @@ App core (src/app.rs)           -- config, sessions, approvals, event broadcast
   |                               key from ~/.commandcode/auth.json)
   |- builtin tools (src/tools.rs) -- fs_read/fs_list/fs_write/fs_edit/shell/config_*/mcp
   |                               /web_search/web_fetch
+  |- token accounting (src/types.rs `Usage`) -- providers emit a per-call
+  |                               StreamEvent::Usage including cache read/write;
+  |                               folded into Session::usage (persisted) and
+  |                               shown in the GUI header + `amty usage`
   |- MCP client (src/mcp.rs)    -- stdio JSON-RPC + streamable HTTP transports,
   |                               tools exposed as mcp__<srv>__<tool>
   |- OAuth client (src/oauth.rs) -- auth-code + PKCE + localhost:8571 callback,
@@ -79,6 +83,11 @@ cargo build --release --target x86_64-pc-windows-gnu
 #   still print into the invoking console, but cmd.exe does not wait for
 #   GUI-subsystem exes (use PowerShell/WSL for scripting). `--console` or
 #   AMTY_CONSOLE=1 AllocConsole()s a debug console for GUI mode.
+# - link error `thread_pthread.o: undefined reference to 'nanosleep64'` means the
+#   cached aws-lc-sys C objects for that profile are stale (built against an
+#   older mingw header). Fix: delete
+#   target/x86_64-pc-windows-gnu/<profile>/build/aws-lc-sys-* and
+#   .../deps/libaws_lc_sys-*, then rebuild.
 ```
 
 ## Conventions
@@ -150,7 +159,18 @@ cargo build --release --target x86_64-pc-windows-gnu
   Command Code model list's `context_length` (floor 200K, its smallest
   model) > defaults (Anthropic 200K, OpenAI-compatible 128K). If the
   summary call fails, a plain "N messages omitted" marker is used instead.
-  No token accounting (real usage) yet. Provider streams retry transient
+  Token accounting is real now: providers emit `StreamEvent::Usage` per call
+  (Command Code `finish-step`/`finish` → `cc_usage`; OpenAI `include_usage` →
+  `openai_usage`; Anthropic `message_start`+`message_delta` → `anthropic_usage`,
+  split by phase so input isn't counted twice), `retry_stream` forwards it
+  *before* the terminal `Done` and only for the attempt that survives, the
+  agent loop folds it into `Session::usage` (persisted in the meta line, so
+  totals survive a restart), and it surfaces three ways: `EvKind::Usage` →
+  header badge, `GET /v1/status` → `usage`, and `amty usage [-s <id>]`.
+  `Usage::uncached_input()` is the number that matters: on a long agent turn
+  ~97% of input is cache reads (a real JobBench-style rollout: input 141730 /
+  output 44991 / cache_read 5476480), so the cache split is the only thing that
+  explains the bill. Provider streams retry transient
   failures (network resets, decode errors, 5xx) up to 3 attempts with
   exponential backoff via `provider::retry_stream` — replays are deduplicated
   so already-forwarded text/tool_use events aren't doubled; permanent
@@ -160,4 +180,14 @@ cargo build --release --target x86_64-pc-windows-gnu
   byte-stable, volatile additions go in `system_tail` (the skills index, which
   is re-scanned every turn). `Mcp::specs()` sorts tool names for the same
   reason: keep the request prefix deterministic.
+- Window/GPU resilience (src/gui.rs): `rescue_offscreen_window` polls on a 1 s
+  heartbeat (Windows only) and recenters via Win32 `MonitorFromRect` when the
+  window ends up fully off all monitors (eframe only clamps the restored
+  position at startup). `guard_gpu_loss` installs wgpu `set_device_lost_callback`
+  + `on_uncaptured_error` — a real device loss (`Unknown` reason; `Destroyed` is
+  normal teardown) respawns the exe and closes cleanly, and `run_native` is
+  wrapped in `catch_unwind` so panics escaping wgpu-hal get the same treatment.
+  Non-device-loss wgpu errors still panic. `respawn_self` is deduped by a static
+  AtomicBool; `main` only removes `runtime.json` when its pid still matches so a
+  respawned instance's file isn't deleted.
 - macOS packaging (.app bundle, signing) not set up; `cargo build` on macOS works.

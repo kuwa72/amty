@@ -71,13 +71,92 @@ pub async fn run(cmd: crate::Cmd) -> Result<()> {
             let v = get(&base, &tok, "/v1/sessions").await?;
             if let Some(arr) = v.as_array() {
                 for s in arr {
+                    let u = &s["usage"];
+                    let n = |k: &str| u[k].as_u64().unwrap_or(0);
+                    let toks = n("input") + n("output") + n("cache_read") + n("cache_write");
                     println!(
-                        "{}\t{}\t{} msgs\t{}",
+                        "{}\t{}\t{} msgs\t{}\t{} tok\t(in {} / out {} / cache {})",
                         s["id"].as_str().unwrap_or(""),
                         s["title"].as_str().unwrap_or(""),
                         s["n_messages"],
                         s["provider"].as_str().unwrap_or("default"),
+                        toks,
+                        n("input"),
+                        n("output"),
+                        n("cache_read"),
                     );
+                }
+            }
+        }
+        Usage { session } => {
+            let (base, tok) = runtime_info()?;
+            match session {
+                // per-session breakdown when one is named
+                Some(sid) => {
+                    let v = get(&base, &tok, "/v1/sessions").await?;
+                    let found = v.as_array().and_then(|a| {
+                        a.iter().find(|s| {
+                            s["id"].as_str().map(|i| i.starts_with(&sid)).unwrap_or(false)
+                        }).cloned()
+                    });
+                    match found {
+                        Some(s) => {
+                            let u = &s["usage"];
+                            let g = |k: &str| u[k].as_u64().unwrap_or(0);
+                            let (i, o, cr, cw, rs) =
+                                (g("input"), g("output"), g("cache_read"), g("cache_write"), g("reasoning"));
+                            println!("session {}  {}", s["id"].as_str().unwrap_or(""), s["title"].as_str().unwrap_or(""));
+                            println!("messages           {}", s["n_messages"]);
+                            println!("input              {i}");
+                            println!("  of which cached  {cr}");
+                            println!("  uncached         {}", i.saturating_sub(cr));
+                            println!("output             {o}");
+                            println!("reasoning          {rs}");
+                            println!("cache_write        {cw}");
+                            if i > 0 {
+                                println!("cache hit rate     {:.1}%", 100.0 * cr as f64 / i as f64);
+                            }
+                        }
+                        None => bail!("no session matching '{sid}'"),
+                    }
+                }
+                // otherwise every session, then the grand total
+                None => {
+                    let v = get(&base, &tok, "/v1/sessions").await?;
+                    let arr = v.as_array().cloned().unwrap_or_default();
+                    let mut ti = 0u64; let mut to = 0u64; let mut tcr = 0u64;
+                    let mut tcw = 0u64; let mut tr = 0u64;
+                    let mut n_with = 0usize;
+                    for s in &arr {
+                        let u = &s["usage"];
+                        let g = |k: &str| u[k].as_u64().unwrap_or(0);
+                        let (i, o, cr, cw, rs) =
+                            (g("input"), g("output"), g("cache_read"), g("cache_write"), g("reasoning"));
+                        if i + o + cr + cw == 0 {
+                            continue;
+                        }
+                        n_with += 1;
+                        ti += i; to += o; tcr += cr; tcw += cw; tr += rs;
+                        println!(
+                            "{}\t{}\tin {}\tout {}\tcache_read {}\treasoning {}",
+                            s["id"].as_str().unwrap_or(""),
+                            s["title"].as_str().unwrap_or(""),
+                            i, o, cr, rs,
+                        );
+                    }
+                    println!("\n{n_with} of {} session(s) have usage", arr.len());
+                    println!("total input        {}", ti);
+                    println!("  of which cached  {}", tcr);
+                    println!("  uncached         {}", ti.saturating_sub(tcr));
+                    println!("total output       {}", to);
+                    println!("total reasoning    {}", tr);
+                    println!("total cache_write  {}", tcw);
+                    println!("total tokens       {}", ti + to + tcw);
+                    if ti > 0 {
+                        // cache_read is a *subset* of input (both include the
+                        // cached prefix), so the rate is against input only.
+                        println!("cache hit rate     {:.1}%", 100.0 * tcr as f64 / ti as f64);
+                    }
                 }
             }
         }

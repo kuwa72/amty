@@ -56,6 +56,14 @@ where
         let mut run = std::pin::pin!(f(rtx));
         let mut res: Option<Result<()>> = None;
         let mut ev_err: Option<String> = None;
+        // usage is accumulated per attempt and forwarded only if the attempt
+        // succeeds: a retried attempt's tokens were still billed, but replaying
+        // them into the sum would double-count the request the caller sees.
+        let mut attempt_usage = crate::types::Usage::default();
+        // `Done` is held back until the attempt is known to have succeeded, so
+        // usage can be emitted *before* it: consumers stop at Done, so anything
+        // queued after it is lost.
+        let mut saw_done = false;
         cur.clear();
         loop {
             tokio::select! {
@@ -79,7 +87,12 @@ where
                             let _ = tx.send(StreamEvent::ToolUse { id, name, input });
                         }
                     }
-                    Some(StreamEvent::Done) => { let _ = tx.send(StreamEvent::Done); }
+                    Some(StreamEvent::Usage(u)) => {
+                        // Buffer; forwarded once below only when this attempt is
+                        // the one that survives (see `attempt_usage`).
+                        attempt_usage.add(&u);
+                    }
+                    Some(StreamEvent::Done) => { saw_done = true; }
                     Some(StreamEvent::Err(e)) => { ev_err = Some(e); }
                 }
             }
@@ -90,7 +103,16 @@ where
         };
         let err = ev_err.or_else(|| res.err().map(|e| e.to_string()));
         match err {
-            None => return,
+            None => {
+                // order matters: usage, then the terminal Done
+                if !attempt_usage.is_zero() {
+                    let _ = tx.send(StreamEvent::Usage(attempt_usage));
+                }
+                if saw_done {
+                    let _ = tx.send(StreamEvent::Done);
+                }
+                return;
+            }
             Some(e) if attempt == MAX_ATTEMPTS || !retryable(&e) => {
                 let _ = tx.send(StreamEvent::Err(e));
                 return;
@@ -108,7 +130,7 @@ struct Sse {
     stream: std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
     buf: Vec<u8>,
     ev: String,
-    data: String,
+    pub data: String,
     have: bool,
 }
 
@@ -195,6 +217,10 @@ fn anthropic_messages(messages: &[ChatMessage]) -> Vec<Value> {
                         json!({"type": "tool_result", "tool_use_id": tool_use_id,
                                "content": content, "is_error": is_error})
                     }
+                    Block::Image { media_type, data, .. } => json!({
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": media_type, "data": data},
+                    }),
                 })
                 .collect();
             json!({"role": role, "content": content})
@@ -255,6 +281,30 @@ fn anthropic_body(req: &ChatRequest) -> Value {
         "messages": messages,
         "tools": tools,
     })
+}
+
+/// Parse an Anthropic `usage` object. `phase` selects which half of the
+/// response we are looking at: 0 = `message_start` (input + cache only, output
+/// is not final yet), 1 = `message_delta` (output tokens). Splitting this way
+/// keeps input tokens from being counted twice.
+fn anthropic_usage(v: &Value, phase: u8) -> Option<crate::types::Usage> {
+    if !v.is_object() {
+        return None;
+    }
+    let num = |x: &Value| x.as_u64().unwrap_or(0);
+    let u = if phase == 0 {
+        crate::types::Usage {
+            input: num(&v["input_tokens"]) + num(&v["cache_read_input_tokens"])
+                + num(&v["cache_creation_input_tokens"]),
+            output: 0,
+            cache_read: num(&v["cache_read_input_tokens"]),
+            cache_write: num(&v["cache_creation_input_tokens"]),
+            reasoning: 0,
+        }
+    } else {
+        crate::types::Usage { output: num(&v["output_tokens"]), ..Default::default() }
+    };
+    (!u.is_zero()).then_some(u)
 }
 
 impl Anthropic {
@@ -324,6 +374,23 @@ impl Anthropic {
                         }
                     }
                 }
+                "message_start" => {
+                    // Input-side usage arrives on message_start; output is only
+                    // known at message_delta, so both are forwarded and the
+                    // receiver sums them.
+                    if let Ok(v) = serde_json::from_str::<Value>(&data) {
+                        if let Some(u) = anthropic_usage(&v["message"]["usage"], 0) {
+                            let _ = tx.send(StreamEvent::Usage(u));
+                        }
+                    }
+                }
+                "message_delta" => {
+                    if let Ok(v) = serde_json::from_str::<Value>(&data) {
+                        if let Some(u) = anthropic_usage(&v["usage"], 1) {
+                            let _ = tx.send(StreamEvent::Usage(u));
+                        }
+                    }
+                }
                 "message_stop" => {
                     for (_, (id, name, js)) in std::mem::take(&mut tools) {
                         let input = if js.is_empty() { json!({}) } else { serde_json::from_str(&js).unwrap_or(json!({})) };
@@ -371,6 +438,15 @@ fn openai_messages(req: &ChatRequest) -> Vec<Value> {
                                 out.push(json!({"role": "user", "content": std::mem::take(&mut text)}));
                             }
                             out.push(json!({"role": "tool", "tool_call_id": tool_use_id, "content": content}));
+                        }
+                        Block::Image { media_type, data, .. } => {
+                            if !text.is_empty() {
+                                out.push(json!({"role": "user", "content": std::mem::take(&mut text)}));
+                            }
+                            out.push(json!({"role": "user", "content": [{
+                                "type": "image_url",
+                                "image_url": {"url": format!("data:{media_type};base64,{data}")},
+                            }]}));
                         }
                         _ => {}
                     }
@@ -443,12 +519,20 @@ impl OpenAi {
         }
         let mut sse = Sse::new(resp);
         let mut tools: BTreeMap<usize, (String, String, String)> = BTreeMap::new();
+        let mut usage: Option<crate::types::Usage> = None;
+        let mut saw_usage = false;
         while let Some((_ev, data)) = sse.next().await? {
             let data = data.trim();
             if data == "[DONE]" {
                 break;
             }
             let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
+            // `include_usage` puts a usage-only frame at the end (no choices).
+            if let Some(u) = openai_usage(&v["usage"]) {
+                // keep the last (final) frame only
+                usage = Some(u);
+                saw_usage = true;
+            }
             let Some(choice) = v["choices"].get(0) else { continue };
             let delta = &choice["delta"];
             if let Some(t) = delta["content"].as_str() {
@@ -477,9 +561,31 @@ impl OpenAi {
             let id = if id.is_empty() { format!("call_{}", uuid::Uuid::new_v4()) } else { id };
             let _ = tx.send(StreamEvent::ToolUse { id, name, input });
         }
+        if saw_usage {
+            if let Some(u) = usage {
+                let _ = tx.send(StreamEvent::Usage(u));
+            }
+        }
         let _ = tx.send(StreamEvent::Done);
         Ok(())
     }
+}
+
+/// Parse an OpenAI-compatible `usage` object (`prompt_tokens` /
+/// `completion_tokens` / `prompt_tokens_details.cached_tokens`).
+fn openai_usage(v: &Value) -> Option<crate::types::Usage> {
+    if !v.is_object() {
+        return None;
+    }
+    let num = |x: &Value| x.as_u64().unwrap_or(0);
+    let u = crate::types::Usage {
+        input: num(&v["prompt_tokens"]),
+        output: num(&v["completion_tokens"]),
+        cache_read: num(&v["prompt_tokens_details"]["cached_tokens"]),
+        cache_write: 0,
+        reasoning: num(&v["completion_tokens_details"]["reasoning_tokens"]),
+    };
+    (!u.is_zero()).then_some(u)
 }
 
 // ---------------- Command Code ----------------
@@ -532,6 +638,9 @@ fn cc_messages(messages: &[ChatMessage]) -> Vec<Value> {
                                                 "toolName": name, "input": input}));
                         }
                         Block::ToolResult { .. } => {}
+                        // images are only meaningful on user turns; the agent
+                        // never emits them, but ignore rather than panic
+                        Block::Image { .. } => {}
                     }
                 }
                 out.push(json!({"role": "assistant", "content": content}));
@@ -542,6 +651,13 @@ fn cc_messages(messages: &[ChatMessage]) -> Vec<Value> {
                 for b in &m.blocks {
                     match b {
                         Block::Text { text } => user.push(json!({"type": "text", "text": text})),
+                        // The /alpha/generate schema wants the Anthropic-style
+                        // snake_case `media_type`; `mediaType` is rejected with
+                        // a 400 "expected one of image/jpeg|png|gif|webp".
+                        Block::Image { media_type, data, .. } => user.push(json!({
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": media_type, "data": data},
+                        })),
                         Block::ToolResult { tool_use_id, content, is_error } => results.push(json!({
                             "type": "tool-result",
                             "toolCallId": tool_use_id,
@@ -605,6 +721,35 @@ fn cmdc_exe() -> Option<String> {
     }
 }
 
+/// Parse a Command Code usage object into [`Usage`].
+///
+/// The server reports input split into cached and uncached halves
+/// (`inputTokenDetails.cacheReadTokens` / `.noCacheTokens`); `inputTokens` is
+/// their sum. Accepts the older flat `prompt_tokens`/`completion_tokens` shape
+/// too, and returns `None` when nothing usable is present.
+fn cc_usage(v: &Value) -> Option<crate::types::Usage> {
+    if !v.is_object() {
+        return None;
+    }
+    let num = |x: &Value| x.as_u64().unwrap_or(0);
+    let input = num(&v["inputTokens"]).max(num(&v["prompt_tokens"]));
+    let output = num(&v["outputTokens"]).max(num(&v["completion_tokens"]));
+    let details = &v["inputTokenDetails"];
+    let mut cache_read = num(&details["cacheReadTokens"]);
+    let mut cache_write = num(&details["cacheWriteTokens"]);
+    if cache_read == 0 {
+        // Anthropic-style naming, seen on some routed models
+        cache_read = num(&v["cacheRead"])
+            .max(num(&details["cachedTokens"]))
+            .max(num(&v["cache_read_input_tokens"]));
+        cache_write = cache_write.max(num(&v["cache_creation_input_tokens"]));
+    }
+    let reasoning = num(&v["outputTokenDetails"]["reasoningTokens"])
+        .max(num(&v["reasoningTokens"]));
+    let u = crate::types::Usage { input, output, cache_read, cache_write, reasoning };
+    (!u.is_zero()).then_some(u)
+}
+
 /// `cmdc <args>` → stdout, "" on any failure. When cmdc was resolved to a
 /// fallback path instead of PATH, prepend the nodejs dirs so the .cmd shim
 /// can still find `node`.
@@ -657,7 +802,8 @@ impl CommandCode {
             .ok_or_else(|| anyhow!("no Command Code api key — run `cmdc` once to sign in, or set providers.commandcode.api_key"))?;
         let system: Value = match system_full(req) {
             Some(s) => json!([{ "type": "text", "text": s }]),
-            None => Value::Null,
+            // the schema wants a string or an array, never null
+            None => json!([]),
         };
         // Server validates this `config` env block and rejects missing fields.
         let cwd = std::env::current_dir().unwrap_or_default();
@@ -720,6 +866,8 @@ impl CommandCode {
         let mut stream = Box::pin(resp.bytes_stream());
         let mut buf = Vec::<u8>::new();
         let mut finished = false;
+        // whether a per-step usage event was seen (see the `finish` arm)
+        let mut saw_step_usage = false;
         'outer: loop {
             while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = buf.drain(..=pos).collect();
@@ -745,7 +893,27 @@ impl CommandCode {
                             input,
                         });
                     }
+                    Some("finish-step") => {
+                        // The token accounting the server has always sent and amty
+                        // used to drop on the floor. Shape:
+                        //   {"usage":{"inputTokens":N,
+                        //             "inputTokenDetails":{"noCacheTokens":N,"cacheReadTokens":N},
+                        //             "outputTokens":N,
+                        //             "outputTokenDetails":{"textTokens":N,"reasoningTokens":N}}}
+                        if let Some(u) = cc_usage(&ev["usage"]) {
+                            saw_step_usage = true;
+                            let _ = tx.send(StreamEvent::Usage(u));
+                        }
+                    }
                     Some("finish") => {
+                        // Fallback only: `totalUsage` here duplicates the sum of
+                        // the per-step events, so prefer those to avoid counting
+                        // every token twice.
+                        if !saw_step_usage {
+                            if let Some(u) = cc_usage(&ev["totalUsage"]) {
+                                let _ = tx.send(StreamEvent::Usage(u));
+                            }
+                        }
                         finished = true;
                         break 'outer;
                     }
@@ -918,6 +1086,96 @@ const FALLBACK_CC_MODELS: &[&str] = &[
 mod tests {
     use super::*;
 
+    /// The Command Code usage shape: `inputTokens` is the sum of the cached and
+    /// uncached halves, so `input` must not be added to `cache_read` again.
+    #[test]
+    fn cc_usage_splits_cached_from_uncached_input() {
+        let v = json!({
+            "inputTokens": 4443,
+            "inputTokenDetails": {"noCacheTokens": 91, "cacheReadTokens": 4352},
+            "outputTokens": 15,
+            "outputTokenDetails": {"textTokens": 2, "reasoningTokens": 13},
+        });
+        let u = cc_usage(&v).expect("usage parsed");
+        assert_eq!(u.input, 4443, "inputTokens is the total, not the uncached part");
+        assert_eq!(u.cache_read, 4352);
+        assert_eq!(u.uncached_input(), 91);
+        assert_eq!(u.output, 15);
+        assert_eq!(u.reasoning, 13);
+    }
+
+    #[test]
+    fn cc_usage_falls_back_to_openai_and_anthropic_names() {
+        // OpenAI-ish flat shape
+        let u = cc_usage(&json!({"prompt_tokens": 100, "completion_tokens": 7})).unwrap();
+        assert_eq!((u.input, u.output), (100, 7));
+        // Anthropic-ish cache naming
+        let u = cc_usage(&json!({
+            "inputTokens": 50, "cache_read_input_tokens": 900,
+            "cache_creation_input_tokens": 20,
+        }))
+        .unwrap();
+        assert_eq!(u.cache_read, 900);
+        assert_eq!(u.cache_write, 20);
+    }
+
+    #[test]
+    fn cc_usage_none_when_absent_or_zero() {
+        assert!(cc_usage(&json!({})).is_none());
+        assert!(cc_usage(&json!(null)).is_none());
+        assert!(cc_usage(&json!({"inputTokens": 0, "outputTokens": 0})).is_none());
+    }
+
+    #[test]
+    fn openai_usage_reads_cached_and_reasoning_tokens() {
+        let u = openai_usage(&json!({
+            "prompt_tokens": 1200,
+            "completion_tokens": 80,
+            "prompt_tokens_details": {"cached_tokens": 1024},
+            "completion_tokens_details": {"reasoning_tokens": 32},
+        }))
+        .unwrap();
+        assert_eq!(u.input, 1200);
+        assert_eq!(u.cache_read, 1024);
+        assert_eq!(u.output, 80);
+        assert_eq!(u.reasoning, 32);
+        assert!(openai_usage(&json!({})).is_none());
+    }
+
+    /// Anthropic splits usage across two events; the phases must not overlap or
+    /// input/output would be counted twice.
+    #[test]
+    fn anthropic_usage_splits_input_and_output_phases() {
+        let start = json!({
+            "input_tokens": 200, "cache_read_input_tokens": 800,
+            "cache_creation_input_tokens": 100, "output_tokens": 1,
+        });
+        let u = anthropic_usage(&start, 0).unwrap();
+        assert_eq!(u.input, 1100, "input + cache read + cache write");
+        assert_eq!(u.output, 0, "output is not final on message_start");
+        assert_eq!(u.cache_read, 800);
+        assert_eq!(u.cache_write, 100);
+
+        let delta = json!({"output_tokens": 250});
+        let u = anthropic_usage(&delta, 1).unwrap();
+        assert_eq!((u.input, u.output), (0, 250));
+    }
+
+    #[test]
+    fn usage_accumulates_and_reports_uncached() {
+        let mut a = crate::types::Usage {
+            input: 1000, output: 10, cache_read: 900, cache_write: 5, reasoning: 3,
+        };
+        let b = crate::types::Usage { input: 500, output: 20, cache_read: 400, ..Default::default() };
+        a.add(&b);
+        assert_eq!(a.input, 1500);
+        assert_eq!(a.output, 30);
+        assert_eq!(a.cache_read, 1300);
+        assert_eq!(a.uncached_input(), 200);
+        assert!(!a.is_zero());
+        assert!(crate::types::Usage::default().is_zero());
+    }
+
     fn req_msgs() -> Vec<ChatMessage> {
         vec![
             ChatMessage::user("hi"),
@@ -932,6 +1190,64 @@ mod tests {
                 tool_use_id: "t1".into(), content: "data".into(), is_error: false,
             }]),
         ]
+    }
+
+    /// Command Code's `/alpha/generate` schema is Anthropic-shaped: an image
+    /// block needs `source.media_type` (snake_case). Sending `mediaType` (the
+    /// AI-SDK/OpenAI spelling) gets the whole request rejected with a 400
+    /// "Invalid option: expected one of image/jpeg|png|gif|webp", and a
+    /// `system: null` is rejected too.
+    #[test]
+    fn cc_wire_shape_is_anthropic_style() {
+        let msgs = vec![ChatMessage {
+            role: Role::User,
+            blocks: vec![
+                Block::Image { media_type: "image/png".into(), data: "AAAA".into(), width: 2, height: 2 },
+                Block::Text { text: "what is this?".into() },
+            ],
+        }];
+        let cc = cc_messages(&msgs);
+        assert_eq!(cc[0]["role"], "user");
+        assert_eq!(cc[0]["content"][0]["type"], "image");
+        assert_eq!(cc[0]["content"][0]["source"]["type"], "base64");
+        assert_eq!(cc[0]["content"][0]["source"]["media_type"], "image/png");
+        assert_eq!(cc[0]["content"][0]["source"]["data"], "AAAA");
+        assert!(cc[0]["content"][0]["source"].get("mediaType").is_none());
+        assert_eq!(cc[0]["content"][1]["text"], "what is this?");
+    }
+
+    /// Switching model/provider mid-run makes the agent re-convert the whole
+    /// session for the *new* provider on the next turn. The two wire formats
+    /// differ (Anthropic `tool_use`/`tool_result` blocks vs OpenAI
+    /// `tool_calls`/`role:"tool"`), so a transcript produced by one provider
+    /// must convert cleanly for the other. If this breaks, agent.rs's
+    /// per-turn provider switch would send an invalid body.
+    #[test]
+    fn transcript_converts_across_providers() {
+        let msgs = req_msgs();
+
+        // Anthropic-produced log -> OpenAI wire format
+        let oai = openai_messages(&ChatRequest {
+            model: "m".into(), max_tokens: 1, system: Some("sys".into()),
+            system_tail: None, messages: msgs.clone(), tools: vec![],
+        });
+        assert_eq!(oai[2]["tool_calls"][0]["id"], "t1");
+        assert_eq!(oai[3]["role"], "tool");
+        assert_eq!(oai[3]["tool_call_id"], "t1");
+
+        // OpenAI-produced log -> Anthropic wire format
+        let ant = anthropic_messages(&msgs);
+        assert_eq!(ant[1]["content"][1]["type"], "tool_use");
+        assert_eq!(ant[2]["content"][0]["type"], "tool_result");
+
+        // and every tool_use is answered in both directions, so neither
+        // provider rejects the body with "missing tool_result"
+        for (name, has_res) in [
+            ("anthropic", ant[2]["content"][0]["tool_use_id"] == "t1"),
+            ("openai", oai[3]["tool_call_id"] == "t1"),
+        ] {
+            assert!(has_res, "{name}: tool result not paired");
+        }
     }
 
     #[test]
@@ -1094,5 +1410,71 @@ mod live_tests {
                 break;
             }
         }
+    }
+
+    /// End-to-end check against the live Command Code API: the stream must
+    /// report real usage, and the cached-token split must be non-zero once the
+    /// same prefix is sent twice. Requires a signed-in `cmdc` / OpenCode
+    /// credential; ignored by default because it spends credits.
+    ///
+    ///   cargo test cc_live_reports_usage -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn cc_live_reports_usage() {
+        let conf = ProviderConf {
+            kind: ProviderKind::CommandCode,
+            model: "deepseek/deepseek-v4.1-flash".into(),
+            // WSL has no ~/.commandcode/auth.json; reuse the OpenCode credential
+            // (same Command Code account) so the test can run outside Windows.
+            api_key: std::fs::read_to_string(
+                dirs::home_dir().unwrap_or_default().join(".local/share/opencode/auth.json"),
+            )
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .and_then(|v| v["commandcode"]["key"].as_str().map(str::to_string))
+            .or_else(|| std::env::var("CMD_API_KEY").ok()),
+            ..Default::default()
+        };
+        let p = build(&conf);
+        let pad = (0..200)
+            .map(|i| format!("Rule {i}: a long stable prefix line used to exercise prompt caching."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mk_req = |tail: &str| ChatRequest {
+            model: "deepseek/deepseek-v4.1-flash".into(),
+            max_tokens: 16,
+            system: Some(format!("You are a helpful assistant.\n{pad}")),
+            system_tail: None,
+            messages: vec![ChatMessage::user(tail)],
+            tools: vec![],
+        };
+
+        let mut last = crate::types::Usage::default();
+        for pass in 1..=2 {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            p.stream(&mk_req("Reply with the single word: OK"), tx).await;
+            let mut u = crate::types::Usage::default();
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    StreamEvent::Usage(x) => u.add(&x),
+                    StreamEvent::Err(e) => {
+                        println!("pass {pass}: STREAM ERROR: {e}");
+                        break;
+                    }
+                    StreamEvent::Done => break,
+                    _ => {}
+                }
+            }
+            println!("pass {pass}: {u:?}  (uncached input {})", u.uncached_input());
+            assert!(!u.is_zero(), "pass {pass}: no usage reported — the stream dropped it");
+            assert!(u.input > 0 && u.output > 0, "pass {pass}: implausible usage {u:?}");
+            last = u;
+        }
+        // The second pass re-sends the identical prefix, so the provider should
+        // serve most of it from cache. This is the number amty used to discard.
+        assert!(
+            last.cache_read > 0,
+            "second pass reported no cache reads ({last:?}) — prefix caching regressed"
+        );
     }
 }
