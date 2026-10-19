@@ -42,6 +42,10 @@ pub enum Cmd {
     Status,
     /// List sessions.
     Sessions,
+    /// Show token usage (per session, or all sessions plus a total).
+    Usage {
+        #[arg(short, long)] session: Option<String>,
+    },
     /// Create a session, print its id.
     New {
         #[arg(long)] provider: Option<String>,
@@ -181,8 +185,16 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             let app = rt.block_on(app::App::start())?;
             let r = gui::run(rt, app);
-            // cleanup runtime file on exit
-            let _ = std::fs::remove_file(config::runtime_path());
+            // cleanup runtime file on exit — but only if it still points at
+            // this instance (a respawned GUI may have written its own already)
+            if std::fs::read_to_string(config::runtime_path())
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|v| v["pid"].as_u64())
+                == Some(std::process::id() as u64)
+            {
+                let _ = std::fs::remove_file(config::runtime_path());
+            }
             r.map_err(|e| anyhow::anyhow!("gui: {e}"))
         }
         Cmd::McpServe => mcp_serve::run(),

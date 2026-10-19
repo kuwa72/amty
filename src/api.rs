@@ -58,6 +58,11 @@ async fn auth(State(app): State<Arc<App>>, req: Request, next: Next) -> Result<R
 
 async fn status(State(app): State<Arc<App>>) -> Json<Value> {
     let cfg = app.cfg.read().unwrap();
+    // token totals across every session, so `amty status` shows real spend
+    let mut totals = crate::types::Usage::default();
+    for s in app.sessions.list() {
+        totals.add(&s.usage);
+    }
     Json(json!({
         "name": "amty",
         "version": env!("CARGO_PKG_VERSION"),
@@ -67,6 +72,7 @@ async fn status(State(app): State<Arc<App>>) -> Json<Value> {
         "approval": format!("{:?}", cfg.approval).to_lowercase(),
         "providers": cfg.providers.keys().cloned().collect::<Vec<_>>(),
         "sessions": app.sessions.list().len(),
+        "usage": totals,
         "mcp": app.mcp.statuses().iter().map(|(n, s, en)| {
             let st = match s {
                 crate::mcp::Status::Disabled => "disabled".to_string(),

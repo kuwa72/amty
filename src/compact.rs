@@ -39,6 +39,8 @@ fn msg_tokens(m: &ChatMessage) -> u64 {
                 est_tokens(name) + est_tokens(&input.to_string())
             }
             Block::ToolResult { content, .. } => est_tokens(content),
+            // an image costs roughly its base64 length; biased high on purpose
+            Block::Image { data, .. } => est_tokens(data),
         };
     }
     t
@@ -108,6 +110,10 @@ fn transcript(messages: &[ChatMessage]) -> String {
                         if *is_error { " (error)" } else { "" },
                         truncate_preview(content, 1000)
                     ));
+                }
+                Block::Image { width, height, .. } => {
+                    // the summary is text-only, so note the attachment instead
+                    out.push_str(&format!("{role} [image {width}x{height}]\n"));
                 }
             }
         }

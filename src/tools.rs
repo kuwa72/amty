@@ -435,6 +435,22 @@ pub async fn execute(app: &App, name: &str, input: &Value) -> Result<String, Str
 /// Returns (program, flag, wrapped command). On Windows, force UTF-8 output —
 /// cmd.exe otherwise answers in the OEM codepage (cp932 on ja-JP), which
 /// shows up as mojibake both in tool results and in the model's context.
+///
+/// DO NOT change "/C" to "/S /C" here without reproducing the *Rust* argv path.
+/// A `/S /C` attempt (2026-10) broke every command: the shell died with
+/// `'"chcp 65001 >nul & …' is not recognized as an internal or external
+/// command`, i.e. the whole wrapped string was taken as one command name.
+/// The earlier "verification" was invalid because it passed a verbatim command
+/// *string* to Python (no argv quoting), while `Command::args` quotes `/S /C`
+/// itself (it contains a space) and escapes the inner quotes as `\"`.
+/// Reproduce with the LIST form instead:
+///     subprocess.run(["cmd", "/S", "/C", "chcp 65001 >nul & dir /b <path>"])
+/// Known remaining limitation (pre-existing, not a regression): because
+/// `Command` escapes the quotes of the wrapped argument, a command that itself
+/// contains `"` is not passed through faithfully, so `dir /b "C:\some path"`
+/// fails with "The filename, directory name, or volume label syntax is
+/// incorrect." Fixing that needs `raw_arg` or a temp `.cmd`, both of which must
+/// be verified on Windows first.
 #[cfg(unix)]
 fn wrap_shell(command: &str) -> (&'static str, &'static str, String) {
     ("/bin/sh", "-c", command.to_string())
@@ -1141,6 +1157,37 @@ mod tests {
         let ask = cfg(ApprovalMode::Ask);
         assert!(!needs_approval(&ask, "web_search", &json!({"query": "x"})));
         assert!(!needs_approval(&ask, "web_fetch", &json!({"url": "https://ex.com"})));
+    }
+
+    /// Regression guard for the 2026-10 shell outage: changing the flag to
+    /// `/S /C` broke every command, because `Command::args` quotes `/S /C`
+    /// itself (it has a space) and escapes the inner quotes as `\"`, so cmd
+    /// received one long token and answered `'"chcp 65001 >nul & …' is not
+    /// recognized as an internal or external command`.
+    ///
+    /// So: assert the flag and the command are passed as SEPARATE, unmutated
+    /// arguments. Anything cleverer must first be verified on Windows through
+    /// the argv path (`subprocess.run(["cmd", ...])`), not with a command
+    /// string.
+    #[test]
+    #[cfg(windows)]
+    fn shell_wrapper_passes_flag_and_command_separately() {
+        let (prog, flag, wrapped) = wrap_shell(r#"dir /b "C:\Program Files""#);
+        assert_eq!(prog, "cmd");
+        assert_eq!(flag, "/C", "a bare /C is the verified-working form");
+        assert!(flag.split_whitespace().count() == 1, "the flag must be one token");
+        assert!(wrapped.starts_with("chcp 65001 >nul & "), "UTF-8 output must be forced");
+        // the agent's command must be present verbatim, quotes included
+        assert!(wrapped.ends_with(r#"dir /b "C:\Program Files""#));
+    }
+
+    /// The unix side must not gain the Windows flag or prefix.
+    #[test]
+    #[cfg(unix)]
+    fn shell_wrapper_is_sh_c_on_unix() {
+        let (prog, flag, wrapped) = wrap_shell(r#"ls -la "a b""#);
+        assert_eq!((prog, flag), ("/bin/sh", "-c"));
+        assert_eq!(wrapped, r#"ls -la "a b""#);
     }
 
     #[test]

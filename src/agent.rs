@@ -11,9 +11,26 @@ use tokio::sync::mpsc;
 const MAX_TURNS: usize = 40;
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 
+/// Turn cap for a fresh agent run: in bypass (`ApprovalMode::Auto`) there is no
+/// practical reason to stop the loop, so allow a very high cap. The cap is
+/// re-evaluated every turn, so toggling bypass mid-run takes effect immediately.
+fn turn_limit(bypass: bool) -> usize {
+    if bypass {
+        usize::MAX
+    } else {
+        MAX_TURNS
+    }
+}
+
 /// Start an agent run in the background. Returns error if already running
 /// or the session/provider is invalid.
 pub fn start_run(app: &Arc<App>, session_id: &str, text: String) -> Result<()> {
+    start_run_blocks(app, session_id, vec![Block::Text { text }])
+}
+
+/// Like [`start_run`] but with explicit blocks, so a message can carry images
+/// (clipboard paste / file drop) as well as text.
+pub fn start_run_blocks(app: &Arc<App>, session_id: &str, blocks: Vec<Block>) -> Result<()> {
     let sid = app
         .sessions
         .resolve(session_id)
@@ -23,29 +40,36 @@ pub fn start_run(app: &Arc<App>, session_id: &str, text: String) -> Result<()> {
     }
     let app = app.clone();
     tokio::spawn(async move {
-        run(&app, &sid, text).await;
+        run(&app, &sid, blocks).await;
         app.end_run(&sid);
     });
     Ok(())
 }
 
-async fn run(app: &Arc<App>, sid: &str, text: String) {
-    if let Err(e) = run_inner(app, sid, text).await {
+async fn run(app: &Arc<App>, sid: &str, blocks: Vec<Block>) {
+    if let Err(e) = run_inner(app, sid, blocks).await {
         app.emit(sid, EvKind::Error { message: e.to_string() });
     }
 }
 
-async fn run_inner(app: &Arc<App>, sid: &str, text: String) -> Result<()> {
+async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> {
     let cancel = app.runs.lock().unwrap().get(sid).cloned().ok_or_else(|| anyhow!("run not registered"))?;
     let cancelled = || cancel.load(Ordering::SeqCst);
 
-    app.sessions.push_message(sid, ChatMessage::user(text));
+    app.sessions.push_message(sid, ChatMessage::user_blocks(blocks));
     app.emit(sid, EvKind::Touched);
 
     // ensure MCP servers are up (cheap after first connect)
     app.mcp.ensure_connected().await;
 
-    for _turn in 0..MAX_TURNS {
+    let mut turn = 0usize;
+    let stop_msg = loop {
+        // re-read each turn: toggling bypass mid-run lifts/reinstates the cap
+        let limit = turn_limit(app.cfg.read().unwrap().approval == ApprovalMode::Auto);
+        if turn >= limit {
+            break format!("stopped after {limit} turns");
+        }
+        turn += 1;
         if cancelled() {
             app.emit(sid, EvKind::Error { message: "cancelled".into() });
             return Ok(());
@@ -90,11 +114,17 @@ async fn run_inner(app: &Arc<App>, sid: &str, text: String) -> Result<()> {
         let fwd = tokio::spawn(async move {
             let mut blocks: Vec<Block> = vec![];
             let mut cur_text = String::new();
+            let mut usage = crate::types::Usage::default();
             while let Some(ev) = rx.recv().await {
                 match ev {
                     StreamEvent::Text(t) => {
                         cur_text.push_str(&t);
                         app2.emit(&sid2, EvKind::Text { text: t });
+                    }
+                    StreamEvent::Usage(u) => {
+                        usage.add(&u);
+                        // one frame per provider call so the UI settles fast
+                        app2.emit(&sid2, EvKind::Usage { usage: u, turns: 1, cumulative: usage });
                     }
                     StreamEvent::ToolUse { id, name, input } => {
                         if !cur_text.is_empty() {
@@ -112,7 +142,7 @@ async fn run_inner(app: &Arc<App>, sid: &str, text: String) -> Result<()> {
             if !cur_text.is_empty() {
                 blocks.push(Block::Text { text: cur_text });
             }
-            blocks
+            (blocks, usage)
         });
         // stream is cancel-safe: dropping the future aborts the HTTP request
         {
@@ -129,6 +159,11 @@ async fn run_inner(app: &Arc<App>, sid: &str, text: String) -> Result<()> {
             }
         }
         let blocks = fwd.await.unwrap_or_default();
+        let (blocks, call_usage) = blocks;
+        // persist the turn's token usage so totals survive a restart
+        if !call_usage.is_zero() {
+            app.sessions.add_usage(sid, &call_usage);
+        }
 
         let tool_uses: Vec<Block> = blocks
             .iter()
@@ -220,8 +255,8 @@ async fn run_inner(app: &Arc<App>, sid: &str, text: String) -> Result<()> {
             app.emit(sid, EvKind::Error { message: "cancelled".into() });
             return Ok(());
         }
-    }
-    app.emit(sid, EvKind::Error { message: format!("stopped after {MAX_TURNS} turns") });
+    };
+    app.emit(sid, EvKind::Error { message: stop_msg });
     Ok(())
 }
 
