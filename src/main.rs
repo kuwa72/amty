@@ -10,6 +10,7 @@ mod catalog;
 mod cli;
 mod compact;
 mod config;
+mod evolve;
 mod gui;
 mod i18n;
 mod mcp;
@@ -111,10 +112,28 @@ pub enum Cmd {
         #[command(subcommand)]
         sub: Option<SkillCmd>,
     },
+    /// Show self-evolution state (memory, stats, pending restart) or manage it.
+    Evolve {
+        #[command(subcommand)]
+        sub: Option<EvolveCmd>,
+    },
     /// Expose the running instance as an MCP server (stdio) for external agents.
     McpServe,
     /// Import mcpServers from claude_desktop_config.json into config.toml.
     ImportClaude,
+    /// Internal: swap helper process for self-update. Runs in a copy of this
+    /// binary so it can overwrite the real exe after the original exits
+    /// (a running exe can't be overwritten, and on Windows can't even be
+    /// linked over by cargo).
+    #[command(hide = true)]
+    SelfSwap {
+        #[arg(long)]
+        wait_pid: u32,
+        #[arg(long)]
+        install: std::path::PathBuf,
+        #[arg(long)]
+        target: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -135,6 +154,14 @@ pub enum McpCmd {
 pub enum SkillCmd {
     /// Remove a skill (only ones managed inside amty's own skills dir).
     Remove { name: String },
+}
+
+#[derive(Subcommand)]
+pub enum EvolveCmd {
+    /// Force a reflection pass on a session (empty = most recent).
+    Reflect { session: Option<String> },
+    /// Erase a learned auto-approval (the exact command line).
+    Forget { command: String },
 }
 
 /// Linux/WSL display fixups: point XDG_RUNTIME_DIR at WSLg's socket dir when
@@ -198,6 +225,11 @@ fn main() -> Result<()> {
             r.map_err(|e| anyhow::anyhow!("gui: {e}"))
         }
         Cmd::McpServe => mcp_serve::run(),
+        // no tokio, no App, no config — the helper must work even while the
+        // runtime/config state is being shut down by the exiting parent
+        Cmd::SelfSwap { wait_pid, install, target } => {
+            evolve::self_swap(wait_pid, install, target)
+        }
         Cmd::ImportClaude => {
             let (mut cfg, path) = config::Config::load()?;
             match config::import_claude(&mut cfg) {

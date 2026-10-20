@@ -38,6 +38,9 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/mcp-keys", post(mcp_keys))
         .route("/v1/skills", get(skills_list))
         .route("/v1/skills/{name}", delete(skill_remove))
+        .route("/v1/evolve", get(evolve_status))
+        .route("/v1/evolve/reflect", post(evolve_reflect))
+        .route("/v1/evolve/forget", post(evolve_forget))
         .layer(middleware::from_fn_with_state(app.clone(), auth))
         .with_state(app)
 }
@@ -320,6 +323,42 @@ async fn skills_list() -> Json<Value> {
         })
         .collect();
     Json(json!({"skills": arr}))
+}
+
+/// `GET /v1/evolve` — self-evolution state: toggles, memory file, stats,
+/// pending rebuild/restart.
+async fn evolve_status(State(app): State<Arc<App>>) -> Json<Value> {
+    Json(crate::evolve::status_json(&app))
+}
+
+#[derive(Deserialize)]
+struct ReflectBody {
+    session: Option<String>,
+}
+
+/// `POST /v1/evolve/reflect` — force a reflection pass over a session.
+async fn evolve_reflect(
+    State(app): State<Arc<App>>,
+    body: Option<Json<ReflectBody>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let sid = body.and_then(|b| b.session.clone()).unwrap_or_default();
+    let summary = crate::evolve::reflect_now(&app, &sid)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    Ok(Json(json!({"ok": summary})))
+}
+
+#[derive(Deserialize)]
+struct ForgetBody {
+    command: String,
+}
+
+/// `POST /v1/evolve/forget` — erase a learned auto-approval.
+async fn evolve_forget(
+    State(app): State<Arc<App>>,
+    Json(b): Json<ForgetBody>,
+) -> Json<Value> {
+    Json(json!({"removed": crate::evolve::forget_command(&app, &b.command)}))
 }
 
 async fn skill_remove(

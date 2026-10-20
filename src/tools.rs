@@ -17,7 +17,8 @@ pub enum Risk {
 
 pub fn risk_of(name: &str) -> Risk {
     match name {
-        "fs_read" | "fs_list" | "config_get" | "mcp" | "web_search" | "web_fetch" => Risk::Safe,
+        "fs_read" | "fs_list" | "config_get" | "mcp" | "web_search" | "web_fetch"
+        | "self_update" => Risk::Safe,
         "shell" => Risk::Exec,
         _ => {
             if name.starts_with("mcp__") {
@@ -113,12 +114,12 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "config_get".into(),
-            description: "Read an amty setting. Keys: provider, model, approval, system_prompt, allow_commands, allow_paths, providers, mcp_servers, search, provider.<name>.<field>, search.<field>.".into(),
+            description: "Read an amty setting. Keys: provider, model, approval, system_prompt, allow_commands, allow_paths, providers, mcp_servers, search, evolve, provider.<name>.<field>, search.<field>, evolve.<field>.".into(),
             schema: schema(json!({"key": {"type": "string", "description": "omit to list keys"}}), &[]),
         },
         ToolSpec {
             name: "config_set".into(),
-            description: "Change an amty setting at runtime (persisted). Keys: provider, model, approval(ask|auto|allowlist), system_prompt, max_tokens, allow_commands, allow_paths, +allow_commands, +allow_paths, provider.<name>.{model,api_key,api_key_env,base_url,context_window}, mcp.<name>.enabled, search.{backend,api_key,api_key_env,base_url,max_results,fetch_max_chars}.".into(),
+            description: "Change an amty setting at runtime (persisted). Keys: provider, model, approval(ask|auto|allowlist), system_prompt, max_tokens, allow_commands, allow_paths, +allow_commands, +allow_paths, provider.<name>.{model,api_key,api_key_env,base_url,context_window}, mcp.<name>.enabled, search.{backend,api_key,api_key_env,base_url,max_results,fetch_max_chars}, evolve.{reflect,skills,self_modify,auto_restart,learn_approvals}.".into(),
             schema: schema(
                 json!({"key": {"type": "string"}, "value": {"type": "string"}}),
                 &["key", "value"],
@@ -155,6 +156,18 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
             ),
         },
         ToolSpec {
+            name: "self_update".into(),
+            description: "Self-evolution control. actions: status (memory/stats/build state) | reflect (force a memory-distillation pass on a session) | rebuild (cargo build amty from its own source tree, detached; on success the new binary is installed over the running exe and the app restarts when idle — a detached helper process does the swap, so it works even though a running exe can't be overwritten) | restart (schedule that restart manually) | forget (erase a learned auto-approval; pass the exact command in `command`). Rebuild needs the checkout this binary was built from.".into(),
+            schema: schema(
+                json!({
+                    "action": {"type": "string"},
+                    "session": {"type": "string", "description": "reflect action: session id or prefix; empty = most recent"},
+                    "command": {"type": "string", "description": "forget action: exact command to unlearn"}
+                }),
+                &["action"],
+            ),
+        },
+        ToolSpec {
             name: "mcp_install".into(),
             description: "Add an MCP server to config and connect it. id=name in config, package=npm/uvx package, command=npx|uvx, args and env optional.".into(),
             schema: schema(
@@ -184,6 +197,7 @@ pub fn summarize(name: &str, input: &Value) -> String {
         "mcp" => format!("mcp: {} {}", input["action"].as_str().unwrap_or(""), input["server"].as_str().unwrap_or("")),
         "mcp_search" => format!("mcp_search: {}", input["query"].as_str().unwrap_or("")),
         "mcp_install" => format!("mcp_install: {} ({})", input["id"].as_str().unwrap_or(""), input["package"].as_str().unwrap_or("")),
+        "self_update" => format!("self_update: {}", input["action"].as_str().unwrap_or("status")),
         _ => {
             let s = input.to_string();
             format!("{name}: {}", &s[..s.len().min(300)])
@@ -196,7 +210,18 @@ pub fn needs_approval(cfg: &Config, name: &str, input: &Value) -> bool {
     // `mcp` is Safe only for read actions; mutations count as Write.
     let mutating_mcp = name == "mcp"
         && !matches!(input["action"].as_str().unwrap_or("list"), "list" | "tools");
-    match if mutating_mcp { Risk::Write } else { risk_of(name) } {
+    // `self_update` read actions (status, reflect) are safe; rebuild/restart
+    // count as Exec — they spawn a build and can kill the process.
+    let mutating_su = name == "self_update"
+        && !matches!(input["action"].as_str().unwrap_or("status"), "status" | "reflect");
+    let risk = if mutating_mcp {
+        Risk::Write
+    } else if mutating_su {
+        Risk::Exec
+    } else {
+        risk_of(name)
+    };
+    match risk {
         Risk::Safe => false,
         _ => match cfg.approval {
             ApprovalMode::Auto => false,
@@ -234,7 +259,7 @@ fn truncate(s: String) -> String {
     }
 }
 
-pub async fn execute(app: &App, name: &str, input: &Value) -> Result<String, String> {
+pub async fn execute(app: &std::sync::Arc<App>, name: &str, input: &Value) -> Result<String, String> {
     match name {
         "fs_read" => {
             let path = input["path"].as_str().unwrap_or("");
@@ -302,7 +327,7 @@ pub async fn execute(app: &App, name: &str, input: &Value) -> Result<String, Str
             let cfg = app.cfg.read().map_err(|e| e.to_string())?;
             match input["key"].as_str() {
                 Some(k) => cfg.get(k).map_err(|e| e.to_string()),
-                None => Ok("provider, model, approval, system_prompt, allow_commands, allow_paths, providers, mcp_servers, search, provider.<name>.{model,base_url,api_key_env,api_key}, search.{backend,api_key,api_key_env,base_url,max_results,fetch_max_chars}".into()),
+                None => Ok("provider, model, approval, system_prompt, allow_commands, allow_paths, providers, mcp_servers, search, evolve, provider.<name>.{model,base_url,api_key_env,api_key}, search.{backend,api_key,api_key_env,base_url,max_results,fetch_max_chars}, evolve.{reflect,skills,self_modify,auto_restart,learn_approvals}".into()),
             }
         }
         "config_set" => {
@@ -398,6 +423,37 @@ pub async fn execute(app: &App, name: &str, input: &Value) -> Result<String, Str
                 .map(|(i, (name, desc))| format!("{}. {}\n   {}", i + 1, name, desc))
                 .collect::<Vec<_>>()
                 .join("\n\n"))
+        }
+        "self_update" => {
+            let action = input["action"].as_str().unwrap_or("status");
+            match action {
+                "status" => Ok(crate::evolve::status_text(app)),
+                "reflect" => {
+                    let session = input["session"].as_str().unwrap_or("");
+                    crate::evolve::reflect_now(app, session).await
+                }
+                "rebuild" => crate::evolve::start_rebuild(app),
+                "restart" => {
+                    let target = app
+                        .built_binary
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .or_else(|| std::env::current_exe().ok())
+                        .ok_or_else(|| "no binary to restart with".to_string())?;
+                    crate::evolve::request_restart(app, target.clone());
+                    Ok(format!("restart scheduled into {} — fires when all runs are idle (including this one when it ends)", target.display()))
+                }
+                "forget" => {
+                    let cmd = input["command"].as_str().ok_or("command required")?;
+                    Ok(if crate::evolve::forget_command(app, cmd) {
+                        format!("forgot learned approval: {cmd}")
+                    } else {
+                        format!("not learned: {cmd}")
+                    })
+                }
+                _ => Err(format!("unknown action '{action}' (status|reflect|rebuild|restart|forget)")),
+            }
         }
         "mcp_install" => {
             let id = input["id"].as_str().ok_or("id required")?;
@@ -1157,6 +1213,17 @@ mod tests {
         let ask = cfg(ApprovalMode::Ask);
         assert!(!needs_approval(&ask, "web_search", &json!({"query": "x"})));
         assert!(!needs_approval(&ask, "web_fetch", &json!({"url": "https://ex.com"})));
+    }
+
+    #[test]
+    fn self_update_read_actions_are_safe() {
+        let ask = cfg(ApprovalMode::Ask);
+        assert!(!needs_approval(&ask, "self_update", &json!({"action": "status"})));
+        assert!(!needs_approval(&ask, "self_update", &json!({"action": "reflect"})));
+        assert!(needs_approval(&ask, "self_update", &json!({"action": "rebuild"})));
+        assert!(needs_approval(&ask, "self_update", &json!({"action": "restart"})));
+        let auto = cfg(ApprovalMode::Auto);
+        assert!(!needs_approval(&auto, "self_update", &json!({"action": "rebuild"})));
     }
 
     /// Regression guard for the 2026-10 shell outage: changing the flag to

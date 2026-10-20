@@ -13,7 +13,6 @@ use crate::config::{ProviderConf, ProviderKind};
 use crate::provider::Provider;
 use crate::types::*;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 const SUMMARY_SYSTEM: &str = "You are compacting a chat session between a user \
 and an AI coding assistant. Summarize the transcript below into a compact brief \
@@ -86,7 +85,7 @@ fn find_split(messages: &[ChatMessage], keep: u64) -> usize {
 
 /// Flatten messages into a text transcript for the summarizer. Long tool
 /// inputs/results are clipped — the summary needs their gist, not bytes.
-fn transcript(messages: &[ChatMessage]) -> String {
+pub(crate) fn transcript(messages: &[ChatMessage]) -> String {
     let mut out = String::new();
     for m in messages {
         let role = match m.role {
@@ -130,50 +129,7 @@ async fn summarize(
     head: &[ChatMessage],
     cancelled: impl Fn() -> bool,
 ) -> Result<String, String> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
-    let req = ChatRequest {
-        model: model.into(),
-        max_tokens: 2048,
-        system: Some(SUMMARY_SYSTEM.into()),
-        system_tail: None,
-        messages: vec![ChatMessage::user(transcript(head))],
-        tools: vec![],
-    };
-    let fwd = tokio::spawn(async move {
-        let mut out = String::new();
-        let mut err = None;
-        while let Some(ev) = rx.recv().await {
-            match ev {
-                StreamEvent::Text(t) => out.push_str(&t),
-                StreamEvent::Err(e) => {
-                    err = Some(e);
-                    break;
-                }
-                StreamEvent::Done => break,
-                _ => {}
-            }
-        }
-        (out, err)
-    });
-    {
-        let mut fut = std::pin::pin!(prov.stream(&req, tx));
-        loop {
-            tokio::select! {
-                _ = &mut fut => break,
-                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
-                    if cancelled() {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    let (out, err) = fwd.await.map_err(|e| e.to_string())?;
-    match err {
-        Some(e) => Err(e),
-        None if out.trim().is_empty() => Err("empty summary".into()),
-        None => Ok(out),
-    }
+    crate::provider::stream_text(prov, model, SUMMARY_SYSTEM, transcript(head), 2048, cancelled).await
 }
 
 /// Compact the session if its estimated size is near the context window.

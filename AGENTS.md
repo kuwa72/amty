@@ -12,7 +12,9 @@ App core (src/app.rs)           -- config, sessions, approvals, event broadcast
   |- agent loop (src/agent.rs)  -- provider stream -> tool calls -> results -> repeat;
   |                             auto-compacts via src/compact.rs when the
   |                             estimated prompt nears the context window
-  |                             (LLM summary replaces old messages, tail kept)
+  |                             (LLM summary replaces old messages, tail kept);
+  |                             abnormal exits persist a `[amty: run ended —
+  |                             <reason>]` user msg so the log records why
   |- providers (src/provider.rs)-- Anthropic native + OpenAI-compatible (hand-rolled SSE)
   |                             + Command Code (POST /alpha/generate, NDJSON stream,
   |                               key from ~/.commandcode/auth.json)
@@ -50,8 +52,12 @@ do via `config_set`, a script can do via `POST /v1/config`, and vice versa.
   system prompt each turn (`config::skills_prompt`); the first non-heading line
   becomes the description. Agents write machine-specific operational notes here
   (e.g. `windows-env`, `wsl-env`, `gws`) instead of probing the environment.
+- memory: `$XDG_CONFIG_HOME/amty/MEMORY.md` — written by the reflection pass,
+  injected into the system tail each turn (`evolve::memory_prompt`, ~6 KB cap)
 - sessions: `$XDG_DATA_HOME/amty/sessions/<id>.jsonl` (meta line + messages)
 - runtime discovery: `$XDG_DATA_HOME/amty/runtime.json` (0600)
+- evolve state: `$XDG_DATA_HOME/amty/evolve.json` (tool stats, learned
+  approvals, reflection watermarks), `evolve.log`, `self-update.log`
 
 ## Build / test / run
 
@@ -71,6 +77,8 @@ cargo build --release
 ./target/debug/amty config unset mcp.<name># generic delete (mcp./provider./search.)
 ./target/debug/amty install notion NOTION_TOKEN=ntn_…   # catalog install via API
 ./target/debug/amty auth gdrive [--status]   # run a catalog entry's OAuth flow
+./target/debug/amty evolve            # self-evolution state (memory/stats/restart)
+./target/debug/amty evolve <session>  # force a reflection pass on a session
 
 # Windows native binary (cross-compiled from WSL; needs mingw-w64 incl. windres):
 cargo build --release --target x86_64-pc-windows-gnu
@@ -99,6 +107,54 @@ cargo build --release --target x86_64-pc-windows-gnu
   and binary small.
 - CJK fonts are loaded from OS font paths at startup (see `install_cjk_fonts`);
   egui's bundled fonts have no CJK glyphs.
+
+## Self-evolution (src/evolve.rs)
+
+amty continuously improves itself; toggles live under `evolve.*` config keys
+(all default on):
+
+- **Reflection** (`evolve.reflect`): after each run ends, if the session grew by
+  ≥6 messages since the last pass, a one-shot provider call (`provider::stream_text`
+  — shared with auto-compaction) reads the transcript tail + current MEMORY.md +
+  tool stats and emits fenced blocks: ` ```memory ` (full MEMORY.md rewrite,
+  atomic via tmp+rename), ` ```skill <name> ` (complete SKILL.md into the skills
+  dir, ≤3/pass, `evolve.skills` gate), ` ```config ` (whitelisted keys only:
+  `+allow_commands`, `+allow_paths`, `max_tokens`, `search.*` — never provider/
+  model/system_prompt). Results surface as `EvKind::Evolved` → GUI toast.
+  Cost control: ≤20 reflections/rolling day (`reflection_times`) + a 10 min
+  cooldown after a provider failure (`reflect_fail_until`); the manual
+  `reflect` action bypasses both.
+- **Approval learning** (`evolve.learn_approvals`): in `ask`/`allowlist` mode,
+  approving the exact same `shell` command line 3 times auto-allows it from
+  then on (`evolve::auto_approved` in `approval_gate`). Exact match only.
+  Unlearn via `POST /v1/evolve/forget`, `self_update forget <command>`, or
+  `amty evolve forget <cmd>`.
+- **Self-rebuild** (`evolve.self_modify`): the `self_update` tool —
+  `status | reflect [session] | rebuild | restart`. `rebuild` runs `cargo
+  build` detached in `CARGO_MANIFEST_DIR` (profile matches the running exe:
+  target/debug → debug, else release) logging to `self-update.log`, since a
+  cold build can exceed the 300 s tool cap. If the artifact path equals the
+  running exe the build is redirected to `target/self-update/` — a running
+  exe can't be linked over (Windows lock, unix ETXTBSY), so it builds out of
+  the way and the swap handles installation.
+- **Restart/swap** (`evolve.auto_restart`): when all runs are idle (checked
+  after `end_run`), `maybe_restart` copies the running exe to
+  `$XDG_DATA_HOME/amty/self-swap/amty-helper` and spawns it as the hidden
+  `amty self-swap --wait-pid <pid> --install <artifact> --target <exe>`
+  subcommand, then `process::exit` — the helper waits for the parent pid,
+  renames the old exe to `amty.old` (renaming a running exe is legal even on
+  Windows), copies the new binary in (retry loop, rollback on relaunch
+  failure), and respawns it. Same code path on all platforms.
+- **Stats**: per-tool calls/errors/denied + approved-command counts persist
+  to `evolve.json`; exposed via `self_update status`, `GET /v1/evolve`,
+  `amty evolve`, the `amty_evolve` MCP facade tool (status|reflect|forget),
+  and fed into the reflection prompt. The Settings GUI has an "evolve" tab
+  with the five toggles plus a read-only MEMORY.md viewer.
+- **Verified on Windows**: `self_update restart` from an agent session drove
+  the full swap (helper copy → pid wait → exe replace → relaunch) including
+  a real binary replacement (0.3.0 → 0.3.0-swaptest). A Windows binary whose
+  CARGO_MANIFEST_DIR points into WSL reports `source_dir: null` — rebuild
+  there needs a Windows-side checkout + cargo.
 
 ## Known limits / TODO
 
@@ -191,3 +247,23 @@ cargo build --release --target x86_64-pc-windows-gnu
   AtomicBool; `main` only removes `runtime.json` when its pid still matches so a
   respawned instance's file isn't deleted.
 - macOS packaging (.app bundle, signing) not set up; `cargo build` on macOS works.
+<!-- lead-flow begin (managed by `lead enable`; do not edit) -->
+## lead-flow（`/lead-flow <issue-number>`）
+
+このプロジェクトでは `lead` を使った Issue 駆動開発フローを採用している。ユーザーが `/lead-flow <issue-number>` で作業を指示したら、以下を実行する。
+
+1. `lead run <issue-number>` でブランチ・作業状態を作成する。
+2. TDD：まず失敗するテストを追加し Red を確認してから実装し、Green を確認する。
+3. `./test/run-tests.sh`（または `go test ./...`、プロジェクト固有のテストコマンド）をすべてパスさせる。
+4. `git push -u origin $(git branch --show-current)` でブランチを push する。
+5. `gh pr create --fill` で PR を作成する。
+6. `bin/ci-wait <pr-number>`（または `gh pr checks`）で CI が pass するまで待つ。
+7. `gh pr merge --squash`（または `lead finish <issue-number> --merge`）でマージする。
+8. 関連 Issue が closed になったことを確認する。
+
+ルール：
+- `main` には直接 push しない。`issue/<number>-<slug>` ブランチで作業する。
+- 1 Issue に原則 1 ブランチ/PR とし、Issue 側で明示がない限り分割しない。
+- `AGENTS.md`、`.agents/`、`.claude/`、`.devin/` などのプロジェクト規約ファイルは、当該 Issue で変更が明示されていない限り編集しない。
+
+<!-- lead-flow end -->

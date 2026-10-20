@@ -61,7 +61,7 @@ fn print_json(v: &Value) {
 pub async fn run(cmd: crate::Cmd) -> Result<()> {
     use crate::Cmd::*;
     match cmd {
-        Gui | McpServe | ImportClaude => unreachable!(),
+        Gui | McpServe | ImportClaude | SelfSwap { .. } => unreachable!(),
         Status => {
             let (base, tok) = runtime_info()?;
             print_json(&get(&base, &tok, "/v1/status").await?);
@@ -321,6 +321,18 @@ pub async fn run(cmd: crate::Cmd) -> Result<()> {
                 Some(crate::SkillCmd::Remove { name }) => {
                     print_json(&delete(&base, &tok, &format!("/v1/skills/{name}")).await?)
                 }
+            }
+        }
+        Evolve { sub } => {
+            let (base, tok) = runtime_info()?;
+            match sub {
+                Some(crate::EvolveCmd::Reflect { session }) => {
+                    print_json(&post(&base, &tok, "/v1/evolve/reflect", json!({"session": session.unwrap_or_default()})).await?)
+                }
+                Some(crate::EvolveCmd::Forget { command }) => {
+                    print_json(&post(&base, &tok, "/v1/evolve/forget", json!({"command": command})).await?)
+                }
+                None => print_json(&get(&base, &tok, "/v1/evolve").await?),
             }
         }
         Auth { id, status } => {
