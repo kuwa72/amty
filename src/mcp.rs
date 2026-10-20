@@ -13,6 +13,16 @@ use tokio::sync::{mpsc, oneshot};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// Clip an MCP tool result to [`crate::tools::MAX_OUT`].
+///
+/// MCP servers return screen dumps and document bodies, so this is the path that
+/// most needs a ceiling (issue #6: an uncapped windows-mcp `Snapshot` put 107,816
+/// chars / ~27k tokens into a single turn). Shares the helper with builtin tools
+/// so the truncation marker is identical and no UTF-8 character is split.
+pub fn cap_result(text: String) -> String {
+    crate::tools::truncate_to(text, crate::tools::MAX_OUT)
+}
+
 struct Rpc {
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
     next: AtomicU64,
@@ -491,6 +501,10 @@ impl Manager {
                     .join("\n")
             })
             .unwrap_or_else(|| res.to_string());
+        // Same ceiling builtin tools get (issue #6): without this an MCP server
+        // can push an arbitrary amount into the context and the session log — a
+        // windows-mcp Snapshot was measured at 107,816 chars (~27k tokens).
+        let text = cap_result(text);
         if is_err {
             Err(text)
         } else {
@@ -541,6 +555,23 @@ impl Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_results_are_capped_like_builtin_tools() {
+        // small results are untouched
+        assert_eq!(cap_result("ok".to_string()), "ok");
+        // oversized results are clipped, marked, and keep their head
+        let big = "x".repeat(crate::tools::MAX_OUT + 5_000);
+        let out = cap_result(big.clone());
+        assert!(out.len() < big.len());
+        assert!(out.contains("[truncated"));
+        assert!(out.starts_with("xxx"), "keeps the head where the summary lives");
+        // a multi-byte character must never be sliced in half
+        let jp = "あ".repeat((crate::tools::MAX_OUT / 3) + 100);
+        let out = cap_result(jp);
+        assert!(out.contains("[truncated"));
+        assert!(out.is_char_boundary(out.find('…').unwrap()));
+    }
 
     #[test]
     fn sse_response_finds_matching_id() {
