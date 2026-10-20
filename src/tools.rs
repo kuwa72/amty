@@ -249,14 +249,29 @@ fn allowlisted(cfg: &Config, name: &str, input: &Value) -> bool {
     }
 }
 
-const MAX_OUT: usize = 48_000;
+/// Default ceiling for any single tool result that enters the model's context.
+///
+/// Builtin tools go through [`truncate`]; MCP results go through
+/// [`crate::mcp::cap_result`], which uses this same constant so the two paths
+/// behave identically (see issue #6: an uncapped MCP `Snapshot` put 107,816
+/// chars / ~27k tokens into one turn).
+pub const MAX_OUT: usize = 48_000;
+
+/// Clip `s` to `max` bytes without splitting a UTF-8 character, appending a
+/// marker that tells the model (and the reader) how much was dropped.
+pub fn truncate_to(s: String, max: usize) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated {} bytes]", &s[..end], s.len() - end)
+}
 
 fn truncate(s: String) -> String {
-    if s.len() > MAX_OUT {
-        format!("{}…[truncated {} bytes]", &s[..MAX_OUT], s.len() - MAX_OUT)
-    } else {
-        s
-    }
+    truncate_to(s, MAX_OUT)
 }
 
 pub async fn execute(app: &std::sync::Arc<App>, name: &str, input: &Value) -> Result<String, String> {
