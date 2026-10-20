@@ -58,6 +58,18 @@ fn print_json(v: &Value) {
     println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
 }
 
+/// Percent-encode a query-string value (unreserved characters kept verbatim).
+pub fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 pub async fn run(cmd: crate::Cmd) -> Result<()> {
     use crate::Cmd::*;
     match cmd {
@@ -86,6 +98,36 @@ pub async fn run(cmd: crate::Cmd) -> Result<()> {
                         n("cache_read"),
                     );
                 }
+            }
+        }
+        Search { query, session, limit, json: as_json } => {
+            let (base, tok) = runtime_info()?;
+            let q = query.join(" ");
+            if q.trim().is_empty() {
+                bail!("usage: amty search <query> [-s <session>] [--limit N]");
+            }
+            let mut path = format!("/v1/search?q={}&limit={limit}", url_encode(&q));
+            if let Some(sid) = session.as_deref().filter(|s| !s.is_empty()) {
+                path.push_str(&format!("&session={}", url_encode(sid)));
+            }
+            let v = get(&base, &tok, &path).await?;
+            if as_json {
+                print_json(&v);
+            } else {
+                let hits = v["hits"].as_array().cloned().unwrap_or_default();
+                for h in &hits {
+                    let idx = h["msg_index"].as_u64().map(|i| format!("#{i}")).unwrap_or_default();
+                    println!(
+                        "{}\t{}\t{:<9}{}\t{}",
+                        h["id"].as_str().unwrap_or(""),
+                        crate::session::fmt_stamp(h["updated"].as_u64().unwrap_or(0)),
+                        h["role"].as_str().unwrap_or(""),
+                        idx,
+                        h["snippet"].as_str().unwrap_or(""),
+                    );
+                }
+                let n = v["n"].as_u64().unwrap_or(0);
+                eprintln!("\n{n} hit(s) for \"{q}\"");
             }
         }
         Usage { session } => {

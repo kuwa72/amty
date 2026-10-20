@@ -43,6 +43,15 @@ pub enum Cmd {
     Status,
     /// List sessions.
     Sessions,
+    /// Search sessions by title, message text and tool calls.
+    Search {
+        /// query text (space-joined)
+        query: Vec<String>,
+        #[arg(short, long)] session: Option<String>,
+        #[arg(long, default_value = "50")] limit: usize,
+        /// print the raw API JSON instead of a table
+        #[arg(long)] json: bool,
+    },
     /// Show token usage (per session, or all sessions plus a total).
     Usage {
         #[arg(short, long)] session: Option<String>,
