@@ -297,8 +297,10 @@ struct SettingsBuf {
     sel_mcp: Option<String>,
     new_provider: String,
     new_mcp: String,
-    /// active tab index (providers / mcp / skills / behavior)
+    /// active tab index (providers / mcp / skills / behavior / evolve)
     tab: usize,
+    /// cached MEMORY.md contents for the evolve tab (loaded once per open)
+    memory: String,
 }
 
 /// `YYYY-MM-DD HH:MM` (UTC) from a unix timestamp — no date crate dependency.
@@ -468,6 +470,9 @@ impl GuiApp {
                 self.toast(format!("{} ({dropped})", self.tr("context compacted")));
                 self.view_dirty = true;
             }
+            EvKind::Evolved { summary } => {
+                self.toast(format!("{}: {summary}", self.tr("self-evolved")));
+            }
             EvKind::Touched | EvKind::Done => {
                 // store now has everything streamed so far
                 self.live_text.remove(&ev.session);
@@ -627,7 +632,13 @@ impl eframe::App for GuiApp {
                 let held = ctrl_held && down(VK_V as _);
                 let rising = held && !self.paste_hot;
                 self.paste_hot = held;
-                rising && ctrl_held && !down(VK_SHIFT as _)
+                // GetAsyncKeyState is *global*: without a focus check amty
+                // steals clipboard images when the user pastes into another
+                // app while amty sits in the background.
+                let focused = ctx
+                    .input(|i| i.viewport().focused)
+                    .unwrap_or(true);
+                rising && ctrl_held && !down(VK_SHIFT as _) && focused
             }
             #[cfg(not(target_os = "windows"))]
             {
@@ -788,6 +799,8 @@ impl eframe::App for GuiApp {
                                     new_provider: String::new(),
                                     new_mcp: String::new(),
                                     tab: 0,
+                                    memory: std::fs::read_to_string(crate::config::memory_path())
+                                        .unwrap_or_default(),
                                 });
                             }
                         }
@@ -812,24 +825,10 @@ impl eframe::App for GuiApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                 let metas = self.app.sessions.list();
-                let mut rename: Option<(String, String)> = None;
                 let mut delete: Option<String> = None;
                 for meta in metas {
                     let selected = meta.id == self.current;
                     let running = *self.running.get(&meta.id).unwrap_or(&false);
-                    if self.rename_id.as_deref() == Some(meta.id.as_str()) {
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut self.rename_buf)
-                                .desired_width(f32::INFINITY),
-                        );
-                        resp.request_focus();
-                        let done = resp.lost_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        if done || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                            rename = Some((meta.id.clone(), self.rename_buf.trim().to_string()));
-                        }
-                        continue;
-                    }
                     let label = if running { format!("● {}", meta.title) } else { meta.title.clone() };
                     let resp = ui.selectable_label(selected, label);
                     let hint = format!(
@@ -842,8 +841,12 @@ impl eframe::App for GuiApp {
                     let resp = resp.on_hover_text(hint);
                     resp.context_menu(|ui| {
                         if ui.button(self.tr("rename")).clicked() {
+                            // the edit field lives in the right pane's header —
+                            // select the session so it shows up there
                             self.rename_id = Some(meta.id.clone());
                             self.rename_buf = meta.title.clone();
+                            self.current = meta.id.clone();
+                            self.view_dirty = true;
                             ui.close();
                         }
                         if ui.button(self.tr("delete")).clicked() {
@@ -855,13 +858,6 @@ impl eframe::App for GuiApp {
                         self.current = meta.id.clone();
                         self.view_dirty = true;
                         self.remember_last_session();
-                    }
-                }
-                if let Some((id, title)) = rename {
-                    self.rename_id = None;
-                    if !title.is_empty() {
-                        self.app.sessions.set_title(&id, &title);
-                        self.view_dirty = true;
                     }
                 }
                 if let Some(id) = delete {
@@ -974,6 +970,50 @@ impl eframe::App for GuiApp {
                             )
                         })
                         .inner;
+                    // Text-edit style context menu. Cut/Copy/Select-all are
+                    // forwarded as synthetic events — the focused TextEdit
+                    // consumes them on the next frame (right-click doesn't
+                    // steal its focus). Paste reads the clipboard ourselves:
+                    // text becomes a Paste event, an image is attached.
+                    resp.context_menu(|ui| {
+                        let push = |ui: &mut egui::Ui, e: egui::Event| {
+                            ui.ctx().input_mut(|i| i.events.push(e));
+                            ui.close();
+                        };
+                        if ui.button(self.tr("cut")).clicked() {
+                            push(ui, egui::Event::Cut);
+                        }
+                        if ui.button(self.tr("copy")).clicked() {
+                            push(ui, egui::Event::Copy);
+                        }
+                        if ui.button(self.tr("paste")).clicked() {
+                            let text = arboard::Clipboard::new()
+                                .and_then(|mut c| c.get_text())
+                                .ok()
+                                .filter(|s| !s.is_empty());
+                            match text {
+                                Some(t) => push(ui, egui::Event::Paste(t)),
+                                None => {
+                                    if let Some(Ok(img)) = clipboard_image() {
+                                        self.pending_images.push(img);
+                                    }
+                                    ui.close();
+                                }
+                            }
+                        }
+                        if ui.button(self.tr("select all")).clicked() {
+                            push(
+                                ui,
+                                egui::Event::Key {
+                                    key: egui::Key::A,
+                                    physical_key: None,
+                                    pressed: true,
+                                    repeat: false,
+                                    modifiers: egui::Modifiers::COMMAND,
+                                },
+                            );
+                        }
+                    });
                     let ime = ui.ctx().input(|i| {
                         i.events.iter().any(|e| matches!(e, egui::Event::Ime(_)))
                             || i.raw.events.iter().any(|e| matches!(e, egui::Event::Ime(_)))
@@ -1012,7 +1052,35 @@ impl eframe::App for GuiApp {
             let (prov, model) = self.session_provider();
             ui.horizontal_wrapped(|ui| {
                 if let Some(s) = &self.view {
-                    ui.heading(&s.title);
+                    let (sid, title) = (s.id.clone(), s.title.clone());
+                    if self.rename_id.as_deref() == Some(sid.as_str()) {
+                        // rename in the header: a wide field in the main pane,
+                        // where IME works (the sidebar inline editor didn't)
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.rename_buf)
+                                .desired_width(320.0),
+                        );
+                        if !resp.has_focus() {
+                            resp.request_focus();
+                        }
+                        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            let t = self.rename_buf.trim().to_string();
+                            if !t.is_empty() {
+                                self.app.sessions.set_title(&sid, &t);
+                            }
+                            self.rename_id = None;
+                            self.view_dirty = true;
+                        } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            self.rename_id = None;
+                        }
+                    } else {
+                        let r = ui.heading(&title);
+                        if r.double_clicked() {
+                            self.rename_id = Some(sid.clone());
+                            self.rename_buf = title.clone();
+                        }
+                        r.on_hover_text(self.tr("double-click to rename"));
+                    }
                 } else {
                     ui.heading("amty");
                 }
@@ -1100,11 +1168,7 @@ impl eframe::App for GuiApp {
                         egui::Frame::new()
                             .inner_margin(egui::Margin { left: 0, right: 12, top: 0, bottom: 0 })
                             .show(ui, |ui| {
-                                let ix = table_col_width(t, ui.available_width());
-                                ui.scope(|ui| {
-                                    ui.spacing_mut().interact_size.x = ix;
-                                    egui_commonmark::CommonMarkViewer::new().show(ui, &mut self.mark, &linkify(t));
-                                });
+                                render_md(ui, &mut self.mark, t);
                             });
                     }
                 }
@@ -1615,12 +1679,7 @@ fn render_message(ui: &mut egui::Ui, mark: &mut egui_commonmark::CommonMarkCache
     for (bi, b) in msg.blocks.iter().enumerate() {
         match b {
             Block::Text { text } => {
-                // see `table_col_width`: size table columns from the row width
-                let ix = table_col_width(text, ui.available_width());
-                ui.scope(|ui| {
-                    ui.spacing_mut().interact_size.x = ix;
-                    egui_commonmark::CommonMarkViewer::new().show(ui, mark, &linkify(text));
-                });
+                render_md(ui, mark, text);
             }
             Block::Image { media_type, data, width, height } => {
                 render_attached_image(ui, tex, media_type, data, *width, *height);
@@ -1664,45 +1723,207 @@ fn export_text(text: &str) -> std::io::Result<std::path::PathBuf> {
     Ok(path)
 }
 
-/// Column min-width for the markdown tables in `text`, given the width the
-/// message row has available.
-///
-/// egui_commonmark renders tables with `egui::Grid`, whose column width is
-/// driven by `spacing.interact_size.x` (40 pt by default) — so a 5-column
-/// table only ever gets ~250 pt inside a ~880 pt row and looks cramped. The
-/// same value is the *cell* width cap, so raising it globally would push wide
-/// tables (and code blocks, which size at the same width) past the right edge.
-/// Instead scale it per message from the table's own column count: wide tables
-/// fill the row, narrow ones stay readable, and `>= 0.92` keeps the last column
-/// inside the row.
-fn table_col_width(text: &str, avail: f32) -> f32 {
-    let mut max_cols = 0usize;
-    let mut prev: Option<&str> = None;
+/// A markdown segment: plain markdown, or a parsed pipe table.
+enum Seg {
+    Md(String),
+    Table { headers: Vec<String>, rows: Vec<Vec<String>> },
+}
+
+/// Split `text` into markdown and pipe-table segments, in order. A table is a
+/// `|…|` header line followed by a `|---|` ruler; contiguous `|` lines after
+/// the ruler form the body. Fenced code blocks are never scanned.
+fn split_tables(text: &str) -> Vec<Seg> {
+    let lines: Vec<&str> = text.lines().collect();
+    let is_ruler = |l: &str| {
+        let t = l.trim();
+        t.starts_with('|')
+            && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+            && t.contains('-')
+    };
+    let cells = |l: &str| -> Vec<String> {
+        l.trim().trim_matches('|').split('|').map(|c| c.trim().to_string()).collect()
+    };
+    let mut segs = Vec::new();
+    let mut md = String::new();
     let mut in_fence = false;
-    for line in text.lines() {
-        let l = line.trim();
-        if l.starts_with("```") || l.starts_with("~~~") {
+    let mut i = 0;
+    while i < lines.len() {
+        let l = lines[i];
+        let t = l.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
             in_fence = !in_fence;
-            prev = None;
+            md.push_str(l);
+            md.push('\n');
+            i += 1;
             continue;
         }
-        if !in_fence {
-            if let Some(header) = prev {
-                // a table is a `| … |` line followed by a `|---|:--|` ruler
-                let is_ruler = l.starts_with('|')
-                    && l.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
-                    && l.contains('-');
-                if header.starts_with('|') && is_ruler {
-                    max_cols = max_cols.max(header.trim_matches('|').split('|').count());
-                }
+        if !in_fence && t.starts_with('|') && i + 1 < lines.len() && is_ruler(lines[i + 1]) {
+            if !md.trim().is_empty() {
+                segs.push(Seg::Md(std::mem::take(&mut md)));
+            } else {
+                md.clear();
+            }
+            let headers = cells(l);
+            i += 2;
+            let mut rows = Vec::new();
+            while i < lines.len() && lines[i].trim_start().starts_with('|') {
+                rows.push(cells(lines[i]));
+                i += 1;
+            }
+            segs.push(Seg::Table { headers, rows });
+            continue;
+        }
+        md.push_str(l);
+        md.push('\n');
+        i += 1;
+    }
+    if !md.trim().is_empty() {
+        segs.push(Seg::Md(md));
+    }
+    segs
+}
+
+/// Strip inline markdown (`**`, `` ` ``, `~~`, `[label](url)` → `label`) —
+/// table cells render as plain wrapped labels, not nested markdown.
+fn inline_text(s: &str) -> String {
+    let mut t = s.replace("**", "").replace("__", "").replace("~~", "").replace('`', "");
+    let mut out = String::with_capacity(t.len());
+    while let Some(i) = t.find("](") {
+        let before = &t[..i];
+        if let Some(open) = before.rfind('[') {
+            out.push_str(&before[..open]);
+            out.push_str(&before[open + 1..]);
+        } else {
+            out.push_str(before);
+        }
+        let rest = &t[i + 2..];
+        let close = rest.find(')').unwrap_or(rest.len());
+        t = rest.get(close + 1..).unwrap_or("").to_string();
+    }
+    out.push_str(&t);
+    out
+}
+
+/// Render a pipe table natively. We lay out every cell into a `Galley`
+/// wrapped at the column's width, compute row heights ourselves, allocate one
+/// rect for the whole table, and paint each cell through a per-cell clip —
+/// so a cell can never paint into the next column no matter what egui's
+/// layout helpers would have done.
+fn render_table(ui: &mut egui::Ui, headers: &[String], rows: &[Vec<String>], avail: f32) {
+    fn tw(s: &str) -> f32 {
+        // rough display width in points at egui's default font size
+        s.chars().map(|c| if c.is_ascii() { 7.0 } else { 14.0 }).sum()
+    }
+    let cols = headers.len().max(1);
+    let usable = (avail - 20.0).max(120.0);
+    let mut nat: Vec<f32> = headers.iter().map(|h| tw(h).max(48.0)).collect();
+    nat.resize(cols, 48.0);
+    for r in rows {
+        for (i, c) in r.iter().enumerate().take(cols) {
+            // a single cell may not claim more than 60% of the row
+            nat[i] = nat[i].max(tw(c).min(usable * 0.6));
+        }
+    }
+    let total: f32 = nat.iter().sum();
+    let widths: Vec<f32> = if total <= usable {
+        nat
+    } else {
+        let floor = 48.0f32.min(usable / cols as f32);
+        let mut w: Vec<f32> = nat.iter().map(|n| (n / total * usable).max(floor)).collect();
+        let sum: f32 = w.iter().sum();
+        if sum > usable {
+            let f = usable / sum;
+            for x in &mut w {
+                *x *= f;
             }
         }
-        prev = if in_fence { None } else { Some(l) };
+        w
+    };
+
+    let pad = 5.0f32;
+    let gap = 10.0f32;
+    let font = ui.style().text_styles[&egui::TextStyle::Body].clone();
+    let text_c = ui.visuals().text_color();
+    let head_c = ui.visuals().strong_text_color();
+    let ctx = ui.ctx().clone();
+    let mk = |s: &str, w: f32, c: egui::Color32| -> std::sync::Arc<egui::Galley> {
+        ctx.fonts_mut(|f| f.layout(inline_text(s), font.clone(), c, (w - 2.0 * pad).max(8.0)))
+    };
+    let head_g: Vec<_> = (0..cols)
+        .map(|i| mk(headers.get(i).map(|s| s.as_str()).unwrap_or(""), widths[i], head_c))
+        .collect();
+    let row_g: Vec<Vec<_>> = rows
+        .iter()
+        .map(|r| (0..cols).map(|i| mk(r.get(i).map(|s| s.as_str()).unwrap_or(""), widths[i], text_c)).collect())
+        .collect();
+
+    let head_h = head_g.iter().map(|g| g.size().y).fold(0.0, f32::max) + 2.0 * pad;
+    let row_hs: Vec<f32> = row_g
+        .iter()
+        .map(|r| r.iter().map(|g| g.size().y).fold(0.0, f32::max) + 2.0 * pad)
+        .collect();
+    let table_w = widths.iter().sum::<f32>() + gap * (cols - 1) as f32;
+    let table_h = head_h + row_hs.iter().sum::<f32>() + 2.0;
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(table_w.min(avail), table_h),
+        egui::Sense::hover(),
+    );
+    let p = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+    let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+    p.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
+
+    // column x offsets
+    let mut xs = Vec::with_capacity(cols);
+    let mut x = rect.min.x;
+    for w in &widths {
+        xs.push(x);
+        x += w + gap;
     }
-    if max_cols == 0 || !avail.is_finite() {
-        return 40.0; // egui's default min_col_width
+    // header
+    let mut y = rect.min.y;
+    for (i, g) in head_g.iter().enumerate() {
+        let cell = egui::Rect::from_min_max(
+            egui::pos2(xs[i], y),
+            egui::pos2(xs[i] + widths[i], y + head_h),
+        );
+        p.with_clip_rect(cell).galley(egui::pos2(xs[i] + pad, y + pad), g.clone(), head_c);
     }
-    (avail * 0.92 / max_cols as f32).clamp(40.0, 280.0)
+    y += head_h;
+    p.hline(rect.min.x..=rect.max.x, y, stroke);
+    // body rows (striped)
+    let stripe = ui.visuals().faint_bg_color;
+    for (ri, (r, rh)) in row_g.iter().zip(&row_hs).enumerate() {
+        if ri % 2 == 1 {
+            p.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(rect.min.x, y), egui::vec2(rect.width(), *rh)),
+                0.0,
+                stripe,
+            );
+        }
+        for (i, g) in r.iter().enumerate() {
+            let cell = egui::Rect::from_min_max(
+                egui::pos2(xs[i], y),
+                egui::pos2(xs[i] + widths[i], y + rh),
+            );
+            p.with_clip_rect(cell).galley(egui::pos2(xs[i] + pad, y + pad), g.clone(), text_c);
+        }
+        y += rh;
+    }
+    ui.add_space(4.0);
+}
+
+/// Render a message's markdown: pipe tables are split out and drawn natively
+/// (see `render_table`); everything else goes to egui_commonmark.
+fn render_md(ui: &mut egui::Ui, mark: &mut egui_commonmark::CommonMarkCache, text: &str) {
+    let avail = ui.available_width();
+    for seg in split_tables(text) {
+        match seg {
+            Seg::Md(t) => {
+                egui_commonmark::CommonMarkViewer::new().show(ui, mark, &linkify(&t));
+            }
+            Seg::Table { headers, rows } => render_table(ui, &headers, &rows, avail),
+        }
+    }
 }
 
 /// An image waiting to be sent: base64 PNG bytes plus its natural size.
@@ -1889,7 +2110,87 @@ fn linkify(text: &str) -> String {
             out.push_str(line);
             continue;
         }
-        out.push_str(&linkify_line(line));
+        out.push_str(&pathify_line(&linkify_line(line)));
+    }
+    out
+}
+
+/// `file://` URL for an absolute path (unix /a/b, drive C:\a\b, UNC \\h\s).
+fn file_url(p: &str) -> String {
+    let s = p.replace('\\', "/");
+    if s.starts_with("//") {
+        format!("file:{s}")        // UNC → file://host/share
+    } else if s.starts_with('/') {
+        format!("file://{s}")      // unix abs → file:///a/b
+    } else {
+        format!("file:///{s}")     // drive letter → file:///C:/a
+    }
+}
+
+/// True when `tok` looks like an absolute filesystem path.
+fn is_abs_path(tok: &str) -> bool {
+    let b = tok.as_bytes();
+    if b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') {
+        return true;
+    }
+    if tok.starts_with("\\\\") || tok.starts_with("//") || tok.starts_with("~/") {
+        return tok.len() > 4;
+    }
+    tok.len() > 4 && tok.starts_with('/') && tok[1..].contains('/')
+}
+
+/// Wrap absolute file paths in `file://` markdown links so clicking them in
+/// the chat opens the file/folder with the OS handler. Runs after the URL
+/// pass, skipping autolinks `<…>`, inline code, and markdown link targets.
+fn pathify_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len() + 48);
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut bt = 0usize; // backtick parity
+    while i < line.len() {
+        if bytes[i] == b'`' {
+            bt += 1;
+            out.push('`');
+            i += 1;
+            continue;
+        }
+        // inside <autolink> or `code` — copy through
+        let in_code = bt % 2 == 1;
+        let boundary = i == 0
+            || matches!(bytes[i - 1], b' ' | b'\t' | b'(' | b'"' | b'\'');
+        let rest = &line[i..];
+        // skip markdown link target `](...)` and autolink `<...>` contexts
+        let in_link_target = boundary && out.ends_with("](");
+        if !in_code && boundary && !in_link_target && !rest.starts_with('<') {
+            // candidate: absolute path token
+            let end = rest
+                .find(|c: char| matches!(c, ' ' | '\t' | '(' | '<' | '"' | '\''))
+                .unwrap_or(rest.len());
+            let mut tok = &rest[..end];
+            // strip leading '(' isn't needed — '(' is a boundary
+            while let Some(c) = tok.chars().last() {
+                let unbalanced = c == ')' && tok.matches(')').count() > tok.matches('(').count();
+                if matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')') && (unbalanced || c != ')') {
+                    tok = &tok[..tok.len() - c.len_utf8()];
+                } else {
+                    break;
+                }
+            }
+            if is_abs_path(tok) {
+                let (disp, url) = if let Some(h) = tok.strip_prefix("~/") {
+                    let home = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
+                    (tok.to_string(), file_url(&format!("{home}/{h}")))
+                } else {
+                    (tok.to_string(), file_url(tok))
+                };
+                out.push_str(&format!("[{disp}]({url})"));
+                i += tok.len();
+                continue;
+            }
+        }
+        let ch_len = rest.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&rest[..ch_len]);
+        i += ch_len;
     }
     out
 }
@@ -1959,7 +2260,7 @@ fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut S
             });
             ui.separator();
             // ----- tabs: providers / mcp / skills / behavior -----
-            let tabs = [t("providers"), t("mcp"), t("skills"), t("behavior")];
+            let tabs = [t("providers"), t("mcp"), t("skills"), t("behavior"), t("evolve")];
             ui.horizontal_wrapped(|ui| {
                 for (i, label) in tabs.iter().enumerate() {
                     if ui.selectable_label(buf.tab == i, *label).clicked() {
@@ -2213,6 +2514,29 @@ fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut S
             ui.label(t("system prompt:"));
             ui.add(egui::TextEdit::multiline(&mut buf.cfg.system_prompt).desired_rows(4).desired_width(520.0));
             }
+            if buf.tab == 4 {
+            ui.heading(t("evolve"));
+            ui.weak(t("self-evolution: reflection into MEMORY.md/skills, learned approvals, self-rebuild + idle restart"));
+            ui.checkbox(&mut buf.cfg.evolve.reflect, t("reflect after runs into MEMORY.md"));
+            ui.checkbox(&mut buf.cfg.evolve.skills, t("reflection may create skills"));
+            ui.checkbox(&mut buf.cfg.evolve.self_modify, t("self_update tool (rebuild + restart)"));
+            ui.checkbox(&mut buf.cfg.evolve.auto_restart, t("auto-restart when idle after rebuild"));
+            ui.checkbox(&mut buf.cfg.evolve.learn_approvals, t("auto-allow repeatedly approved commands"));
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(t("memory:"));
+                ui.weak(crate::config::memory_path().display().to_string());
+                if ui.small_button(t("reload")).clicked() {
+                    buf.memory = std::fs::read_to_string(crate::config::memory_path())
+                        .unwrap_or_default();
+                }
+            });
+            ui.add(
+                egui::TextEdit::multiline(&mut buf.memory.as_str())
+                    .desired_rows(12)
+                    .desired_width(520.0),
+            );
+            }
         });
         ui.separator();
         ui.horizontal(|ui| {
@@ -2339,45 +2663,32 @@ mod tests {
     }
 
     #[test]
-    fn table_col_width_scales_with_column_count() {
-        let avail = 867.0;
-        // no table -> egui's default, so prose layout is unchanged
-        assert_eq!(table_col_width("just prose\n", avail), 40.0);
-        // fenced code is not a table even when it contains pipes/rulers
-        assert_eq!(table_col_width("```\n| a | b |\n|---|---|\n```\n", avail), 40.0);
+    fn split_tables_finds_tables_and_skips_fences() {
+        // plain prose -> single markdown segment
+        assert!(matches!(split_tables("just prose\n").as_slice(), [Seg::Md(_)]));
+        // fenced code is not a table even when it looks like one
+        assert!(matches!(split_tables("```\n| a | b |\n|---|---|\n```\n").as_slice(), [Seg::Md(_)]));
         // a pipe line without a ruler is not a table
-        assert_eq!(table_col_width("| not a table |\n| still not |\n", avail), 40.0);
-        // wider tables get narrower columns, but all stay above the default
-        let w3 = table_col_width("| a | b | c |\n|---|---|---|\n| 1 | 2 | 3 |\n", avail);
-        let w8 = table_col_width(
-            "| # | Tool | What | Params | Returns | Notes | Risk | Seen |\n\
-             |---|---|---|---|---|---|---|---|\n| 1 | x | y | z | w | v | u | t |\n",
-            avail,
-        );
-        assert!(w3 > 40.0 && w8 > 40.0);
-        assert!(w3 > w8, "3 columns should get wider columns than 8 ({w3} vs {w8})");
-        assert!(w8 >= 1.0);
-        // a table must not overflow the row: n * ix <= avail
-        for cols in [1usize, 3, 5, 8, 12, 20] {
-            let mut md = String::from("|");
-            for i in 0..cols {
-                md.push_str(&format!(" c{i} |"));
+        assert!(matches!(split_tables("| not a table |\n| still not |\n").as_slice(), [Seg::Md(_)]));
+        let segs = split_tables("before\n| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\nafter\n");
+        assert_eq!(segs.len(), 3);
+        match &segs[1] {
+            Seg::Table { headers, rows } => {
+                assert_eq!(headers, &["a", "b"]);
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0], vec!["1", "2"]);
             }
-            md.push_str("\n|");
-            for _ in 0..cols {
-                md.push_str("---|");
-            }
-            md.push('\n');
-            let ix = table_col_width(&md, avail);
-            let total = ix * cols as f32;
-            assert!(
-                total <= avail + 1.0,
-                "{cols} cols: {total} > {avail} (ix={ix})"
-            );
+            _ => panic!("middle segment should be a table"),
         }
-        // degenerate inputs fall back to the default
-        assert_eq!(table_col_width("| a | b |\n|---|---|\n", 0.0), 40.0);
-        assert_eq!(table_col_width("| a | b |\n|---|---|\n", f32::NAN), 40.0);
+        assert!(matches!(&segs[0], Seg::Md(t) if t.contains("before")));
+        assert!(matches!(&segs[2], Seg::Md(t) if t.contains("after")));
+    }
+
+    #[test]
+    fn inline_text_strips_marks_and_links() {
+        assert_eq!(inline_text("plain"), "plain");
+        assert_eq!(inline_text("**bold** and `code`"), "bold and code");
+        assert_eq!(inline_text("[label](https://a.b/c) here"), "label here");
     }
 
     #[test]

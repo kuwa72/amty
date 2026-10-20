@@ -42,14 +42,28 @@ pub fn start_run_blocks(app: &Arc<App>, session_id: &str, blocks: Vec<Block>) ->
     tokio::spawn(async move {
         run(&app, &sid, blocks).await;
         app.end_run(&sid);
+        // self-evolution: idle-restart (self_update) takes priority, then the
+        // post-run reflection pass may distill lessons into memory/skills
+        crate::evolve::after_run(&app, &sid);
     });
     Ok(())
 }
 
 async fn run(app: &Arc<App>, sid: &str, blocks: Vec<Block>) {
     if let Err(e) = run_inner(app, sid, blocks).await {
+        mark_end(app, sid, &format!("error: {e}"));
         app.emit(sid, EvKind::Error { message: e.to_string() });
     }
+}
+
+/// Persist why a run stopped — a clean Done is self-evident from the
+/// trailing assistant text, but errors/cancels otherwise leave the session
+/// looking "mid-thought" forever with no explanation.
+fn mark_end(app: &Arc<App>, sid: &str, reason: &str) {
+    app.sessions.push_message(
+        sid,
+        ChatMessage::user(format!("[amty: run ended — {reason}]")),
+    );
 }
 
 async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> {
@@ -71,25 +85,30 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
         }
         turn += 1;
         if cancelled() {
+            mark_end(app, sid, "cancelled");
             app.emit(sid, EvKind::Error { message: "cancelled".into() });
             return Ok(());
         }
 
         let session = app.sessions.get(sid).ok_or_else(|| anyhow!("session gone"))?;
-        let (prov_name, prov_conf, model, system, system_tail) = {
+        let (prov_name, prov_conf, model, system, system_tail, self_modify) = {
             let cfg = app.cfg.read().unwrap();
             let name = session.provider.clone().unwrap_or_else(|| cfg.provider.clone());
             let conf = cfg.providers.get(&name).cloned().ok_or_else(|| anyhow!("provider '{name}' not defined"))?;
             let model = session.model.clone().unwrap_or_else(|| conf.model.clone());
-            // skills index is volatile (re-scanned each turn): send it as a
-            // tail so the static system_prompt stays cache-stable
-            (name, conf, model, cfg.system_prompt.clone(), crate::config::skills_prompt())
+            // skills index + memory are volatile (re-scanned each turn): send
+            // them as a tail so the static system_prompt stays cache-stable
+            let tail = format!("{}{}", crate::config::skills_prompt(), crate::evolve::memory_prompt());
+            (name, conf, model, cfg.system_prompt.clone(), tail, cfg.evolve.self_modify)
         };
         if model.is_empty() {
             anyhow::bail!("no model configured for provider '{prov_name}'");
         }
 
         let mut specs = tools::builtin_specs();
+        if !self_modify {
+            specs.retain(|s| s.name != "self_update");
+        }
         specs.extend(app.mcp.specs());
         let max_tokens = prov_conf.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
@@ -207,6 +226,9 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
             app.emit(sid, EvKind::ToolStart { name: name.clone(), detail: detail.clone() });
 
             if let Err(e) = approval_gate(app, sid, &name, &input, &detail, cancelled).await {
+                if e == "denied by user" {
+                    crate::evolve::record_denied(app, &name);
+                }
                 results.push(Block::ToolResult {
                     tool_use_id: id,
                     content: format!("denied: {e}"),
@@ -217,6 +239,7 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
             }
 
             let out = run_tool(app, &name, &input, &cancelled).await;
+            crate::evolve::record_tool(app, &name, out.is_ok());
             match out {
                 Ok(text) => {
                     app.emit(sid, EvKind::ToolEnd {
@@ -252,10 +275,12 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
         app.sessions.push_message(sid, ChatMessage::tool_results(results));
         app.emit(sid, EvKind::Touched);
         if interrupted {
+            mark_end(app, sid, "cancelled");
             app.emit(sid, EvKind::Error { message: "cancelled".into() });
             return Ok(());
         }
     };
+    mark_end(app, sid, &stop_msg);
     app.emit(sid, EvKind::Error { message: stop_msg });
     Ok(())
 }
@@ -313,7 +338,7 @@ async fn approval_gate(
             tools::needs_approval(&cfg, name, input)
         }
     };
-    if !needs {
+    if !needs || crate::evolve::auto_approved(app, name, input) {
         return Ok(());
     }
     let (id, rx) = app.approvals.request(sid, name, detail);
@@ -333,6 +358,7 @@ async fn approval_gate(
     };
     app.emit(sid, EvKind::ApprovalResolved { approval_id: id, allowed });
     if allowed {
+        crate::evolve::record_approved(app, name, input);
         Ok(())
     } else {
         Err("denied by user".into())

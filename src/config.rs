@@ -177,6 +177,38 @@ impl Default for McpServerConf {
     }
 }
 
+/// Self-evolution toggles (`evolve.*` keys). All default on; each can be
+/// disabled independently via `config_set`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EvolveConf {
+    /// After a run ends, ask the provider to distill durable lessons into
+    /// MEMORY.md (and SKILL.md files when `skills` is on).
+    pub reflect: bool,
+    /// Let the reflection pass create/update skills, not just memory.
+    pub skills: bool,
+    /// Expose the `self_update` tool (rebuild the binary, restart on idle).
+    pub self_modify: bool,
+    /// Respawn automatically once all runs are idle after a successful
+    /// rebuild — the "session ended, swap in the new binary" path.
+    pub auto_restart: bool,
+    /// Auto-approve a shell command once the user has approved the exact
+    /// same command line a few times (only in `approval = ask` mode).
+    pub learn_approvals: bool,
+}
+
+impl Default for EvolveConf {
+    fn default() -> Self {
+        Self {
+            reflect: true,
+            skills: true,
+            self_modify: true,
+            auto_restart: true,
+            learn_approvals: true,
+        }
+    }
+}
+
 pub const DEFAULT_SYSTEM: &str = "You are amty, a lightweight desktop AI agent. \
 You can read/write files, run shell commands, and change this app's own settings \
 through the provided tools. Use web_search to look up current information and \
@@ -204,6 +236,8 @@ pub struct Config {
     /// Session id selected when the app last closed; restored on startup so the
     /// chat reopens where the user left off (with that session's provider/model).
     pub last_session: Option<String>,
+    /// Self-evolution toggles.
+    pub evolve: EvolveConf,
 }
 
 impl Default for Config {
@@ -255,6 +289,7 @@ impl Default for Config {
             providers,
             mcp_servers: BTreeMap::new(),
             last_session: None,
+            evolve: EvolveConf::default(),
         }
     }
 }
@@ -280,6 +315,12 @@ pub fn config_path() -> PathBuf {
 
 pub fn runtime_path() -> PathBuf {
     data_dir().join("runtime.json")
+}
+
+/// `<config_dir>/MEMORY.md` — durable notes the reflection pass maintains;
+/// injected into the system tail each turn.
+pub fn memory_path() -> PathBuf {
+    config_dir().join("MEMORY.md")
 }
 
 /// `<config_dir>/skills/<name>/SKILL.md` — agent-run documentation the model
@@ -429,7 +470,8 @@ impl Config {
     ///       allow_commands | allow_paths | +allow_commands | +allow_paths |
     ///       provider.<name>.{model,api_key_env,api_key,base_url,context_window} |
     ///       mcp.<name>.enabled |
-    ///       search.{backend,api_key,api_key_env,base_url,max_results,fetch_max_chars}
+    ///       search.{backend,api_key,api_key_env,base_url,max_results,fetch_max_chars} |
+    ///       evolve.{reflect,skills,self_modify,auto_restart,learn_approvals}
     pub fn apply_set(&mut self, key: &str, value: &str) -> Result<String> {
         match key {
             "provider" => {
@@ -524,6 +566,20 @@ impl Config {
                 }
                 Ok(format!("{key} updated"))
             }
+            _ if key.starts_with("evolve.") => {
+                let field = &key["evolve.".len()..];
+                let v = matches!(value, "true" | "1" | "on" | "yes");
+                let f = match field {
+                    "reflect" => &mut self.evolve.reflect,
+                    "skills" => &mut self.evolve.skills,
+                    "self_modify" => &mut self.evolve.self_modify,
+                    "auto_restart" => &mut self.evolve.auto_restart,
+                    "learn_approvals" => &mut self.evolve.learn_approvals,
+                    _ => bail!("unknown evolve field '{field}'"),
+                };
+                *f = v;
+                Ok(format!("{key} = {v}"))
+            }
             _ if key.starts_with("mcp.") => {
                 let parts: Vec<&str> = key.splitn(3, '.').collect();
                 if parts.len() == 3 && parts[2] == "enabled" {
@@ -605,6 +661,22 @@ impl Config {
             "providers" => Ok(self.providers.keys().cloned().collect::<Vec<_>>().join(", ")),
             "mcp_servers" => Ok(self.mcp_servers.keys().cloned().collect::<Vec<_>>().join(", ")),
             "search" => Ok(self.search.backend.clone()),
+            "evolve" => Ok(format!(
+                "reflect={} skills={} self_modify={} auto_restart={} learn_approvals={}",
+                self.evolve.reflect, self.evolve.skills, self.evolve.self_modify,
+                self.evolve.auto_restart, self.evolve.learn_approvals,
+            )),
+            _ if key.starts_with("evolve.") => {
+                let v = match &key["evolve.".len()..] {
+                    "reflect" => self.evolve.reflect,
+                    "skills" => self.evolve.skills,
+                    "self_modify" => self.evolve.self_modify,
+                    "auto_restart" => self.evolve.auto_restart,
+                    "learn_approvals" => self.evolve.learn_approvals,
+                    _ => bail!("unknown evolve field"),
+                };
+                Ok(v.to_string())
+            }
             _ if key.starts_with("search.") => {
                 let s = &self.search;
                 match &key["search.".len()..] {
@@ -694,6 +766,20 @@ mod tests {
         cfg.apply_set("model", "gpt-x").unwrap();
         assert_eq!(cfg.get("model").unwrap(), "gpt-x");
         assert!(cfg.apply_set("provider", "nope").is_err());
+    }
+
+    #[test]
+    fn apply_set_evolve_keys() {
+        let mut cfg = Config::default();
+        assert!(cfg.evolve.reflect);
+        cfg.apply_set("evolve.reflect", "false").unwrap();
+        cfg.apply_set("evolve.auto_restart", "0").unwrap();
+        assert!(!cfg.evolve.reflect && !cfg.evolve.auto_restart);
+        assert_eq!(cfg.get("evolve.learn_approvals").unwrap(), "true");
+        assert!(cfg.apply_set("evolve.bogus", "true").is_err());
+        // and it survives a toml round-trip
+        let back: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert!(!back.evolve.reflect);
     }
 
     #[test]

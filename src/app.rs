@@ -76,6 +76,12 @@ pub struct App {
     pub runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// catalog id → auth subprocess state
     pub auth: Mutex<HashMap<String, AuthRun>>,
+    /// self-evolution metrics (persisted to <data_dir>/evolve.json)
+    pub stats: Mutex<crate::evolve::Stats>,
+    /// binary to respawn once all runs are idle (self-update)
+    pub restart_pending: Mutex<Option<std::path::PathBuf>>,
+    /// last successfully rebuilt artifact, for `self_update restart`
+    pub built_binary: Mutex<Option<std::path::PathBuf>>,
     pub token: String,
     pub started: u64,
     pub rt: tokio::runtime::Handle,
@@ -113,6 +119,9 @@ impl App {
             events,
             runs: Mutex::new(HashMap::new()),
             auth: Mutex::new(HashMap::new()),
+            stats: Mutex::new(crate::evolve::Stats::load()),
+            restart_pending: Mutex::new(None),
+            built_binary: Mutex::new(None),
             token,
             started: crate::session::now_secs(),
             rt: tokio::runtime::Handle::current(),

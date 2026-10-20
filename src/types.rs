@@ -229,6 +229,8 @@ pub enum EvKind {
     Error { message: String },
     /// Auto-compaction replaced `dropped` messages with a summary.
     Compacted { dropped: usize },
+    /// The self-evolution pass updated memory/skills/config.
+    Evolved { summary: String },
     Touched,
 }
 

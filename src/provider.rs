@@ -1064,6 +1064,64 @@ pub fn context_window(conf: &ProviderConf, model: &str) -> u64 {
     }
 }
 
+/// One-shot text completion: stream a system+user exchange with no tools and
+/// collect the text. Used by auto-compaction and post-run reflection — jobs
+/// that need the model outside the agent loop. Polls `cancelled` the same
+/// way the agent loop does so callers can abort a hung request.
+pub async fn stream_text(
+    prov: &dyn Provider,
+    model: &str,
+    system: &str,
+    user_text: String,
+    max_tokens: u32,
+    cancelled: impl Fn() -> bool,
+) -> Result<String, String> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+    let req = ChatRequest {
+        model: model.into(),
+        max_tokens,
+        system: Some(system.into()),
+        system_tail: None,
+        messages: vec![ChatMessage::user(user_text)],
+        tools: vec![],
+    };
+    let fwd = tokio::spawn(async move {
+        let mut out = String::new();
+        let mut err = None;
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                StreamEvent::Text(t) => out.push_str(&t),
+                StreamEvent::Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+                StreamEvent::Done => break,
+                _ => {}
+            }
+        }
+        (out, err)
+    });
+    {
+        let mut fut = std::pin::pin!(prov.stream(&req, tx));
+        loop {
+            tokio::select! {
+                _ = &mut fut => break,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                    if cancelled() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let (out, err) = fwd.await.map_err(|e| e.to_string())?;
+    match err {
+        Some(e) => Err(e),
+        None if out.trim().is_empty() => Err("empty response".into()),
+        None => Ok(out),
+    }
+}
+
 /// Last-resort model list when `cmdc` can't be run (e.g. not installed on
 /// Windows). The model field stays free-text; these are just menu entries.
 const FALLBACK_CC_MODELS: &[&str] = &[

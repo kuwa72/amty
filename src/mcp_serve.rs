@@ -45,7 +45,7 @@ fn tool_defs() -> Vec<Value> {
     ),
     (
         "amty_set_config",
-        "Change an amty setting. Keys: provider, model, approval, system_prompt, max_tokens, allow_commands, allow_paths, provider.<name>.<field>, mcp.<name>.enabled, search.<field>.",
+        "Change an amty setting. Keys: provider, model, approval, system_prompt, max_tokens, allow_commands, allow_paths, provider.<name>.<field>, mcp.<name>.enabled, search.<field>, evolve.<field>.",
         json!({"type": "object", "properties": {
             "key": {"type": "string"}, "value": {"type": "string"}}, "required": ["key", "value"]}),
     ),
@@ -76,6 +76,14 @@ fn tool_defs() -> Vec<Value> {
         "amty_cancel",
         "Cancel a running turn in a session.",
         json!({"type": "object", "properties": {"session": {"type": "string"}}, "required": []}),
+    ),
+    (
+        "amty_evolve",
+        "Self-evolution control. action=status (default) returns toggles/memory/stats; reflect forces a memory-distillation pass on a session; forget <command> erases a learned auto-approval.",
+        json!({"type": "object", "properties": {
+            "action": {"type": "string", "description": "status | reflect | forget"},
+            "session": {"type": "string", "description": "reflect: session id/prefix"},
+            "command": {"type": "string", "description": "forget: exact command to unlearn"}}}),
     ),
 ]
     .iter()
@@ -168,6 +176,19 @@ async fn call_tool(name: &str, args: &Value) -> Result<Value> {
         "amty_cancel" => {
             let sid = args["session"].as_str().unwrap_or("");
             crate::cli::post(&base, &tok, &format!("/v1/sessions/{sid}/cancel"), json!({})).await
+        }
+        "amty_evolve" => {
+            match args["action"].as_str().unwrap_or("status") {
+                "reflect" => {
+                    crate::cli::post(&base, &tok, "/v1/evolve/reflect",
+                        json!({"session": args["session"].as_str().unwrap_or("")})).await
+                }
+                "forget" => {
+                    crate::cli::post(&base, &tok, "/v1/evolve/forget",
+                        json!({"command": args["command"].as_str().unwrap_or("")})).await
+                }
+                _ => crate::cli::get(&base, &tok, "/v1/evolve").await,
+            }
         }
         _ => Ok(json!({"error": format!("unknown tool {name}")})),
     }
