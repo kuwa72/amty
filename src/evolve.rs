@@ -474,8 +474,101 @@ pub fn start_rebuild(app: &Arc<App>) -> Result<String, String> {
     ))
 }
 
-// ---------- reflection ----------
+// ---------- install a prebuilt artifact ----------
 
+/// Canonicalize + sanity-check an artifact destined to replace the running
+/// exe. Pure filesystem checks only (no spawning), so it is unit-testable.
+fn check_artifact(path: &std::path::Path) -> Result<PathBuf, String> {
+    if !path.exists() {
+        return Err(format!("no such file: {}", path.display()));
+    }
+    if !path.is_file() {
+        return Err(format!("not a file: {}", path.display()));
+    }
+    if cfg!(windows) && path.extension().and_then(|e| e.to_str()) != Some("exe") {
+        return Err(format!(
+            "{} is not a Windows .exe — cross-build it with `cargo build --release --target x86_64-pc-windows-gnu` first",
+            path.display()
+        ));
+    }
+    let canon = std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if let Ok(me) = std::env::current_exe() {
+        if std::fs::canonicalize(&me).map(|m| m == canon).unwrap_or(false) {
+            return Err(
+                "that IS the running binary — use `self_update restart` to relaunch it, or point `path` at a freshly built artifact"
+                    .into(),
+            );
+        }
+    }
+    if std::fs::metadata(&canon).map(|m| m.len()).unwrap_or(0) < 1024 * 1024 {
+        return Err(format!("{} looks too small to be amty (suspicious)", canon.display()));
+    }
+    Ok(canon)
+}
+
+/// Run `<artifact> --version` with a hard timeout. A wrong-platform or corrupt
+/// artifact fails here instead of after the swap, when rolling back is the only
+/// option. Returns the version line on success.
+fn smoke_artifact(path: &PathBuf) -> Result<String, String> {
+    let mut cmd = std::process::Command::new(path);
+    cmd.arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    crate::catalog::no_window(&mut cmd);
+    let mut child = cmd.spawn().map_err(|e| format!("cannot execute {}: {e}", path.display()))?;
+    for _ in 0..100 {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let out = child.wait_with_output().map(|o| {
+                    String::from_utf8_lossy(&o.stdout).trim().to_string()
+                }).unwrap_or_default();
+                if !status.success() {
+                    return Err(format!("{} --version failed ({status})", path.display()));
+                }
+                if !out.contains("amty") {
+                    return Err(format!("{} does not look like amty: {:?}", path.display(), out));
+                }
+                return Ok(out);
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
+    let _ = child.kill();
+    Err(format!("{} --version timed out (binary may be corrupt)", path.display()))
+}
+
+/// Install a prebuilt binary as the next version of amty: it becomes the
+/// restart target, and with `evolve.auto_restart` the swap fires as soon as
+/// the app is idle (the same detached helper as `rebuild`).
+///
+/// This is the deploy path on machines where `rebuild` cannot run — e.g. a
+/// Windows amty cross-built from WSL has `source_dir: null` (its
+/// `CARGO_MANIFEST_DIR` is a /home/... path) and Windows has no cargo.
+pub fn install_artifact(app: &Arc<App>, path: &PathBuf) -> Result<String, String> {
+    let artifact = check_artifact(path)?;
+    let version = smoke_artifact(&artifact)?;
+    *app.built_binary.lock().unwrap() = Some(artifact.clone());
+    let auto = app.cfg.read().unwrap().evolve.auto_restart;
+    log_line(&format!("install: {} ({version})", artifact.display()));
+    if auto {
+        request_restart(app, artifact.clone());
+        Ok(format!(
+            "installed {version} from {}\nThe swap runs through the detached helper once this turn ends (exit → replace {} → relaunch).",
+            artifact.display(),
+            std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "the exe".into()),
+        ))
+    } else {
+        app.emit("", EvKind::Touched);
+        Ok(format!(
+            "installed {version} from {} — `evolve.auto_restart` is off, so call self_update restart when ready",
+            artifact.display()
+        ))
+    }
+}
+
+// ---------- reflection ----------
 /// Minimum new messages since the last reflection before we spend a call.
 const MIN_NEW_MESSAGES: u64 = 6;
 /// Cap on `reflected` watermarks.
@@ -849,8 +942,34 @@ mod tests {
     }
 
     #[test]
-    fn stats_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("amty-evolve-test-{}", uuid::Uuid::new_v4()));
+    fn artifact_checks_reject_junk() {
+        let dir = std::env::temp_dir().join(format!("amty-artifact-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // missing path
+        let missing = dir.join("nope.exe");
+        assert!(check_artifact(&missing).is_err());
+        // a directory is not an artifact
+        assert!(check_artifact(&dir).is_err());
+        // too small to be a binary
+        let tiny = dir.join("tiny.exe");
+        std::fs::write(&tiny, b"hi").unwrap();
+        let err = check_artifact(&tiny).unwrap_err();
+        assert!(err.contains("too small") || cfg!(not(windows)), "{err}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The running exe itself is never a valid install source — restarting into
+    /// it is what `self_update restart` already does.
+    #[test]
+    fn artifact_checks_reject_the_running_exe() {
+        if let Ok(me) = std::env::current_exe() {
+            let err = check_artifact(&me).unwrap_err();
+            assert!(err.contains("IS the running binary") || err.contains("too small"), "{err}");
+        }
+    }
+
+    #[test]
+    fn stats_roundtrip() {        let dir = std::env::temp_dir().join(format!("amty-evolve-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut st = Stats::default();
         st.tools.entry("shell".into()).or_default().calls = 5;
