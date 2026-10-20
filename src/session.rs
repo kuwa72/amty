@@ -1,4 +1,4 @@
-use crate::types::{ChatMessage, Role, Usage};
+use crate::types::{Block, ChatMessage, Role, Usage};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -53,11 +53,94 @@ pub struct SessionMeta {
     pub usage: crate::types::Usage,
 }
 
+/// One cross-session search hit: a matching title or a matching message.
+#[derive(Clone, Debug, Serialize)]
+pub struct SearchHit {
+    pub id: String,
+    pub title: String,
+    /// Session `updated` stamp, so callers can age/sort hits.
+    pub updated: u64,
+    /// `title` for a title hit, otherwise the message role, or `tool` for a
+    /// tool call/result block.
+    pub role: String,
+    /// Index into `Session::messages` — `None` for a title hit.
+    pub msg_index: Option<usize>,
+    /// Single-line excerpt around the first match.
+    pub snippet: String,
+}
+
+/// Characters kept before / after the match inside a snippet.
+const SNIPPET_BEFORE: usize = 40;
+const SNIPPET_AFTER: usize = 120;
+/// Hits reported per session, so one long conversation can't flood results.
+const MAX_HITS_PER_SESSION: usize = 3;
+
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// `YYYY-MM-DD HH:MM` (UTC) from a unix timestamp — no date crate dependency.
+/// Shared by the GUI sidebar and `amty search`.
+pub fn fmt_stamp(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let (h, m) = ((secs / 3600) % 24, (secs / 60) % 60);
+    // days since 1970-01-01 -> civil date (Howard Hinnant's algorithm)
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}")
+}
+
+/// Squash runs of whitespace (newlines included) into single spaces, so a
+/// snippet stays one line in the sidebar and in `amty search` output.
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut spaced = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !spaced {
+                out.push(' ');
+                spaced = true;
+            }
+        } else {
+            out.push(c);
+            spaced = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Excerpt around the first case-insensitive match of `needle` (already
+/// lowercased). Windows are measured in characters, not bytes, so CJK text
+/// (~3 bytes/char) still gets a readable snippet. `None` = no match.
+fn snippet_around(text: &str, needle: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    let at = lower.find(needle)?;
+    // Lowercasing can change byte lengths for a few exotic characters; only
+    // trust the byte offset when the length is unchanged (ASCII/CJK are).
+    let anchor = if lower.len() == text.len() { lower[..at].chars().count() } else { 0 };
+    let chars: Vec<char> = text.chars().collect();
+    let start = anchor.saturating_sub(SNIPPET_BEFORE);
+    let end = (anchor + SNIPPET_AFTER).min(chars.len());
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.extend(&chars[start..end]);
+    if end < chars.len() {
+        out.push('…');
+    }
+    Some(collapse_ws(&out))
 }
 
 pub struct SessionStore {
@@ -287,6 +370,111 @@ impl SessionStore {
         self.map.write().unwrap().remove(id);
         let _ = std::fs::remove_file(self.dir.join(format!("{id}.jsonl")));
     }
+
+    /// Cross-session full-text search over titles, message text and tool
+    /// inputs. Sessions are all in memory, so this is a plain scan; results
+    /// are newest-first and capped at `limit` overall and
+    /// `MAX_HITS_PER_SESSION` per session.
+    pub fn search(&self, query: &str, limit: usize) -> Vec<SearchHit> {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() || limit == 0 {
+            return vec![];
+        }
+        let sessions: Vec<Session> = {
+            let map = self.map.read().unwrap();
+            let mut v: Vec<Session> = map.values().cloned().collect();
+            v.sort_by(|a, b| (b.updated, b.seq).cmp(&(a.updated, a.seq)));
+            v
+        };
+        let mut hits = Vec::new();
+        for s in &sessions {
+            search_session(s, &needle, &mut hits, limit);
+            if hits.len() >= limit {
+                hits.truncate(limit);
+                break;
+            }
+        }
+        hits
+    }
+
+    /// Search inside a single session (id, unique prefix, or empty = newest).
+    pub fn search_in(&self, id: &str, query: &str, limit: usize) -> Vec<SearchHit> {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() || limit == 0 {
+            return vec![];
+        }
+        let s = self.resolve(id).and_then(|sid| self.get(&sid));
+        let Some(s) = s else { return vec![] };
+        let mut hits = Vec::new();
+        search_session(&s, &needle, &mut hits, limit);
+        hits.truncate(limit);
+        hits
+    }
+}
+
+/// Collect up to `MAX_HITS_PER_SESSION` hits for one session. `needle` must
+/// already be lowercased and trimmed.
+fn search_session(s: &Session, needle: &str, hits: &mut Vec<SearchHit>, limit: usize) {
+    let mut per_session = 0usize;
+    // push is a plain fn (not a closure) so the loop can still read
+    // `per_session` for the cap checks
+    let push = |role: &str, msg_index: Option<usize>, snippet: String, per: &mut usize, hits: &mut Vec<SearchHit>| {
+        if *per >= MAX_HITS_PER_SESSION || hits.len() >= limit {
+            return;
+        }
+        *per += 1;
+        hits.push(SearchHit {
+            id: s.id.clone(),
+            title: s.title.clone(),
+            updated: s.updated,
+            role: role.to_string(),
+            msg_index,
+            snippet,
+        });
+    };
+
+    if let Some(sn) = snippet_around(&s.title, needle) {
+        push("title", None, sn, &mut per_session, hits);
+    }
+    for (i, m) in s.messages.iter().enumerate() {
+        if hits.len() >= limit || per_session >= MAX_HITS_PER_SESSION {
+            return;
+        }
+        for b in &m.blocks {
+            match b {
+                Block::Text { text } => {
+                    if let Some(sn) = snippet_around(text, needle) {
+                        push(msg_role(&m.role), Some(i), sn, &mut per_session, hits);
+                    }
+                }
+                Block::ToolUse { name, input, .. } => {
+                    // match the tool name and its arguments on one line, so
+                    // `amty search grep` finds the shell call that ran it
+                    let rendered = match input {
+                        serde_json::Value::String(v) => v.clone(),
+                        _ => input.to_string(),
+                    };
+                    let label = format!("{name} {rendered}");
+                    if let Some(sn) = snippet_around(&label, needle) {
+                        push("tool", Some(i), sn, &mut per_session, hits);
+                    }
+                }
+                Block::ToolResult { content, .. } => {
+                    if let Some(sn) = snippet_around(content, needle) {
+                        push("tool", Some(i), sn, &mut per_session, hits);
+                    }
+                }
+                Block::Image { .. } => {}
+            }
+        }
+    }
+}
+
+fn msg_role(r: &Role) -> &'static str {
+    match r {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+    }
 }
 
 /// The meta line stores everything except messages.
@@ -436,6 +624,120 @@ mod tests {
         assert_eq!(store.resolve(""), Some(b.clone())); // latest
         assert_eq!(store.resolve(&a), Some(a.clone()));
         assert_eq!(store.resolve(&a[..4]), Some(a));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn seed_search_store() -> (SessionStore, PathBuf, String, String) {
+        let (store, dir) = temp_store();
+        let a = store.create(None, None);
+        store.push_message(&a, ChatMessage::user("deploy the WSL build please"));
+        store.push_message(&a, ChatMessage {
+            role: Role::Assistant,
+            blocks: vec![
+                Block::Text { text: "running cargo build --release --target x86_64-pc-windows-gnu".into() },
+                Block::ToolUse {
+                    id: "t1".into(),
+                    name: "shell".into(),
+                    input: serde_json::json!({"command": "cargo test --all-targets"}),
+                },
+            ],
+        });
+        let b = store.create(None, None);
+        store.set_title(&b, "release checklist");
+        store.push_message(&b, ChatMessage::user("nothing relevant here"));
+        (store, dir, a, b)
+    }
+
+    #[test]
+    fn search_matches_text_and_tool_input() {
+        let (store, dir, a, _b) = seed_search_store();
+        let hits = store.search("cargo", 20);
+        assert!(hits.iter().any(|h| h.id == a && h.role == "assistant"));
+        // tool calls are searchable: name + arguments
+        let tool_hits = store.search("--all-targets", 20);
+        assert!(tool_hits.iter().any(|h| h.id == a && h.role == "tool"));
+        // and tool names
+        assert!(store.search("shell", 20).iter().any(|h| h.id == a));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn search_matches_titles_and_is_case_insensitive() {
+        let (store, dir, _a, b) = seed_search_store();
+        let hits = store.search("RELEASE CHECKLIST", 20);
+        assert!(hits.iter().any(|h| h.id == b && h.role == "title"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn search_returns_empty_for_blank_or_absent_queries() {
+        let (store, dir, _a, _b) = seed_search_store();
+        assert!(store.search("", 20).is_empty());
+        assert!(store.search("   ", 20).is_empty());
+        assert!(store.search("zzz-not-present-zzz", 20).is_empty());
+        assert!(store.search("cargo", 0).is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn search_respects_limit_and_per_session_cap() {
+        let (store, dir) = temp_store();
+        let id = store.create(None, None);
+        for i in 0..10 {
+            store.push_message(&id, ChatMessage::user(format!("needle message {i}")));
+        }
+        // one session cannot flood: at most MAX_HITS_PER_SESSION hits
+        let hits = store.search("needle", 50);
+        assert_eq!(hits.len(), MAX_HITS_PER_SESSION);
+        // an explicit limit is honoured across sessions
+        let hits = store.search("needle", 2);
+        assert_eq!(hits.len(), 2);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn search_in_limits_to_one_session() {
+        let (store, dir, a, _b) = seed_search_store();
+        let all = store.search("cargo", 20);
+        let only = store.search_in(&a, "cargo", 20);
+        assert!(!only.is_empty());
+        assert_eq!(all.len(), only.len());
+        assert!(only.iter().all(|h| h.id == a));
+        // an unknown session yields nothing rather than an error
+        assert!(store.search_in("nope", "cargo", 20).is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn snippet_is_single_line_and_cjk_safe() {
+        let long = format!("{}{}{}", "あ".repeat(200), "キーワード", "い".repeat(200));
+        // note: Unicode lowercasing leaves kana alone, so CJK matching is a
+        // plain substring test — only Latin case varies
+        let sn = snippet_around(&long, "キーワード").expect("CJK substring match");
+        assert!(!sn.contains('\n'));
+        assert!(sn.contains("キーワード"));
+        assert!(sn.len() < long.len());
+        assert!(sn.starts_with('…') && sn.ends_with('…'));
+        // whitespace (newlines included) collapses to single spaces
+        let sn = snippet_around("line one\n\n  line two hit here", "hit").unwrap();
+        assert_eq!(sn, "line one line two hit here");
+        // no match -> no snippet, and offsets never split a character
+        assert!(snippet_around("abc", "zzz").is_none());
+        let wide = snippet_around(&"漢".repeat(400), "漢").unwrap();
+        assert_eq!(wide.chars().count(), SNIPPET_AFTER + 1); // + leading ellipsis
+        // the caller lowercases the needle, so Latin case folds
+        assert!(snippet_around("Cargo Test", "cargo test").is_some());
+    }
+
+    #[test]
+    fn hits_come_back_newest_first() {
+        let (store, dir) = temp_store();
+        let old = store.create(None, None);
+        store.push_message(&old, ChatMessage::user("shared term"));
+        let new = store.create(None, None);
+        store.push_message(&new, ChatMessage::user("shared term again"));
+        let hits = store.search("shared term", 10);
+        assert_eq!(hits[0].id, new, "newest session first");
         std::fs::remove_dir_all(dir).ok();
     }
 }

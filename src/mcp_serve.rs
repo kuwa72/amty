@@ -18,6 +18,15 @@ fn tool_defs() -> Vec<Value> {
         json!({"type": "object", "properties": {}}),
     ),
     (
+        "amty_search_sessions",
+        "Full-text search across chat sessions (titles, message text, tool calls). Returns matching sessions with a one-line excerpt per hit.",
+        json!({"type": "object", "properties": {
+            "query": {"type": "string", "description": "text to look for (case-insensitive substring)"},
+            "session": {"type": "string", "description": "limit the search to one session id/prefix"},
+            "limit": {"type": "integer", "description": "max hits (default 50)"}},
+         "required": ["query"]}),
+    ),
+    (
         "amty_new_session",
         "Create a new chat session. Returns its id.",
         json!({"type": "object", "properties": {
@@ -101,6 +110,15 @@ async fn call_tool(name: &str, args: &Value) -> Result<Value> {
     match name {
         "amty_status" => crate::cli::get(&base, &tok, "/v1/status").await,
         "amty_list_sessions" => crate::cli::get(&base, &tok, "/v1/sessions").await,
+        "amty_search_sessions" => {
+            let q = crate::cli::url_encode(args["query"].as_str().unwrap_or(""));
+            let limit = args["limit"].as_u64().unwrap_or(50);
+            let mut path = format!("/v1/search?q={q}&limit={limit}");
+            if let Some(sid) = args["session"].as_str().filter(|s| !s.is_empty()) {
+                path.push_str(&format!("&session={}", crate::cli::url_encode(sid)));
+            }
+            crate::cli::get(&base, &tok, &path).await
+        }
         "amty_new_session" => {
             crate::cli::post(&base, &tok, "/v1/sessions", json!({
                 "provider": args["provider"], "model": args["model"], "title": args["title"],

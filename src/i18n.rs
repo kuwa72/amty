@@ -33,6 +33,12 @@ static JA: &[(&str, &str)] = &[
     ("rename", "名前を変更"),
     ("delete", "削除"),
     ("messages", "メッセージ"),
+    // search
+    ("search title, then Enter for full text", "タイトル検索 (Enterで本文も検索)"),
+    ("clear", "クリア"),
+    ("no matches", "一致なし"),
+    ("title", "タイトル"),
+    ("tool", "ツール"),
     ("shell and file writes run without asking", "シェルとファイル書き込みが確認なしで実行されます"),
     ("connected", "接続中"),
     ("servers", "サーバー"),

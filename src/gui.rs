@@ -303,21 +303,20 @@ struct SettingsBuf {
     memory: String,
 }
 
-/// `YYYY-MM-DD HH:MM` (UTC) from a unix timestamp — no date crate dependency.
-fn stamp(secs: u64) -> String {    let days = (secs / 86_400) as i64;
-    let (h, m) = ((secs / 3600) % 24, (secs / 60) % 60);
-    // days since 1970-01-01 -> civil date (Howard Hinnant's algorithm)
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if mo <= 2 { y + 1 } else { y };
-    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}")
+/// `YYYY-MM-DD HH:MM` (UTC) from a unix timestamp — lives in `session` so the
+/// CLI prints the same format.
+fn stamp(secs: u64) -> String {
+    crate::session::fmt_stamp(secs)
+}
+
+/// i18n key for a `SearchHit.role` value (English key = the fallback).
+fn role_label(role: &str) -> &'static str {
+    match role {
+        "title" => "title",
+        "user" => "you",
+        "assistant" => "assistant",
+        _ => "tool",
+    }
 }
 
 pub struct GuiApp {
@@ -360,6 +359,12 @@ pub struct GuiApp {
     cat_env: HashMap<String, String>,
     /// keys-file source path inputs, per catalog id
     cat_keys: HashMap<String, String>,
+    /// sidebar search box: live title filter, Enter = full-text search
+    search_buf: String,
+    /// full-text hits from the last Enter (`None` = title filtering only)
+    search_hits: Option<Vec<crate::session::SearchHit>>,
+    /// value of `search_buf` the current `search_hits` were computed for
+    search_for: String,
     /// Windows: Ctrl+V is currently held (rising-edge debounce for image paste)
     paste_hot: bool,
 }
@@ -405,6 +410,9 @@ impl GuiApp {
             cat_sel: None,
             cat_env: HashMap::new(),
             cat_keys: HashMap::new(),
+            search_buf: String::new(),
+            search_hits: None,
+            search_for: String::new(),
             paste_hot: false,
         }
     }
@@ -506,7 +514,6 @@ impl GuiApp {
     fn tr(&self, key: &'static str) -> &'static str {
         crate::i18n::t(&self.app.cfg.read().unwrap().lang, key)
     }
-
     /// Remember which session is selected, so the next launch reopens it (and
     /// with it the session's provider/model). `last_session` holds the *id*;
     /// `sessions.resolve` accepts a unique prefix too, so a stale id simply
@@ -819,12 +826,74 @@ impl eframe::App for GuiApp {
                     self.remember_last_session();
                 }
             });
+            // ----- search: typing filters titles, Enter searches message text -----
+            ui.horizontal(|ui| {
+                let hint = self.tr("search title, then Enter for full text");
+                let clear_w = if self.search_buf.is_empty() { 0.0 } else { 22.0 };
+                let edit_w = (ui.available_width() - clear_w).max(60.0);
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.search_buf)
+                        .hint_text(hint)
+                        .desired_width(edit_w),
+                );
+                if !self.search_buf.is_empty() && ui.small_button("✕").on_hover_text(self.tr("clear")).clicked() {
+                    self.search_buf.clear();
+                    self.search_hits = None;
+                }
+                let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if entered || (self.search_hits.is_some() && self.search_buf != self.search_for) {
+                    // re-run on Enter, and refresh live while a result list is
+                    // already shown (so the box stays honest after an edit)
+                    if self.search_buf.trim().is_empty() {
+                        self.search_hits = None;
+                        self.search_for.clear();
+                    } else if entered || self.search_hits.is_some() {
+                        self.search_hits = Some(self.app.sessions.search(&self.search_buf, 50));
+                        self.search_for = self.search_buf.clone();
+                    }
+                }
+            });
             ui.separator();
             egui::ScrollArea::vertical()
                 .id_salt("sessions")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                let metas = self.app.sessions.list();
+                if let Some(hits) = self.search_hits.clone() {
+                    // ----- full-text result list: click a hit to open it -----
+                    if hits.is_empty() {
+                        ui.weak(self.tr("no matches"));
+                    }
+                    for (n, h) in hits.iter().enumerate() {
+                        let head = format!("{} · {}", h.title, self.tr(role_label(&h.role)));
+                        let sub = format!("{} {}\n{}", h.id, crate::session::fmt_stamp(h.updated), h.snippet);
+                        let resp = ui.selectable_label(h.id == self.current, egui::RichText::new(head).small());
+                        if resp.on_hover_text(sub).clicked() {
+                            self.current = h.id.clone();
+                            self.view_dirty = true;
+                            self.remember_last_session();
+                        }
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&h.snippet)
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                            )
+                            .truncate(),
+                        );
+                        if n + 1 < hits.len() {
+                            ui.separator();
+                        }
+                    }
+                    return;
+                }
+                let filter = self.search_buf.trim().to_lowercase();
+                let metas: Vec<_> = self
+                    .app
+                    .sessions
+                    .list()
+                    .into_iter()
+                    .filter(|m| filter.is_empty() || m.title.to_lowercase().contains(&filter))
+                    .collect();
                 let mut delete: Option<String> = None;
                 for meta in metas {
                     let selected = meta.id == self.current;

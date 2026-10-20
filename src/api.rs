@@ -21,6 +21,7 @@ pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/v1/status", get(status))
         .route("/v1/sessions", get(list_sessions).post(new_session))
+        .route("/v1/search", get(search_sessions))
         .route("/v1/sessions/{id}", get(get_session).delete(delete_session))
         .route("/v1/sessions/{id}/messages", post(send_message))
         .route("/v1/sessions/{id}/cancel", post(cancel))
@@ -90,6 +91,37 @@ async fn status(State(app): State<Arc<App>>) -> Json<Value> {
 
 async fn list_sessions(State(app): State<Arc<App>>) -> Json<Value> {
     Json(json!(app.sessions.list()))
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    #[serde(default)]
+    q: String,
+    /// session id / unique prefix to search inside (default: all sessions)
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// `GET /v1/search?q=…[&session=<id>][&limit=N]` — cross-session full-text
+/// search over titles, message text and tool calls.
+async fn search_sessions(
+    State(app): State<Arc<App>>,
+    axum::extract::Query(q): axum::extract::Query<SearchQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let hits = match q.session.as_deref().filter(|s| !s.is_empty()) {
+        Some(sid) => {
+            let resolved = app
+                .sessions
+                .resolve(sid)
+                .ok_or((StatusCode::NOT_FOUND, format!("no session matching '{sid}'")))?;
+            app.sessions.search_in(&resolved, &q.q, limit)
+        }
+        None => app.sessions.search(&q.q, limit),
+    };
+    Ok(Json(json!({"query": q.q, "limit": limit, "n": hits.len(), "hits": hits})))
 }
 
 #[derive(Deserialize)]
