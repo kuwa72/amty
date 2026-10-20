@@ -1640,10 +1640,15 @@ fn render_message(ui: &mut egui::Ui, mark: &mut egui_commonmark::CommonMarkCache
             Some(r) => ui.ctx().pointer_hover_pos().map(|p| r.contains(p)).unwrap_or(false),
             None => false,
         };
+        // the ⋯ popup opens on a layer below the row, so the pointer leaves
+        // the row rect as soon as it opens; keep the actions rendered while
+        // the popup is open or the menu could never be clicked
+        let menu_id = ui.id().with(idx);
+        let show_actions = hovered || egui::Popup::is_id_open(ui.ctx(), menu_id);
         let head = ui.horizontal(|ui| {
             ui.colored_label(color, label);
             let text = msg.text_content();
-            if hovered && !text.trim().is_empty() {
+            if show_actions && !text.trim().is_empty() {
                 if ui.small_button(t("copy")).clicked() {
                     action = Some(MsgAction::Copy(text.clone()));
                 }
@@ -1652,8 +1657,9 @@ fn render_message(ui: &mut egui::Ui, mark: &mut egui_commonmark::CommonMarkCache
                 }
             }
                         // action handlers below in the same function
-            if hovered {
-                ui.menu_button("⋯", |ui| {
+            if show_actions {
+                let more = ui.add(egui::Button::new("⋯"));
+                egui::Popup::menu(&more).id(menu_id).show(|ui| {
                     ui.add_enabled_ui(!running, |ui| {
                         if ui.button(t("rewind to here")).clicked() {
                             action = Some(MsgAction::Rewind(idx));
