@@ -157,12 +157,13 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "self_update".into(),
-            description: "Self-evolution control. actions: status (memory/stats/build state) | reflect (force a memory-distillation pass on a session) | rebuild (cargo build amty from its own source tree, detached; on success the new binary is installed over the running exe and the app restarts when idle — a detached helper process does the swap, so it works even though a running exe can't be overwritten) | restart (schedule that restart manually) | forget (erase a learned auto-approval; pass the exact command in `command`). Rebuild needs the checkout this binary was built from.".into(),
+            description: "Self-evolution control. actions: status (memory/stats/build state) | reflect (force a memory-distillation pass on a session) | rebuild (cargo build amty from its own source tree, detached; on success the new binary is installed over the running exe and the app restarts when idle — a detached helper process does the swap, so it works even though a running exe can't be overwritten) | install (take an ALREADY BUILT binary — `path` — after checking it runs, and make it the next version; use this when rebuild can't work, e.g. a cross-built Windows exe on a machine without cargo) | restart (schedule that restart manually) | forget (erase a learned auto-approval; pass the exact command in `command`). Rebuild needs the checkout this binary was built from; install only needs the artifact.".into(),
             schema: schema(
                 json!({
                     "action": {"type": "string"},
                     "session": {"type": "string", "description": "reflect action: session id or prefix; empty = most recent"},
-                    "command": {"type": "string", "description": "forget action: exact command to unlearn"}
+                    "command": {"type": "string", "description": "forget action: exact command to unlearn"},
+                    "path": {"type": "string", "description": "install action: absolute path of the built binary to install (e.g. target/x86_64-pc-windows-gnu/release/amty.exe)"}
                 }),
                 &["action"],
             ),
@@ -210,8 +211,8 @@ pub fn needs_approval(cfg: &Config, name: &str, input: &Value) -> bool {
     // `mcp` is Safe only for read actions; mutations count as Write.
     let mutating_mcp = name == "mcp"
         && !matches!(input["action"].as_str().unwrap_or("list"), "list" | "tools");
-    // `self_update` read actions (status, reflect) are safe; rebuild/restart
-    // count as Exec — they spawn a build and can kill the process.
+    // `self_update` read actions (status, reflect) are safe; rebuild/install/
+    // restart count as Exec — they spawn a build or replace the running exe.
     let mutating_su = name == "self_update"
         && !matches!(input["action"].as_str().unwrap_or("status"), "status" | "reflect");
     let risk = if mutating_mcp {
@@ -448,6 +449,12 @@ pub async fn execute(app: &std::sync::Arc<App>, name: &str, input: &Value) -> Re
                     crate::evolve::reflect_now(app, session).await
                 }
                 "rebuild" => crate::evolve::start_rebuild(app),
+                "install" => {
+                    let p = input["path"]
+                        .as_str()
+                        .ok_or("install requires `path` (the built binary to install)")?;
+                    crate::evolve::install_artifact(app, &PathBuf::from(p))
+                }
                 "restart" => {
                     let target = app
                         .built_binary
@@ -467,7 +474,7 @@ pub async fn execute(app: &std::sync::Arc<App>, name: &str, input: &Value) -> Re
                         format!("not learned: {cmd}")
                     })
                 }
-                _ => Err(format!("unknown action '{action}' (status|reflect|rebuild|restart|forget)")),
+                _ => Err(format!("unknown action '{action}' (status|reflect|rebuild|install|restart|forget)")),
             }
         }
         "mcp_install" => {
@@ -1237,6 +1244,8 @@ mod tests {
         assert!(!needs_approval(&ask, "self_update", &json!({"action": "reflect"})));
         assert!(needs_approval(&ask, "self_update", &json!({"action": "rebuild"})));
         assert!(needs_approval(&ask, "self_update", &json!({"action": "restart"})));
+        // install replaces the running exe — never silently allowed
+        assert!(needs_approval(&ask, "self_update", &json!({"action": "install", "path": "/tmp/amty"})));
         let auto = cfg(ApprovalMode::Auto);
         assert!(!needs_approval(&auto, "self_update", &json!({"action": "rebuild"})));
     }
