@@ -13,6 +13,11 @@ use tokio::sync::{mpsc, oneshot};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// How long a dying server gets to finish flushing stderr before the failure
+/// reason is frozen. Servers that are actually exiting close the pipe well
+/// inside this; a server that merely dropped stdin is not waited on for long.
+const STDERR_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// Clip an MCP tool result to [`crate::tools::MAX_OUT`].
 ///
 /// MCP servers return screen dumps and document bodies, so this is the path that
@@ -31,7 +36,7 @@ struct Rpc {
     tx: mpsc::UnboundedSender<Value>,
     child: Mutex<Child>,
     /// last bytes of the server's stderr — included in failure status
-    stderr_tail: Arc<Mutex<String>>,
+    stderr_tail: Arc<StderrState>,
     /// Why the child's stdout closed, once it has (EOF or read error).
     ///
     /// Set *before* the pending map is drained, so a call that registers after
@@ -41,13 +46,45 @@ struct Rpc {
     dead: Arc<Mutex<Option<String>>>,
 }
 
+/// Bytes a dead stdio server has said on stderr so far.
+///
+/// The reader task fills `text` in 4 KB chunks and sets `eof` when the pipe
+/// closes. Death is usually detected on the stdin/stdout side, which races the
+/// stderr reader: a server that dies immediately has written its complaint but
+/// the tail is still empty when the reason is composed
+/// (`dead_server_is_reported_with_its_stderr` failed on CI exactly this way).
+/// `settle` closes that gap by waiting for `eof` before the reason is frozen.
+#[derive(Default)]
+struct StderrState {
+    text: Mutex<String>,
+    eof: std::sync::atomic::AtomicBool,
+}
+
+impl StderrState {
+    /// Wait up to `budget` for the stderr pipe to close, so the tail is complete.
+    ///
+    /// Polls the flag instead of waiting on a `Notify`: the reader can reach EOF
+    /// *before* the failing task gets here, and `notify_waiters` would then be
+    /// lost, costing a full `budget` on every death. Costs nothing when the pipe
+    /// has already closed (`echo boom; exit` — the common case).
+    async fn settle(&self, budget: std::time::Duration) {
+        let deadline = tokio::time::Instant::now() + budget;
+        while !self.eof.load(Ordering::SeqCst) {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+}
+
 /// Human-readable "why did the transport die" text for a dead stdio server.
 ///
 /// Includes the server's stderr tail when it said anything — a crash usually
 /// explains itself there, and that is exactly what the caller cannot see when
 /// the tool call just hangs.
-fn dead_reason(why: &str, stderr_tail: &Mutex<String>) -> String {
-    let tail = stderr_tail.lock().map(|t| t.trim().to_string()).unwrap_or_default();
+fn dead_reason(why: &str, stderr: &StderrState) -> String {
+    let tail = stderr.text.lock().map(|t| t.trim().to_string()).unwrap_or_default();
     if tail.is_empty() {
         why.to_string()
     } else {
@@ -60,16 +97,21 @@ fn dead_reason(why: &str, stderr_tail: &Mutex<String>) -> String {
 ///
 /// The dead flag is published first: `Rpc::call` re-checks it after inserting
 /// into `pending`, so an insert that races this drain cannot be left stranded.
-fn fail_pending(
+///
+/// `stderr` is settled first (bounded) so the message carries the server's last
+/// words even when death was detected before the stderr reader caught up.
+async fn fail_pending(
     name: &str,
     pending: &Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
     dead: &Mutex<Option<String>>,
-    reason: &str,
+    why: &str,
+    stderr: &StderrState,
 ) {
+    stderr.settle(STDERR_SETTLE).await;
     let reason = {
         let mut d = dead.lock().unwrap();
         if d.is_none() {
-            *d = Some(reason.to_string());
+            *d = Some(dead_reason(why, stderr));
         }
         d.clone().unwrap_or_default()
     };
@@ -99,7 +141,7 @@ impl Rpc {
         let mut child = cmd.spawn().context(format!("spawn '{prog}'"))?;
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
-        let stderr_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let stderr_tail: Arc<StderrState> = Arc::new(StderrState::default());
         if let Some(stderr) = child.stderr.take() {
             let tail = stderr_tail.clone();
             tokio::spawn(async move {
@@ -110,13 +152,15 @@ impl Rpc {
                     if n == 0 {
                         break;
                     }
-                    let mut t = tail.lock().unwrap();
+                    let mut t = tail.text.lock().unwrap();
                     t.push_str(&String::from_utf8_lossy(&buf[..n]));
                     if t.len() > 4096 {
                         let cut = t.len() - 4096;
                         t.drain(..cut);
                     }
                 }
+                // pipe closed: everything the server ever said is now in `text`
+                tail.eof.store(true, Ordering::SeqCst);
             });
         }
         let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
@@ -135,12 +179,7 @@ impl Rpc {
                 while let Some(msg) = rx.recv().await {
                     let line = serde_json::to_string(&msg).unwrap_or_default() + "\n";
                     if stdin.write_all(line.as_bytes()).await.is_err() {
-                        fail_pending(
-                            &name_w,
-                            &pending_w,
-                            &dead_w,
-                            &dead_reason("stdin closed", &tail),
-                        );
+                        fail_pending(&name_w, &pending_w, &dead_w, "stdin closed", &tail).await;
                         break;
                     }
                 }
@@ -163,21 +202,11 @@ impl Rpc {
                         // shutdown) — nothing will ever answer the calls that
                         // are still in flight, so fail them now instead of
                         // letting each one burn its full timeout.
-                        fail_pending(
-                            &name_r,
-                            &pending_r,
-                            &dead_r,
-                            &dead_reason("server exited", &tail_r),
-                        );
+                        fail_pending(&name_r, &pending_r, &dead_r, "server exited", &tail_r).await;
                         break;
                     }
                     Err(e) => {
-                        fail_pending(
-                            &name_r,
-                            &pending_r,
-                            &dead_r,
-                            &dead_reason(&e.to_string(), &tail_r),
-                        );
+                        fail_pending(&name_r, &pending_r, &dead_r, &e.to_string(), &tail_r).await;
                         break;
                     }
                 };
@@ -516,7 +545,7 @@ impl Manager {
         // attach the server's stderr tail so config/setup errors are visible
         let with_err = |e: anyhow::Error| -> anyhow::Error {
             let tail = match &rpc {
-                Transport::Stdio(r) => r.stderr_tail.lock().unwrap().trim().to_string(),
+                Transport::Stdio(r) => r.stderr_tail.text.lock().unwrap().trim().to_string(),
                 _ => String::new(),
             };
             if tail.is_empty() {
