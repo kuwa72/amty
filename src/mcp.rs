@@ -24,16 +24,64 @@ pub fn cap_result(text: String) -> String {
 }
 
 struct Rpc {
+    /// server id from config — used in every error message
+    name: String,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
     next: AtomicU64,
     tx: mpsc::UnboundedSender<Value>,
     child: Mutex<Child>,
     /// last bytes of the server's stderr — included in failure status
     stderr_tail: Arc<Mutex<String>>,
+    /// Why the child's stdout closed, once it has (EOF or read error).
+    ///
+    /// Set *before* the pending map is drained, so a call that registers after
+    /// the drain still sees it. Without this a crashed server leaves every
+    /// `call()` waiting for its full timeout (issue #15: two
+    /// `create_pull_request` calls silently blocked for 120 s each).
+    dead: Arc<Mutex<Option<String>>>,
+}
+
+/// Human-readable "why did the transport die" text for a dead stdio server.
+///
+/// Includes the server's stderr tail when it said anything — a crash usually
+/// explains itself there, and that is exactly what the caller cannot see when
+/// the tool call just hangs.
+fn dead_reason(why: &str, stderr_tail: &Mutex<String>) -> String {
+    let tail = stderr_tail.lock().map(|t| t.trim().to_string()).unwrap_or_default();
+    if tail.is_empty() {
+        why.to_string()
+    } else {
+        let tail: String = tail.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
+        format!("{why}; stderr: {tail}")
+    }
+}
+
+/// Mark the transport dead and fail every waiting call with `reason`.
+///
+/// The dead flag is published first: `Rpc::call` re-checks it after inserting
+/// into `pending`, so an insert that races this drain cannot be left stranded.
+fn fail_pending(
+    name: &str,
+    pending: &Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
+    dead: &Mutex<Option<String>>,
+    reason: &str,
+) {
+    let reason = {
+        let mut d = dead.lock().unwrap();
+        if d.is_none() {
+            *d = Some(reason.to_string());
+        }
+        d.clone().unwrap_or_default()
+    };
+    let msg = format!("mcp server '{name}' is not running: {reason}");
+    let waiting: Vec<_> = pending.lock().unwrap().drain().collect();
+    for (_, tx) in waiting {
+        let _ = tx.send(Err(msg.clone()));
+    }
 }
 
 impl Rpc {
-    fn spawn(conf: McpServerConf) -> Result<Arc<Self>> {
+    fn spawn(conf: McpServerConf, name: &str) -> Result<Arc<Self>> {
         // Windows: bare names like `npx` resolve to .cmd shims CreateProcess
         // can't launch directly — resolve to a concrete path first.
         let prog = crate::catalog::resolve_spawn_command(&conf.command);
@@ -74,24 +122,65 @@ impl Rpc {
         let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let dead: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         // writer task
-        tokio::spawn(async move {
-            let mut stdin = stdin;
-            while let Some(msg) = rx.recv().await {
-                let line = serde_json::to_string(&msg).unwrap_or_default() + "\n";
-                if stdin.write_all(line.as_bytes()).await.is_err() {
-                    break;
+        {
+            let dead_w = dead.clone();
+            let pending_w = pending.clone();
+            let tail = stderr_tail.clone();
+            let name_w = name.to_string();
+            tokio::spawn(async move {
+                let mut stdin = stdin;
+                while let Some(msg) = rx.recv().await {
+                    let line = serde_json::to_string(&msg).unwrap_or_default() + "\n";
+                    if stdin.write_all(line.as_bytes()).await.is_err() {
+                        fail_pending(
+                            &name_w,
+                            &pending_w,
+                            &dead_w,
+                            &dead_reason("stdin closed", &tail),
+                        );
+                        break;
+                    }
                 }
-            }
-        });
+            });
+        }
 
         // reader task — also answers server→client requests
         let pending_r = pending.clone();
         let tx_r = tx.clone();
+        let dead_r = dead.clone();
+        let tail_r = stderr_tail.clone();
+        let name_r = name.to_string();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            loop {
+                let line = match lines.next_line().await {
+                    Ok(Some(line)) => line,
+                    Ok(None) => {
+                        // EOF: the server exited (crash, kill, or a clean
+                        // shutdown) — nothing will ever answer the calls that
+                        // are still in flight, so fail them now instead of
+                        // letting each one burn its full timeout.
+                        fail_pending(
+                            &name_r,
+                            &pending_r,
+                            &dead_r,
+                            &dead_reason("server exited", &tail_r),
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        fail_pending(
+                            &name_r,
+                            &pending_r,
+                            &dead_r,
+                            &dead_reason(&e.to_string(), &tail_r),
+                        );
+                        break;
+                    }
+                };
                 let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
                 let id = v.get("id").and_then(|i| i.as_u64());
                 if v.get("method").is_some() {
@@ -123,22 +212,48 @@ impl Rpc {
             }
         });
 
-        Ok(Arc::new(Self { pending, next: AtomicU64::new(1), tx, child: Mutex::new(child), stderr_tail }))
+        Ok(Arc::new(Self {
+            name: name.to_string(),
+            pending,
+            next: AtomicU64::new(1),
+            tx,
+            child: Mutex::new(child),
+            stderr_tail,
+            dead,
+        }))
     }
 
     async fn call(&self, method: &str, params: Value, timeout_s: u64) -> Result<Value> {
+        // fail fast on a server that already closed its pipe (issue #15)
+        if let Some(why) = self.dead_reason() {
+            bail!("mcp server '{}' is not running: {why}", self.name);
+        }
         let id = self.next.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
+        // the reader may have drained `pending` between the check above and the
+        // insert — re-check so this call can't be stranded either
+        if let Some(why) = self.dead_reason() {
+            self.pending.lock().unwrap().remove(&id);
+            bail!("mcp server '{}' is not running: {why}", self.name);
+        }
         self.tx
             .send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
-            .map_err(|_| anyhow!("mcp server closed"))?;
+            .map_err(|_| anyhow!("mcp server '{}' closed", self.name))?;
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_s), rx).await {
             Ok(Ok(Ok(v))) => Ok(v),
             Ok(Ok(Err(e))) => bail!("{e}"),
-            Ok(Err(_)) => bail!("mcp server dropped the call"),
-            Err(_) => bail!("mcp '{method}' timed out"),
+            Ok(Err(_)) => bail!("mcp server '{}' dropped the call", self.name),
+            Err(_) => {
+                self.pending.lock().unwrap().remove(&id);
+                bail!("mcp '{method}' on server '{}' timed out after {timeout_s}s", self.name)
+            }
         }
+    }
+
+    /// `Some(reason)` once the child's stdout closed (EOF or read error).
+    fn dead_reason(&self) -> Option<String> {
+        self.dead.lock().unwrap().clone()
     }
 }
 
@@ -278,6 +393,15 @@ impl Transport {
             Transport::Http(r) => r.call(method, params, timeout_s).await,
         }
     }
+
+    /// `Some(reason)` when the underlying child process is gone. Only stdio
+    /// has a process; hosted HTTP servers recover on their own.
+    fn dead_reason(&self) -> Option<String> {
+        match self {
+            Transport::Stdio(r) => r.dead_reason(),
+            Transport::Http(_) => None,
+        }
+    }
 }
 
 struct Client {
@@ -387,7 +511,7 @@ impl Manager {
         let rpc: Transport = if conf.url.is_some() {
             Transport::Http(Arc::new(HttpRpc::new(name.to_string(), conf.clone())))
         } else {
-            Transport::Stdio(Rpc::spawn(conf.clone())?)
+            Transport::Stdio(Rpc::spawn(conf.clone(), name)?)
         };
         // attach the server's stderr tail so config/setup errors are visible
         let with_err = |e: anyhow::Error| -> anyhow::Error {
@@ -469,12 +593,45 @@ impl Manager {
         out
     }
 
+    /// Drop clients whose stdio child has died, recording why in `status`.
+    ///
+    /// Keeps the dead entry out of `clients` so the next `ensure_connected`
+    /// (start of every run) reconnects, and makes the failure visible in
+    /// `amty status` / the GUI instead of a stale `connected (n tools)`.
+    fn prune_dead(&self) -> Vec<(String, String)> {
+        let mut dead: Vec<(String, String)> = vec![];
+        let mut clients = self.clients.lock().unwrap();
+        let mut gone: Vec<String> = vec![];
+        for (name, client) in clients.iter() {
+            if let Some(why) = client.rpc.dead_reason() {
+                dead.push((name.clone(), why));
+                gone.push(name.clone());
+            }
+        }
+        for name in &gone {
+            clients.remove(name);
+        }
+        drop(clients);
+        for (name, why) in &dead {
+            self.status.lock().unwrap().insert(
+                name.clone(),
+                Status::Failed(format!("{why} (reconnecting on the next turn)")),
+            );
+        }
+        dead
+    }
+
     pub async fn call_tool(&self, namespaced: &str, input: Value) -> Result<String, String> {
         let rest = namespaced.strip_prefix("mcp__").ok_or("bad tool name")?;
         let (srv, tool) = rest.split_once("__").ok_or("bad tool name")?;
+        // a crashed server must not silently cost the caller 120 s (issue #15)
+        let dead = self.prune_dead();
         let client = self.clients.lock().unwrap().get(srv).cloned();
         let Some(client) = client else {
-            return Err(format!("mcp server '{srv}' not connected"));
+            return Err(match dead.iter().find(|(n, _)| n == srv) {
+                Some((_, why)) => format!("mcp server '{srv}' is not running: {why}"),
+                None => format!("mcp server '{srv}' not connected"),
+            });
         };
         let orig = client
             .tools
@@ -486,7 +643,12 @@ impl Manager {
             .rpc
             .call("tools/call", json!({"name": orig, "arguments": input}), 120)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string());
+        // the call itself may have killed/revealed a dead child — prune now so
+        // the status surface reflects it immediately
+        self.prune_dead();
+        let res = res?;
+
         let is_err = res["isError"].as_bool().unwrap_or(false);
         let text: String = res["content"]
             .as_array()
@@ -584,5 +746,58 @@ mod tests {
         assert!(sse_response(body2, 1).is_some());
         assert!(sse_response(body2, 2).is_some());
         assert!(sse_response(body2, 3).is_none());
+    }
+
+    fn stdio_conf(script: &str) -> McpServerConf {
+        McpServerConf {
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            ..Default::default()
+        }
+    }
+
+    /// Issue #15: a stdio server that exits immediately used to leave every
+    /// `call()` blocked until its own timeout (120 s for `tools/call`). The
+    /// reader task must fail the pending calls instead.
+    #[tokio::test]
+    async fn call_fails_fast_when_the_server_exits() {
+        // `sh -c exit 0` — a child that closes stdout straight away, like a
+        // crashed MCP server. The assertion below is the regression: it used to
+        // wait the full 120 s.
+        let rpc = Rpc::spawn(stdio_conf("exit 0"), "stub").expect("spawn");
+        let started = std::time::Instant::now();
+        let err = rpc
+            .call("tools/call", json!({}), 15)
+            .await
+            .expect_err("a dead server must not answer");
+        let waited = started.elapsed();
+        assert!(
+            waited < std::time::Duration::from_secs(10),
+            "call waited {waited:?} — the dead-transport handshake is missing"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("stub"), "error should name the server: {msg}");
+        assert!(
+            msg.contains("not running") || msg.contains("exited") || msg.contains("closed"),
+            "error should say why: {msg}"
+        );
+        // and it stays fast on every later call (no re-wait)
+        let t2 = std::time::Instant::now();
+        assert!(rpc.call("tools/call", json!({}), 120).await.is_err());
+        assert!(t2.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn dead_server_is_reported_with_its_stderr() {
+        // a server that complains on stderr and exits: the tail must reach the
+        // caller, since otherwise the failure is invisible
+        let rpc = Rpc::spawn(stdio_conf("echo 'boom: bad token' >&2; exit 1"), "noisy").expect("spawn");
+        let err = rpc
+            .call("tools/call", json!({}), 30)
+            .await
+            .expect_err("dead server");
+        let msg = err.to_string();
+        assert!(msg.contains("noisy"), "{msg}");
+        assert!(msg.contains("boom: bad token"), "stderr tail missing: {msg}");
     }
 }
