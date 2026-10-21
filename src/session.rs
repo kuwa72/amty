@@ -38,6 +38,10 @@ pub struct Session {
     /// persisted in the meta line and listed in the GUI files tray.
     #[serde(default)]
     pub files: Vec<SessionFile>,
+    /// Unsent composer text for this session, persisted in the meta line so
+    /// a draft survives session switches and app restarts.
+    #[serde(default)]
+    pub draft: String,
 }
 
 impl Session {
@@ -54,6 +58,7 @@ impl Session {
             messages: vec![],
             usage: crate::types::Usage::default(),
             files: vec![],
+            draft: String::new(),
         }
     }
 }
@@ -303,6 +308,23 @@ impl SessionStore {
         }
     }
 
+    /// Composer draft for a session (unsent input text).
+    pub fn draft(&self, id: &str) -> Option<String> {
+        self.map.read().unwrap().get(id).map(|s| s.draft.clone())
+    }
+
+    /// Save the composer draft. Unlike messages this does not bump
+    /// `updated`/`seq` — typing must not reorder the session list.
+    pub fn set_draft(&self, id: &str, draft: &str) {
+        let mut map = self.map.write().unwrap();
+        if let Some(s) = map.get_mut(id) {
+            if s.draft != draft {
+                s.draft = draft.to_string();
+                self.persist(s);
+            }
+        }
+    }
+
     /// Retitle a session (sidebar rename).
     pub fn set_title(&self, id: &str, title: &str) -> bool {
         let mut map = self.map.write().unwrap();
@@ -536,6 +558,9 @@ struct MetaOnly {
     /// Paths created by tool calls (see `Session::files`).
     #[serde(default)]
     files: Vec<SessionFile>,
+    /// Unsent composer text (see `Session::draft`).
+    #[serde(default)]
+    draft: String,
 }
 
 impl From<&Session> for MetaOnly {
@@ -550,6 +575,7 @@ impl From<&Session> for MetaOnly {
             seq: s.seq,
             usage: s.usage,
             files: s.files.clone(),
+            draft: s.draft.clone(),
         }
     }
 }
@@ -634,6 +660,36 @@ mod tests {
         drop(store);
         let store2 = SessionStore::load(dir.clone());
         assert_eq!(store2.get(&id).unwrap().files.len(), 2);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn draft_persists_without_touching_order_fields() {
+        let (store, dir) = temp_store();
+        let a = store.create(None, None);
+        let b = store.create(None, None);
+        assert_eq!(store.draft(&a).as_deref(), Some(""));
+        store.set_draft(&a, "draft for a");
+        assert_eq!(store.draft(&a).as_deref(), Some("draft for a"));
+        assert_eq!(store.draft(&b).as_deref(), Some(""));
+        // unknown id is a no-op, not an error
+        store.set_draft("no-such-session", "x");
+        // a draft edit must not reorder the session list
+        let before = store.get(&a).unwrap();
+        let same_draft = "draft for a".to_string();
+        store.set_draft(&a, &same_draft); // identical -> no rewrite
+        store.set_draft(&a, "edited draft");
+        let after = store.get(&a).unwrap();
+        assert_eq!(after.updated, before.updated);
+        assert_eq!(after.seq, before.seq);
+        // clearing a draft (successful send) persists too
+        store.set_draft(&a, "");
+        assert_eq!(store.draft(&a).as_deref(), Some(""));
+        store.set_draft(&b, "keep me");
+        drop(store);
+        let store2 = SessionStore::load(dir.clone());
+        assert_eq!(store2.draft(&a).as_deref(), Some(""));
+        assert_eq!(store2.draft(&b).as_deref(), Some("keep me"));
         std::fs::remove_dir_all(dir).ok();
     }
 

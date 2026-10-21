@@ -324,7 +324,12 @@ pub struct GuiApp {
     rt: tokio::runtime::Handle,
     rx: broadcast::Receiver<AppEvent>,
     current: String,
+    /// composer buffer for `current` only — swapped per session (drafts
+    /// persist in each session's meta line)
     input: String,
+    /// `Some` = `input` was edited since the last draft persist; the value
+    /// is the last edit time for the debounced flush
+    draft_dirty: Option<Instant>,
     /// images attached to the next message (clipboard paste / file drop),
     /// shown as thumbnails under the input box and sent with the text
     pending_images: Vec<PendingImage>,
@@ -384,12 +389,14 @@ impl GuiApp {
             .and_then(|id| app.sessions.resolve(&id))
             .or_else(|| app.sessions.list().first().map(|s| s.id.clone()))
             .unwrap_or_default();
+        let input = app.sessions.draft(&current).unwrap_or_default();
         Self {
             app,
             rt,
             rx,
             current,
-            input: String::new(),
+            input,
+            draft_dirty: None,
             pending_images: Vec::new(),
             image_tex: HashMap::new(),
             live_text: HashMap::new(),
@@ -541,10 +548,37 @@ impl GuiApp {
     fn ensure_session(&mut self) -> String {
         if self.current.is_empty() {
             let (p, m) = self.session_provider();
-            self.current = self.app.sessions.create(Some(p), Some(m));
+            let id = self.app.sessions.create(Some(p), Some(m));
+            self.swap_draft(id);
             self.remember_last_session();
         }
         self.current.clone()
+    }
+
+    /// Swap the composer buffer when `current` changes: the outgoing
+    /// session's draft is persisted and the incoming session's draft is
+    /// loaded, so text typed for one chat can never be sent to another.
+    /// Text typed while no session was selected (before first send)
+    /// carries into the newly selected session.
+    fn swap_draft(&mut self, new_id: String) {
+        let old = std::mem::replace(&mut self.current, new_id);
+        if old.is_empty() && !self.input.is_empty() {
+            self.draft_dirty = Some(Instant::now());
+            return;
+        }
+        if !old.is_empty() {
+            self.app.sessions.set_draft(&old, &self.input);
+        }
+        self.input = self.app.sessions.draft(&self.current).unwrap_or_default();
+        self.draft_dirty = None;
+    }
+
+    /// Flush a dirty composer draft to the current session's meta line.
+    fn flush_draft(&mut self) {
+        if !self.current.is_empty() {
+            self.app.sessions.set_draft(&self.current, &self.input);
+        }
+        self.draft_dirty = None;
     }
 
     fn send(&mut self) {
@@ -563,6 +597,8 @@ impl GuiApp {
         let images = std::mem::take(&mut self.pending_images);
         let blocks = message_blocks(&text, images);
         self.input.clear();
+        self.app.sessions.set_draft(&sid, "");
+        self.draft_dirty = None;
         self.last_error.remove(&sid);
         self.view_dirty = true;
         let app_ref = self.app.clone();
@@ -597,6 +633,16 @@ impl eframe::App for GuiApp {
             self.on_event(ev);
         }
         self.refresh_view();
+        // debounced draft persist: the composer buffer lives in GUI memory,
+        // so a dirty draft is flushed to the session meta ~1s after typing
+        // stops (switching sessions or sending flushes it immediately)
+        if let Some(t) = self.draft_dirty {
+            if t.elapsed() >= Duration::from_secs(1) {
+                self.flush_draft();
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+        }
 
         // drag & drop: dropped file paths are appended to the input box;
         // paint a drop hint while files are hovered over the window
@@ -621,6 +667,7 @@ impl eframe::App for GuiApp {
                 self.input.push(' ');
             }
             self.input.push_str(&s);
+            self.draft_dirty = Some(Instant::now());
         }
 
         // Ctrl+V with an image on the clipboard (a screenshot) attaches it.
@@ -827,7 +874,8 @@ impl eframe::App for GuiApp {
                 ui.heading("amty");
                 if ui.button(self.tr("＋ new")).clicked() {
                     let (p, m) = self.session_provider();
-                    self.current = self.app.sessions.create(Some(p), Some(m));
+                    let id = self.app.sessions.create(Some(p), Some(m));
+                    self.swap_draft(id);
                     self.view_dirty = true;
                     self.remember_last_session();
                 }
@@ -898,7 +946,7 @@ impl eframe::App for GuiApp {
                                 .small(),
                         );
                         if resp.on_hover_text(sub).clicked() {
-                            self.current = h.id.clone();
+                            self.swap_draft(h.id.clone());
                             self.view_dirty = true;
                             self.remember_last_session();
                         }
@@ -944,7 +992,7 @@ impl eframe::App for GuiApp {
                             // select the session so it shows up there
                             self.rename_id = Some(meta.id.clone());
                             self.rename_buf = meta.title.clone();
-                            self.current = meta.id.clone();
+                            self.swap_draft(meta.id.clone());
                             self.view_dirty = true;
                             ui.close();
                         }
@@ -954,7 +1002,7 @@ impl eframe::App for GuiApp {
                         }
                     });
                     if resp.clicked() {
-                        self.current = meta.id.clone();
+                        self.swap_draft(meta.id.clone());
                         self.view_dirty = true;
                         self.remember_last_session();
                     }
@@ -969,7 +1017,7 @@ impl eframe::App for GuiApp {
                     self.running.remove(&id);
                     self.last_error.remove(&id);
                     if self.current == id {
-                        self.current = String::new();
+                        self.swap_draft(String::new());
                     }
                     self.view_dirty = true;
                 }
@@ -1133,6 +1181,9 @@ impl eframe::App for GuiApp {
                             )
                         })
                         .inner;
+                    if resp.changed() {
+                        self.draft_dirty = Some(Instant::now());
+                    }
                     // Text-edit style context menu. Cut/Copy/Select-all are
                     // forwarded as synthetic events — the focused TextEdit
                     // consumes them on the next frame (right-click doesn't
@@ -1356,7 +1407,7 @@ impl eframe::App for GuiApp {
                     }
                     Some(MsgAction::Fork(i)) => {
                         if let Some(id) = self.app.sessions.fork(&self.current, i + 1) {
-                            self.current = id;
+                            self.swap_draft(id);
                             self.view_dirty = true;
                             self.remember_last_session();
                             let m = self.tr("forked");
@@ -1660,6 +1711,12 @@ impl eframe::App for GuiApp {
                 self.settings = Some(buf);
             }
         }
+    }
+
+    /// Last chance to persist the composer draft: the debounced flush may
+    /// not have fired yet when the window closes.
+    fn on_exit(&mut self) {
+        self.flush_draft();
     }
 }
 
