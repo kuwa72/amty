@@ -256,7 +256,14 @@ fn allowlisted(cfg: &Config, name: &str, input: &Value) -> bool {
 /// [`crate::mcp::cap_result`], which uses this same constant so the two paths
 /// behave identically (see issue #6: an uncapped MCP `Snapshot` put 107,816
 /// chars / ~27k tokens into one turn).
-pub const MAX_OUT: usize = 48_000;
+///
+/// Lowered 48 KB → 16 KB after measuring 182 sessions: of 4,947 tool results,
+/// 222 (4%) exceeded 8 KB and those carried 73% of all result bytes (`fs_read`
+/// alone was 4.9 MB of 7.2 MB). A result is re-sent on every later turn, so one
+/// 40 KB read bills 40 KB × remaining turns. 16 KB still fits a 400-line source
+/// file, and the re-read total only drops ~1% versus 48 KB (measured), so this
+/// trims the tail without forcing the model to re-read in slices.
+pub const MAX_OUT: usize = 16_000;
 
 /// Clip `s` to `max` bytes without splitting a UTF-8 character, appending a
 /// marker that tells the model (and the reader) how much was dropped.
@@ -629,11 +636,12 @@ fn http_client() -> Result<&'static reqwest::Client, String> {
 }
 
 async fn web_search(conf: &SearchConf, query: &str, count: usize) -> Result<String, String> {
-    let results = match conf.backend.as_str() {
+    let (results, note) = match conf.backend.as_str() {
         "" | "duckduckgo" => ddg_search(query, count).await?,
         "brave" => brave_search(conf, query, count).await?,
         "tavily" => tavily_search(conf, query, count).await?,
         "searxng" => searxng_search(conf, query, count).await?,
+        "bing" => (bing_search(query, count).await?, String::new()),
         other => return Err(format!("unknown search backend '{other}'")),
     };
     if results.is_empty() {
@@ -644,13 +652,14 @@ async fn web_search(conf: &SearchConf, query: &str, count: usize) -> Result<Stri
         .enumerate()
         .map(|(i, r)| format!("{}. {}\n   {}\n   {}", i + 1, r.title, r.url, r.snippet))
         .collect::<Vec<_>>()
-        .join("\n\n"))
+        .join("\n\n")
+        + &note)
 }
 
 /// DuckDuckGo HTML endpoint — no API key, but rate-limits heavy clients.
 /// Falls back to the lite endpoint (different markup) when the html
 /// endpoint is unreachable, blocked, or returns an unparseable page.
-async fn ddg_search(query: &str, count: usize) -> Result<Vec<SearchResult>, String> {
+async fn ddg_search(query: &str, count: usize) -> Result<(Vec<SearchResult>, String), String> {
     let html_err = match http_client()?
         .post("https://html.duckduckgo.com/html/")
         .form(&[("q", query)])
@@ -662,31 +671,198 @@ async fn ddg_search(query: &str, count: usize) -> Result<Vec<SearchResult>, Stri
             let mut out = parse_ddg(&body);
             out.truncate(count);
             if !out.is_empty() {
-                return Ok(out);
+                return Ok((out, String::new()));
             }
             "html endpoint: no results parsed".to_string()
         }
         Ok(r) => format!("html endpoint returned {}", r.status()),
         Err(e) => format!("html endpoint: {e}"),
     };
-    let resp = http_client()?
-        .get(format!("https://lite.duckduckgo.com/lite/?q={}", url_encode(query)))
-        .send()
-        .await
-        .map_err(|e| format!("{html_err}; lite fallback: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("{html_err}; lite returned {}", resp.status()));
+    // lite is a different host/path, so it is still worth one shot: the html
+    // endpoint can be blocked while lite works.
+    let lite = async {
+        let resp = http_client()?
+            .get(format!("https://lite.duckduckgo.com/lite/?q={}", url_encode(query)))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("lite returned {}", resp.status()));
+        }
+        let body = resp.text().await.map_err(|e| e.to_string())?;
+        let mut out = parse_ddg_lite(&body);
+        out.truncate(count);
+        if out.is_empty() {
+            return Err("lite parsed no results".to_string());
+        }
+        Ok(out)
+    };
+    match lite.await {
+        Ok(out) => Ok((out, String::new())),
+        Err(lite_err) => {
+            // Both DDG endpoints are down or rate-limiting. Measured on this
+            // machine: 8 rapid searches succeed, then every call returns HTTP
+            // 202 with an empty body for at least 20 minutes — retrying DDG
+            // costs a round trip and never recovers in-session, so switch
+            // engines instead of failing the tool.
+            let out = bing_search(query, count).await.map_err(|bing_err| {
+                format!(
+                    "{html_err}; {lite_err}; bing fallback: {bing_err}. \
+                     Search is rate limited — set search.backend to brave/tavily \
+                     with an API key, or retry later."
+                )
+            })?;
+            Ok((
+                out,
+                format!(
+                    "\n\n(note: search.backend=duckduckgo was rate limited; \
+                     these results come from Bing fallback)"
+                ),
+            ))
+        }
     }
-    let body = resp.text().await.map_err(|e| e.to_string())?;
-    let mut out = parse_ddg_lite(&body);
-    out.truncate(count);
-    if out.is_empty() {
-        return Err(format!("{html_err}; lite parsed no results — possibly rate limited; set search.backend=brave"));
-    }
-    Ok(out)
 }
 
-async fn brave_search(conf: &SearchConf, query: &str, count: usize) -> Result<Vec<SearchResult>, String> {
+/// Bing HTML search — keyless fallback used only when DuckDuckGo blocks us.
+///
+/// Results carry an obfuscated redirect (`/ck/a?…&u=a1<base64url>`); the `u=`
+/// parameter decodes to the real URL, and when it is absent (some results) the
+/// `<cite>` element shows the destination in readable form.
+async fn bing_search(query: &str, count: usize) -> Result<Vec<SearchResult>, String> {
+    let url = format!(
+        "https://www.bing.com/search?q={}&count={count}&setlang=en&cc=us&mkt=en-us",
+        url_encode(query)
+    );
+    let resp = http_client()?
+        .get(url)
+        // Bing returns a Chinese-language shell to this client by default and
+        // occasionally no `b_algo` blocks at all; a browser UA + mkt=en-us
+        // makes the markup stable (measured: 10/10 relevant results).
+        .header("User-Agent", BROWSER_UA)
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("bing returned {}", resp.status()));
+    }
+    let body = resp.text().await.map_err(|e| e.to_string())?;
+    let out = parse_bing(&body);
+    if out.is_empty() {
+        return Err("bing parsed no results".into());
+    }
+    Ok(out.into_iter().take(count).collect())
+}
+
+/// A browser UA for engines that reject bot clients. DDG serves results to any
+/// UA, but Bing returns a localized stub without this (measured).
+const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                          (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+/// `<li class="b_algo">` blocks → title/url/snippet. The snippet lives in a
+/// `<p>` (class varies: `b_lineclamp*`), and the URL is either the decoded
+/// `u=a1…` param or the `<cite>` text.
+fn parse_bing(html: &str) -> Vec<SearchResult> {
+    let mut out = Vec::new();
+    for part in html.split("<li class=\"b_algo\"").skip(1) {
+        let Some(h) = part.find("<h2") else { continue };
+        let head = &part[h..];
+        let Some(gt) = head.find('>') else { continue };
+        // the <a> inside the <h2>
+        let Some(a) = head[gt..].find("<a ") else { continue };
+        let anchor = &head[gt + a..];
+        let Some(agt) = anchor.find('>') else { continue };
+        let tag = &anchor[..agt];
+        let Some(href) = attr(tag, "href") else { continue };
+        let rest = &anchor[agt + 1..];
+        let title = clean(&rest[..rest.find("</a>").unwrap_or(rest.len())]);
+        if title.is_empty() {
+            continue;
+        }
+        let snippet = find_tag_text(part, "<p").unwrap_or_default();
+        let url = decode_bing_url(&href)
+            .or_else(|| find_tag_text(part, "<cite").map(|c| cite_to_url(&c)))
+            .unwrap_or_default();
+        if url.is_empty() {
+            continue;
+        }
+        out.push(SearchResult { title, url, snippet });
+    }
+    out
+}
+
+/// First `<p…>text</p>` / `<cite…>text</cite>` inside `s`, cleaned.
+fn find_tag_text(s: &str, open: &str) -> Option<String> {
+    let i = s.find(open)?;
+    let rest = &s[i..];
+    let gt = rest.find('>')?;
+    let body = &rest[gt + 1..];
+    let end = body.find("</")?;
+    Some(unescape(&strip_tags(&body[..end]).trim().to_string()))
+}
+
+/// `<cite>` shows `https://docs.rs › tokio › task` — fold the breadcrumb back
+/// into a URL when the redirect param is missing. Bing emits the separator
+/// both as a literal `›` and as `&rsaquo;`, and `clean()` leaves entities
+/// alone, so strip tags and decode entities before joining.
+fn cite_to_url(cite: &str) -> String {
+    let text = unescape(&strip_tags(cite));
+    let joined = text.replace(" \u{203a} ", "/").replace(' ', "");
+    if joined.starts_with("http") {
+        joined
+    } else {
+        format!("https://{joined}")
+    }
+}
+
+/// `https://www.bing.com/ck/a?…&u=a1<base64url of the target>` → real URL.
+fn decode_bing_url(href: &str) -> Option<String> {
+    let i = href.find("u=a1")?;
+    let v: String = href[i + 4..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let mut b64 = v.to_string();
+    while b64.len() % 4 != 0 {
+        b64.push('=');
+    }
+    let raw = base64_decode(&b64)?;
+    let s = String::from_utf8_lossy(&raw).to_string();
+    s.starts_with("http").then_some(s)
+}
+
+/// Minimal base64 decoder accepting both the standard and URL-safe alphabets
+/// (`+`/`/` and `-`/`_`), with optional padding. Bing's `u=a1…` parameter is
+/// URL-safe, and callers should not have to remember which.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        } as u32)
+    }
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for &c in s.as_bytes() {
+        if c == b'=' {
+            break;
+        }
+        acc = (acc << 6) | val(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+async fn brave_search(conf: &SearchConf, query: &str, count: usize) -> Result<(Vec<SearchResult>, String), String> {
     let key = conf.resolved_key().ok_or("brave needs an API key: set search.api_key or BRAVE_API_KEY")?;
     let url = format!("https://api.search.brave.com/res/v1/web/search?q={}&count={count}", url_encode(query));
     let resp = http_client()?
@@ -700,7 +876,7 @@ async fn brave_search(conf: &SearchConf, query: &str, count: usize) -> Result<Ve
         return Err(format!("brave returned {}", resp.status()));
     }
     let v: Value = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(v.pointer("/web/results")
+    Ok((v.pointer("/web/results")
         .and_then(|a| a.as_array())
         .into_iter()
         .flatten()
@@ -710,10 +886,10 @@ async fn brave_search(conf: &SearchConf, query: &str, count: usize) -> Result<Ve
             url: r["url"].as_str().unwrap_or("").into(),
             snippet: clean(r["description"].as_str().unwrap_or("")),
         })
-        .collect())
+        .collect(), String::new()))
 }
 
-async fn tavily_search(conf: &SearchConf, query: &str, count: usize) -> Result<Vec<SearchResult>, String> {
+async fn tavily_search(conf: &SearchConf, query: &str, count: usize) -> Result<(Vec<SearchResult>, String), String> {
     let key = conf.resolved_key().ok_or("tavily needs an API key: set search.api_key or TAVILY_API_KEY")?;
     let resp = http_client()?
         .post("https://api.tavily.com/search")
@@ -725,7 +901,7 @@ async fn tavily_search(conf: &SearchConf, query: &str, count: usize) -> Result<V
         return Err(format!("tavily returned {}", resp.status()));
     }
     let v: Value = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(v["results"]
+    Ok((v["results"]
         .as_array()
         .into_iter()
         .flatten()
@@ -735,12 +911,12 @@ async fn tavily_search(conf: &SearchConf, query: &str, count: usize) -> Result<V
             url: r["url"].as_str().unwrap_or("").into(),
             snippet: clean(r["content"].as_str().unwrap_or("")),
         })
-        .collect())
+        .collect(), String::new()))
 }
 
 /// SearXNG is self-hosted, so its base_url is trusted and exempt from the
 /// SSRF check (a local instance is the point of this backend).
-async fn searxng_search(conf: &SearchConf, query: &str, count: usize) -> Result<Vec<SearchResult>, String> {
+async fn searxng_search(conf: &SearchConf, query: &str, count: usize) -> Result<(Vec<SearchResult>, String), String> {
     let base = conf.base_url.as_deref().ok_or("searxng needs search.base_url (e.g. http://localhost:8080)")?;
     let url = format!("{}/search?q={}&format=json", base.trim_end_matches('/'), url_encode(query));
     let resp = http_client()?
@@ -752,7 +928,7 @@ async fn searxng_search(conf: &SearchConf, query: &str, count: usize) -> Result<
         return Err(format!("searxng returned {}", resp.status()));
     }
     let v: Value = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(v["results"]
+    Ok((v["results"]
         .as_array()
         .into_iter()
         .flatten()
@@ -762,7 +938,7 @@ async fn searxng_search(conf: &SearchConf, query: &str, count: usize) -> Result<
             url: r["url"].as_str().unwrap_or("").into(),
             snippet: clean(r["content"].as_str().unwrap_or("")),
         })
-        .collect())
+        .collect(), String::new()))
 }
 
 const FETCH_BODY_CAP: usize = 8 * 1024 * 1024;
@@ -985,6 +1161,8 @@ fn unescape(s: &str) -> String {
                 "trade" => '™',
                 "middot" => '·',
                 "bull" => '•',
+                "lsaquo" => '‹',
+                "rsaquo" => '›',
                 "rarr" | "arr" => '→',
                 _ if ent.starts_with("#x") || ent.starts_with("#X") => {
                     u32::from_str_radix(&ent[2..], 16).ok().and_then(char::from_u32)?
@@ -1335,6 +1513,50 @@ mod tests {
         assert_eq!(r[0].snippet, "A snippet here.");
         assert_eq!(r[1].url, "https://direct.example/x");
         assert_eq!(r[1].snippet, "Second snip");
+    }
+
+    #[test]
+    fn parse_bing_extracts_results_and_decodes_redirects() {
+        // `u=a1<base64url>` where the payload is https://example.com/page
+        let html = r#"<ol id="b_results">
+            <li class="b_algo" data-id iid=SERP.1><h2><a href="https://www.bing.com/ck/a?!&amp;&amp;p=abc&amp;u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS9wYWdl&amp;ntb=1">Example &lt;Title&gt;</a></h2>
+            <p class="b_lineclamp4">A <strong>snippet</strong> here.</p></li>
+            <li class="b_algo"><h2><a href="https://direct.example/x">Second</a></h2>
+            <cite>https://direct.example &rsaquo; x</cite></li></ol>"#;
+        let r = parse_bing(html);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].title, "Example <Title>");
+        assert_eq!(r[0].url, "https://example.com/page");
+        assert!(r[0].snippet.contains("snippet"));
+        // no u= param → fall back to the <cite> breadcrumb
+        assert_eq!(r[1].url, "https://direct.example/x");
+    }
+
+    #[test]
+    fn base64_decode_handles_url_safe_and_padding() {
+        // "Hi" -> SGk= ; url-safe alphabet and missing padding must work
+        assert_eq!(base64_decode("SGk=").unwrap(), b"Hi");
+        assert_eq!(base64_decode("SGk").unwrap(), b"Hi");
+        // url-safe chars map back onto the standard alphabet
+        assert_eq!(base64_decode("-_8").unwrap(), vec![0xfb, 0xff]);
+        // invalid input is rejected rather than silently truncated
+        assert_eq!(base64_decode("!!"), None);
+    }
+
+    #[test]
+    fn decode_bing_url_rejects_non_http() {
+        assert_eq!(decode_bing_url("https://example.com/x"), None);
+        // u=a1(base64 of "/images/search?q=x") — an internal path, not a result
+        assert_eq!(decode_bing_url("https://www.bing.com/ck/a?u=a1L2ltYWdlcy9zZWFyY2g"), None);
+    }
+
+    #[test]
+    fn truncate_to_respects_char_boundaries() {
+        // multi-byte char split by the limit must not panic or split
+        let s = "あ".repeat(40); // 120 bytes
+        let out = truncate_to(s, 20);
+        assert!(out.starts_with("あああ"));
+        assert!(out.contains("[truncated"));
     }
 
     #[test]

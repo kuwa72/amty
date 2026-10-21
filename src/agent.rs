@@ -203,9 +203,6 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
         // for every tool_use so the session doesn't end up with a dangling
         // call the provider will reject next turn
         let mut results: Vec<Block> = vec![];
-        // (name, input) -> (content, is_error) — identical calls in one turn
-        // run once and share the result; models sometimes emit exact dupes
-        let mut seen: std::collections::HashMap<String, (String, bool)> = std::collections::HashMap::new();
         let mut interrupted = false;
         for b in &tool_uses {
             if cancelled() {
@@ -213,16 +210,33 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
                 break;
             }
             let Block::ToolUse { id, name, input } = b.clone() else { continue };
-            let dup_key = format!("{name}\u{1}{input}");
-            if let Some((content, is_error)) = seen.get(&dup_key) {
+            let detail = tools::summarize(&name, &input);
+
+            // Read-only calls are stable within a session (a file does not
+            // change behind our back mid-loop), so a repeated identical call
+            // is answered from the memo instead of costing another round trip.
+            // Covers both exact dupes in one turn (the old behaviour) and
+            // repeats on a later turn, which is where the real waste was.
+            let cache_key = cacheable(&name, &input)
+                .then(|| (sid.to_string(), name.clone(), input.to_string()));
+            if let Some((content, is_error)) = cache_key
+                .as_ref()
+                .and_then(|k| app.tool_cache.lock().unwrap().get(k).cloned())
+            {
+                app.emit(sid, EvKind::ToolStart { name: name.clone(), detail: detail.clone() });
+                app.emit(sid, EvKind::ToolEnd {
+                    name: name.clone(),
+                    ok: !is_error,
+                    preview: format!("cached: {}", preview(&content)),
+                });
                 results.push(Block::ToolResult {
                     tool_use_id: id,
-                    content: format!("(deduplicated: identical call already ran)\n{content}"),
-                    is_error: *is_error,
+                    content: format!("(identical call already answered earlier in this session)\n{content}"),
+                    is_error,
                 });
                 continue;
             }
-            let detail = tools::summarize(&name, &input);
+
             app.emit(sid, EvKind::ToolStart { name: name.clone(), detail: detail.clone() });
 
             if let Err(e) = approval_gate(app, sid, &name, &input, &detail, cancelled).await {
@@ -239,6 +253,10 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
             }
 
             let out = run_tool(app, &name, &input, &cancelled).await;
+            // a write or an exec can invalidate every memoized read
+            if !cacheable(&name, &input) {
+                invalidate_tool_cache(app, sid);
+            }
             crate::evolve::record_tool(app, &name, out.is_ok());
             match out {
                 Ok(text) => {
@@ -247,12 +265,15 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
                         ok: true,
                         preview: preview(&text),
                     });
-                    seen.insert(dup_key, (text.clone(), false));
+                    if let Some(k) = cache_key {
+                        app.tool_cache.lock().unwrap().insert(k, (text.clone(), false));
+                    }
                     results.push(Block::ToolResult { tool_use_id: id, content: text, is_error: false });
                 }
                 Err(e) => {
                     app.emit(sid, EvKind::ToolEnd { name: name.clone(), ok: false, preview: preview(&e) });
-                    seen.insert(dup_key, (e.clone(), true));
+                    // do not memoize failures: the retry may legitimately work
+                    // (a transient timeout, a file that now exists)
                     results.push(Block::ToolResult { tool_use_id: id, content: e, is_error: true });
                 }
             }
@@ -322,6 +343,28 @@ fn preview(s: &str) -> String {
     truncate_preview(s.trim(), 400)
 }
 
+/// Is this call safe to memoize for the rest of the session?
+///
+/// Only reads whose answer cannot change as a side effect of the agent's own
+/// work. `shell` is excluded on purpose even for things like `git status`: it is
+/// arbitrary code, and a stale `cat`/`git diff` is worse than a cheap re-run.
+/// Writes invalidate the whole session memo (see `invalidate_tool_cache`), so a
+/// read after an edit is never served stale.
+fn cacheable(name: &str, input: &serde_json::Value) -> bool {
+    match name {
+        "fs_read" | "fs_list" | "web_fetch" | "config_get" => true,
+        // `mcp list` / `mcp tools` are pure inspection; other actions mutate
+        "mcp" => matches!(input["action"].as_str().unwrap_or("list"), "list" | "tools"),
+        _ => false,
+    }
+}
+
+/// Drop memoized reads for a session after anything that could change their
+/// answer. Called from the write/exec tools' call sites via `run_tool`.
+fn invalidate_tool_cache(app: &App, sid: &str) {
+    app.tool_cache.lock().unwrap().retain(|(s, ..), _| s != sid);
+}
+
 async fn approval_gate(
     app: &Arc<App>,
     sid: &str,
@@ -362,5 +405,29 @@ async fn approval_gate(
         Ok(())
     } else {
         Err("denied by user".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn cacheable_covers_reads_only() {
+        assert!(cacheable("fs_read", &json!({"path": "a"})));
+        assert!(cacheable("fs_list", &json!({"path": "."})));
+        assert!(cacheable("web_fetch", &json!({"url": "https://x"})));
+        assert!(cacheable("config_get", &json!({"key": "approval"})));
+        assert!(cacheable("mcp", &json!({"action": "tools"})));
+        assert!(cacheable("mcp", &json!({})), "default action is list");
+        // never cached: arbitrary code, writes, and state-changing actions
+        assert!(!cacheable("shell", &json!({"command": "git status"})));
+        assert!(!cacheable("fs_write", &json!({"path": "a", "content": "b"})));
+        assert!(!cacheable("fs_edit", &json!({})));
+        assert!(!cacheable("mcp", &json!({"action": "remove"})));
+        assert!(!cacheable("mcp_install", &json!({})));
+        assert!(!cacheable("self_update", &json!({"action": "status"})));
+        assert!(!cacheable("mcp__github__get_file_contents", &json!({})));
     }
 }

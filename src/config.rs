@@ -552,8 +552,8 @@ impl Config {
                 let field = &key["search.".len()..];
                 match field {
                     "backend" => {
-                        if !["duckduckgo", "brave", "tavily", "searxng"].contains(&value) {
-                            bail!("search.backend must be duckduckgo|brave|tavily|searxng");
+                        if !["duckduckgo", "brave", "tavily", "searxng", "bing"].contains(&value) {
+                            bail!("search.backend must be duckduckgo|brave|tavily|searxng|bing");
                         }
                         self.search.backend = value.into();
                     }

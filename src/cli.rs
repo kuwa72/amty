@@ -287,6 +287,15 @@ pub async fn run(cmd: crate::Cmd) -> Result<()> {
             match sub {
                 crate::ConfigCmd::Get { key: Some(k) } => {
                     let v = get(&base, &tok, "/v1/config").await?;
+                    // `apply_set` accepts the documented `provider.<name>.<field>`
+                    // alias, but the serialized struct calls the map `providers`.
+                    // Translate here so `set` and `get` accept the same spelling
+                    // (previously `amty config get provider.x.model` returned
+                    // null while the value was set — a silent lie).
+                    let k = match k.strip_prefix("provider.") {
+                        Some(rest) => format!("providers.{rest}"),
+                        None => k,
+                    };
                     let mut cur = v.clone();
                     for p in k.split('.') {
                         cur = cur.get(p).cloned().unwrap_or(Value::Null);
