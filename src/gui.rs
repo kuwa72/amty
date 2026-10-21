@@ -827,16 +827,33 @@ impl eframe::App for GuiApp {
                 }
             });
             // ----- search: typing filters titles, Enter searches message text -----
+            // This row must never exceed the panel's width: egui 0.36 persists a
+            // panel's *content* width as its size (PanelState.outer_rect), so an
+            // overflowing row makes the sidebar grow a little every frame. The
+            // ✕ button's real width (padding included) is measured and the
+            // spacing between the two widgets subtracted, instead of guessing.
             ui.horizontal(|ui| {
                 let hint = self.tr("search title, then Enter for full text");
-                let clear_w = if self.search_buf.is_empty() { 0.0 } else { 22.0 };
-                let edit_w = (ui.available_width() - clear_w).max(60.0);
+                let show_clear = !self.search_buf.is_empty();
+                let spacing = ui.spacing().item_spacing.x;
+                let clear_w = if show_clear {
+                    // ⏎/✕ — measured, not assumed: button padding varies with style
+                    let galley = ui.painter().layout_no_wrap(
+                        "✕".to_owned(),
+                        egui::TextStyle::Button.resolve(ui.style()),
+                        egui::Color32::WHITE,
+                    );
+                    galley.size().x + ui.spacing().button_padding.x * 2.0 + spacing
+                } else {
+                    0.0
+                };
+                let edit_w = (ui.available_width() - clear_w).max(24.0);
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.search_buf)
                         .hint_text(hint)
                         .desired_width(edit_w),
                 );
-                if !self.search_buf.is_empty() && ui.small_button("✕").on_hover_text(self.tr("clear")).clicked() {
+                if show_clear && ui.small_button("✕").on_hover_text(self.tr("clear")).clicked() {
                     self.search_buf.clear();
                     self.search_hits = None;
                 }
@@ -866,7 +883,14 @@ impl eframe::App for GuiApp {
                     for (n, h) in hits.iter().enumerate() {
                         let head = format!("{} · {}", h.title, self.tr(role_label(&h.role)));
                         let sub = format!("{} {}\n{}", h.id, crate::session::fmt_stamp(h.updated), h.snippet);
-                        let resp = ui.selectable_label(h.id == self.current, egui::RichText::new(head).small());
+                        // truncating labels/buttons keep each row inside the
+                        // panel width (long unbroken snippets would otherwise
+                        // widen the sidebar permanently — see the search row)
+                        let resp = ui.add(
+                            egui::Button::selectable(h.id == self.current, head)
+                                .truncate()
+                                .small(),
+                        );
                         if resp.on_hover_text(sub).clicked() {
                             self.current = h.id.clone();
                             self.view_dirty = true;
@@ -2628,6 +2652,90 @@ fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sidebar grows a little every frame when a row overflows the panel's
+    /// width: egui 0.36 persists the panel's *content* rect as its size
+    /// (`PanelState`), so overflow feeds back into the next frame.
+    ///
+    /// Reproduces the reported "typing in the title search widens the left
+    /// pane" bug: the ✕ button appears with text, and a width budget that
+    /// forgets the widget spacing (or under-reserves the button) adds a few
+    /// pixels per frame. Widths must stay stable across many frames.
+    #[test]
+    fn search_row_does_not_grow_the_side_panel() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("side");
+
+        // Run a few frames with an empty box, then many frames with text in it.
+        let mut widths: Vec<Option<f32>> = Vec::new();
+        for frame in 0..40 {
+            let text = if frame < 5 { "" } else { "セッション検索のテスト" };
+            let mut out = ctx.run_ui(Default::default(), |root| {
+                egui::Panel::left("side")
+                    .default_size(250.0)
+                    .min_size(180.0)
+                    .show(root, |ui| {
+                        // same shape as the real row: measured ✕ budget + spacing
+                        let mut buf = text.to_string();
+                        ui.horizontal(|ui| {
+                            let show_clear = !buf.is_empty();
+                            let spacing = ui.spacing().item_spacing.x;
+                            let clear_w = if show_clear {
+                                let galley = ui.painter().layout_no_wrap(
+                                    "✕".to_owned(),
+                                    egui::TextStyle::Button.resolve(ui.style()),
+                                    egui::Color32::WHITE,
+                                );
+                                galley.size().x + ui.spacing().button_padding.x * 2.0 + spacing
+                            } else {
+                                0.0
+                            };
+                            let edit_w = (ui.available_width() - clear_w).max(24.0);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut buf)
+                                    .hint_text("search")
+                                    .desired_width(edit_w),
+                            );
+                            if show_clear {
+                                ui.small_button("✕");
+                            }
+                        });
+                    });
+            });
+            // epaint panics if a frame's texture deltas are dropped unapplied
+            out.textures_delta.clear();
+            widths.push(
+                ctx.data_mut(|d| d.get_persisted::<egui::containers::panel::PanelState>(id))
+                    .map(|s| s.size().x),
+            );
+        }
+
+        let typed: Vec<f32> = widths[5..].iter().map(|w| w.expect("panel state stored")).collect();
+        let first = typed[0];
+        let last = *typed.last().unwrap();
+        assert!(
+            (first - last).abs() < 1.0,
+            "panel width kept drifting while typing: {first} -> {last} (all: {typed:?})"
+        );
+        assert!(last < 300.0, "panel width drifted past its default size: {last}");
+    }
+
+    /// The width budget itself: the edit field plus the ✕ button plus the
+    /// spacing between them must fit in the available width.
+    #[test]
+    fn search_width_budget_fits_the_button() {
+        let spacing: f32 = 8.0;
+        let button_padding: f32 = 4.0;
+        let glyph: f32 = 10.0;
+        let available: f32 = 250.0;
+        let clear_w = glyph + button_padding * 2.0 + spacing;
+        let edit_w = (available - clear_w).max(24.0);
+        assert!(edit_w + clear_w <= available, "budget overflows: {edit_w} + {clear_w} > {available}");
+        // a narrow panel must still leave a usable field, never a negative one
+        let narrow: f32 = 30.0;
+        let edit_narrow = (narrow - clear_w).max(24.0);
+        assert!(edit_narrow >= 24.0);
+    }
 
     #[test]
     fn image_blocks_roundtrip_and_encode() {
