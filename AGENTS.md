@@ -243,6 +243,34 @@ amty continuously improves itself; toggles live under `evolve.*` config keys
   enrollment, so no Google entries are shipped in the catalog. `gws` is in the
   default `allow_commands`; auth lives in `~/.config/gws/` (per-OS).
 - Anthropic provider needs `ANTHROPIC_API_KEY`; OAuth token heuristic is minimal.
+- **Speed budget (measured, 182 local sessions / 4,947 tool results).** Wall
+  clock is dominated by *round trips*, not context size: one provider round trip
+  is 3.0–3.6 s, a tool call adds its own execution time, and a 1.5 M-char
+  session still answers a no-tool prompt in 3.0 s (same as an empty one, because
+  93% of input is cache reads). So: reduce round trips, not tokens.
+  - Known waste, and what fixed it: 315 tool calls were byte-identical repeats
+    of an earlier call *in the same session* (`fs_read` 134, `shell` 113), each
+    costing a full round trip. `App::tool_cache` now memoizes read-only calls
+    (`agent::cacheable`: fs_read/fs_list/web_fetch/config_get + `mcp`
+    list|tools) per session, and any non-cacheable call
+    (`invalidate_tool_cache`) drops the memo so a read after a write is never
+    stale. Failures are not memoized.
+  - `tools::MAX_OUT` 48 KB → 16 KB: 4% of results exceeded 8 KB and carried 73%
+    of all result bytes (`fs_read` alone 4.9 MB of 7.2 MB). Measured re-read
+    totals: −25% (itunes), −9% (session-analysis), −1% (harness2) — a modest
+    win, and the reason not to go lower: a smaller cap forces the model to
+    re-read files in slices, which costs more round trips than it saves bytes.
+  - `web_search` DDG failure: 19 of 43 historical calls errored. Measured
+    cause — 8 rapid searches succeed, then every call returns HTTP 202 with an
+    empty body for 20+ minutes regardless of User-Agent, so retrying is
+    pointless in-session. `ddg_search` now falls through html → lite → Bing
+    (`bing_search`, keyless, `parse_bing` decodes the `/ck/a?u=a1<base64url>`
+    redirect) and notes the substitution in the result; `search.backend=bing`
+    selects it directly.
+  - Parallel tool execution was considered and rejected: 57% of multi-call
+    steps mix a write or `shell` with other calls (so most are not safely
+    parallel), and concurrency saves tool wall time while leaving the round-trip
+    count — the dominant cost — untouched.
 - Tool calls run inside a 200 ms cancel poll (drop aborts the request /
   kill_on_drop kills the shell child) with a 300 s hard cap in `run_tool`;
   web_fetch DNS lookups are separately capped at 10 s.

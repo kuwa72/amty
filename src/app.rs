@@ -85,6 +85,13 @@ pub struct App {
     pub token: String,
     pub started: u64,
     pub rt: tokio::runtime::Handle,
+    /// Per-session memo of tool results: (session, tool, canonical input) →
+    /// (content, is_error). Measured over 182 sessions: 315 tool calls were
+    /// byte-identical repeats of an earlier call in the *same* session, and each
+    /// repeat costs a full model round trip (~3.3 s) plus its result bytes in
+    /// every later prompt. `fs_read` (134) and `shell` (113) dominate. Only
+    /// read-only calls are memoized — see `agent::cacheable`.
+    pub tool_cache: Mutex<HashMap<(String, String, String), (String, bool)>>,
 }
 
 #[derive(Serialize)]
@@ -125,6 +132,7 @@ impl App {
             token,
             started: crate::session::now_secs(),
             rt: tokio::runtime::Handle::current(),
+            tool_cache: Mutex::new(HashMap::new()),
         });
 
         let router = crate::api::router(app.clone());
