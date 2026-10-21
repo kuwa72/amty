@@ -494,6 +494,7 @@ impl GuiApp {
 
     fn refresh_view(&mut self) {
         if self.view_dirty {
+            let prev_id = self.view.as_ref().map(|s| s.id.clone());
             self.view = if self.current.is_empty() {
                 None
             } else {
@@ -501,6 +502,11 @@ impl GuiApp {
             };
             if let Some(v) = &self.view {
                 self.current = v.id.clone();
+            }
+            // decoded image textures belong to the viewed session — drop
+            // them on switch so other sessions' images stop holding memory
+            if self.view.as_ref().map(|s| s.id.as_str()) != prev_id.as_deref() {
+                self.image_tex.clear();
             }
             self.view_dirty = false;
             self.remember_last_session();
@@ -955,6 +961,13 @@ impl eframe::App for GuiApp {
                 }
                 if let Some(id) = delete {
                     self.app.sessions.delete(&id);
+                    self.app.purge_tool_cache(&id);
+                    // drop retained per-session UI state for the deleted id
+                    self.live_text.remove(&id);
+                    self.live_tool.remove(&id);
+                    self.live_usage.remove(&id);
+                    self.running.remove(&id);
+                    self.last_error.remove(&id);
                     if self.current == id {
                         self.current = String::new();
                     }

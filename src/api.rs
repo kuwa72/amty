@@ -162,6 +162,7 @@ async fn session_files(State(app): State<Arc<App>>, Path(id): Path<String>) -> R
 async fn delete_session(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, String)> {
     let sid = app.sessions.resolve(&id).ok_or((StatusCode::NOT_FOUND, "no such session".into()))?;
     app.sessions.delete(&sid);
+    app.purge_tool_cache(&sid);
     app.emit(&sid, EvKind::Touched);
     Ok(Json(json!({"deleted": sid})))
 }
