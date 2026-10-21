@@ -9,6 +9,7 @@ pub enum ProviderKind {
     Anthropic,
     OpenAi,
     CommandCode,
+    OpenCode,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -67,6 +68,9 @@ impl ProviderConf {
             ProviderKind::Anthropic => "https://api.anthropic.com".into(),
             ProviderKind::OpenAi => "https://api.openai.com/v1".into(),
             ProviderKind::CommandCode => "https://api.commandcode.ai".into(),
+            // `opencode serve`'s conventional port; usually overridden by
+            // background-service discovery in provider::opencode_endpoint.
+            ProviderKind::OpenCode => "http://127.0.0.1:4096".into(),
         }
     }
 }
@@ -266,6 +270,15 @@ impl Default for Config {
             ProviderConf {
                 kind: ProviderKind::CommandCode,
                 model: "deepseek/deepseek-v4-flash".into(),
+                ..Default::default()
+            },
+        );
+        providers.insert(
+            "opencode".into(),
+            ProviderConf {
+                kind: ProviderKind::OpenCode,
+                // empty model → the server uses its configured default model
+                model: String::new(),
                 ..Default::default()
             },
         );

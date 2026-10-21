@@ -26,6 +26,7 @@ pub fn build(conf: &ProviderConf) -> Box<dyn Provider> {
         crate::config::ProviderKind::Anthropic => Box::new(Anthropic { conf: conf.clone() }),
         crate::config::ProviderKind::OpenAi => Box::new(OpenAi { conf: conf.clone() }),
         crate::config::ProviderKind::CommandCode => Box::new(CommandCode { conf: conf.clone() }),
+        crate::config::ProviderKind::OpenCode => Box::new(OpenCode { conf: conf.clone() }),
     }
 }
 
@@ -944,6 +945,341 @@ impl CommandCode {
     }
 }
 
+// ---------------- OpenCode ----------------
+//
+// Talks to a running `opencode` v2 server (`opencode serve` or the
+// CLI-managed background service from `opencode service start`) over its
+// HTTP API. There is no streaming generate endpoint, so the chat turn is a
+// single request: POST {base}/api/experimental/generate with the whole
+// transcript flattened into one `prompt` string; the response is
+// `{data:{text}}` — no usage is reported.
+//
+// Endpoint resolution: `providers.opencode.base_url` wins; otherwise the
+// background service is discovered via `opencode service status` (started
+// once via `opencode service start` when absent). v2 servers always need
+// HTTP basic auth — user "opencode", password taken from
+// api_key/api_key_env or the service's ~/.config/opencode/service.json.
+//
+// Model picker strings are "providerID/modelID" as listed by GET
+// /api/model; an empty/unqualified model omits `model` so the server uses
+// its configured default.
+
+struct OpenCode {
+    conf: ProviderConf,
+}
+
+#[async_trait]
+impl Provider for OpenCode {
+    async fn stream(&self, req: &ChatRequest, tx: mpsc::UnboundedSender<StreamEvent>) {
+        retry_stream(|rtx| self.run(req, rtx), &tx).await;
+    }
+}
+
+/// Flatten system + transcript into the single `prompt` string
+/// /api/experimental/generate accepts. Ends on an `assistant:` cue so a
+/// chat model continues the conversation rather than summarizing it.
+fn oc_prompt(req: &ChatRequest) -> String {
+    let mut s = String::new();
+    if let Some(sys) = system_full(req) {
+        s.push_str(&sys);
+        s.push_str("\n\n");
+    }
+    for m in &ensure_tool_results(&req.messages) {
+        let role = match m.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        };
+        let mut wrote = false;
+        for b in &m.blocks {
+            let piece = match b {
+                Block::Text { text } => text.clone(),
+                Block::ToolUse { name, input, .. } => format!("[tool call: {name} {input}]"),
+                Block::ToolResult { tool_use_id, content, is_error } => format!(
+                    "[tool result{} {tool_use_id}]: {content}",
+                    if *is_error { " (error)" } else { "" },
+                ),
+                Block::Image { .. } => "[image]".into(),
+            };
+            if piece.is_empty() {
+                continue;
+            }
+            if !wrote {
+                s.push_str(role);
+                s.push_str(":\n");
+                wrote = true;
+            }
+            s.push_str(&piece);
+            s.push('\n');
+        }
+        if wrote {
+            s.push('\n');
+        }
+    }
+    s.push_str("assistant:\n");
+    s
+}
+
+/// "providerID/modelID" → Model.Ref. Model ids may themselves contain '/'
+/// (e.g. "commandcode/deepseek/deepseek-v4-flash"), so split once.
+fn oc_model_ref(model: &str) -> Option<Value> {
+    let (p, id) = model.split_once('/')?;
+    if p.is_empty() || id.is_empty() {
+        return None;
+    }
+    Some(json!({"providerID": p, "id": id}))
+}
+
+/// Locate the `opencode` CLI. Same PATHEXT problem as `cmdc` on Windows —
+//  probe `where`, then the well-known install dirs.
+fn opencode_exe() -> Option<String> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        Some("opencode".to_string())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(p) = crate::catalog::shim_where("opencode") {
+            return Some(p);
+        }
+        let user = std::env::var("USERPROFILE").unwrap_or_default();
+        let appdata = std::env::var("APPDATA").unwrap_or_default();
+        for p in [
+            format!(r"{user}\.opencode\bin\opencode.exe"),
+            format!(r"{appdata}\npm\opencode.cmd"),
+            format!(r"{user}\scoop\shims\opencode.exe"),
+        ] {
+            if std::path::Path::new(&p).exists() {
+                return Some(p);
+            }
+        }
+        None
+    }
+}
+
+fn opencode_output(args: &[&str]) -> Result<String, String> {
+    let Some(exe) = opencode_exe() else { return Err("opencode not found".into()) };
+    let mut c = std::process::Command::new(&exe);
+    c.args(args);
+    crate::catalog::no_window(&mut c);
+    match c.output() {
+        Ok(o) => {
+            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+            if s.is_empty() {
+                s.push_str(&String::from_utf8_lossy(&o.stderr));
+            }
+            Ok(s)
+        }
+        Err(e) => Err(format!("spawn {exe}: {e}")),
+    }
+}
+
+/// The background service's basic-auth password, written by `opencode
+/// service start` to <config>/opencode/service.json.
+fn opencode_service_password() -> Option<String> {
+    let mut paths = Vec::new();
+    if let Some(c) = dirs::config_dir() {
+        paths.push(c.join("opencode/service.json"));
+    }
+    if let Some(h) = dirs::home_dir() {
+        paths.push(h.join(".config/opencode/service.json"));
+    }
+    for p in paths {
+        let Ok(t) = std::fs::read_to_string(&p) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&t) else { continue };
+        if let Some(pw) = v["password"].as_str().filter(|s| !s.is_empty()) {
+            return Some(pw.into());
+        }
+    }
+    None
+}
+
+#[derive(Clone)]
+struct OcEndpoint {
+    base: String,
+    password: Option<String>,
+    /// true when discovered via `opencode service` (not a configured
+    /// base_url) — only these are cached, and evicted on connect failure.
+    discovered: bool,
+}
+
+/// Cached service-discovery result; the GUI model picker calls this per
+/// frame, so the `opencode service status` subprocess must not re-run each
+/// time. Evicted on connection failure so a service restart re-discovers.
+static OC_ENDPOINT: std::sync::Mutex<Option<OcEndpoint>> = std::sync::Mutex::new(None);
+
+fn opencode_endpoint(conf: &ProviderConf) -> Result<OcEndpoint> {
+    let password = conf.resolved_key().or_else(opencode_service_password);
+    if let Some(b) = conf.base_url.as_deref().filter(|s| !s.is_empty()) {
+        return Ok(OcEndpoint { base: b.trim_end_matches('/').into(), password, discovered: false });
+    }
+    if let Some(ep) = OC_ENDPOINT.lock().unwrap().clone() {
+        return Ok(ep);
+    }
+    let status_url = || {
+        opencode_output(&["service", "status"]).ok().and_then(|s| {
+            s.split_whitespace().find(|t| t.starts_with("http")).map(str::to_string)
+        })
+    };
+    let base = status_url().or_else(|| {
+        // not running — `service start` is idempotent and prints the URL
+        let out = opencode_output(&["service", "start"]).ok()?;
+        out.split_whitespace().find(|t| t.starts_with("http")).map(str::to_string)
+            .or_else(|| {
+                for _ in 0..16 {
+                    if let Some(u) = status_url() {
+                        return Some(u);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                None
+            })
+    });
+    match base {
+        Some(base) => {
+            let ep = OcEndpoint { base, password, discovered: true };
+            *OC_ENDPOINT.lock().unwrap() = Some(ep.clone());
+            Ok(ep)
+        }
+        None => bail!(
+            "no opencode server — run `opencode service start` (or `opencode serve --port N` and set providers.opencode.base_url)"
+        ),
+    }
+}
+
+/// Drop the cached service endpoint (e.g. after a connect failure) so the
+/// next call re-runs discovery.
+fn oc_endpoint_evict() {
+    *OC_ENDPOINT.lock().unwrap() = None;
+}
+
+/// A model entry from GET {base}/api/model: picker id ("providerID/modelID")
+/// + context window (`limit.context`).
+#[derive(Clone)]
+struct OcModel {
+    id: String,
+    context: u64,
+}
+
+/// (base_url, models) — cached per endpoint so a service restart re-fetches.
+static OC_MODELS: std::sync::Mutex<Option<(String, Vec<OcModel>)>> = std::sync::Mutex::new(None);
+
+fn oc_parse_models(value: &Value) -> Vec<OcModel> {
+    value["data"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|m| m["enabled"].as_bool().unwrap_or(true) && m["status"].as_str() != Some("deprecated"))
+                .filter_map(|m| {
+                    let p = m["providerID"].as_str()?;
+                    let id = m["modelID"].as_str().or_else(|| m["id"].as_str())?;
+                    Some(OcModel {
+                        id: format!("{p}/{id}"),
+                        context: m["limit"]["context"].as_u64().unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn oc_models(conf: &ProviderConf) -> (Vec<OcModel>, Option<String>) {
+    let ep = match opencode_endpoint(conf) {
+        Ok(e) => e,
+        Err(e) => return (vec![], Some(e.to_string())),
+    };
+    if let Some((b, ms)) = OC_MODELS.lock().unwrap().clone() {
+        if b == ep.base {
+            return (ms, None);
+        }
+    }
+    let url = format!("{}/api/model", ep.base);
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return (vec![], Some(format!("http client: {e}"))),
+    };
+    let mut req = client.get(&url);
+    if let Some(pw) = &ep.password {
+        req = req.basic_auth("opencode", Some(pw));
+    }
+    let resp = match req.send() {
+        Ok(r) => r,
+        Err(e) => {
+            if ep.discovered {
+                oc_endpoint_evict();
+            }
+            return (vec![], Some(format!("fetch {url}: {e}")));
+        }
+    };
+    let value: serde_json::Value = match resp.json() {
+        Ok(v) => v,
+        Err(e) => return (vec![], Some(format!("json parse: {e}"))),
+    };
+    let models = oc_parse_models(&value);
+    *OC_MODELS.lock().unwrap() = Some((ep.base, models.clone()));
+    (models, None)
+}
+
+/// Populate the model cache if empty. Blocking — call via spawn_blocking.
+pub fn ensure_oc_models(conf: &ProviderConf) {
+    let _ = oc_models(conf);
+}
+
+/// Model picker entries for the opencode provider: "providerID/modelID"
+/// strings from GET {base}/api/model, or (empty, err) on failure.
+pub fn opencode_models(conf: &ProviderConf) -> (Vec<String>, Option<String>) {
+    let (models, err) = oc_models(conf);
+    (models.into_iter().map(|m| m.id).collect(), err)
+}
+
+impl OpenCode {
+    async fn run(&self, req: &ChatRequest, tx: mpsc::UnboundedSender<StreamEvent>) -> Result<()> {
+        let ep = opencode_endpoint(&self.conf)?;
+        let mut body = json!({ "prompt": oc_prompt(req) });
+        if let Some(m) = oc_model_ref(&req.model) {
+            body["model"] = m;
+        }
+        let client = http()?;
+        let mut rb = client
+            .post(format!("{}/api/experimental/generate", ep.base))
+            .header("content-type", "application/json");
+        if let Some(pw) = &ep.password {
+            rb = rb.basic_auth("opencode", Some(pw));
+        }
+        for (k, v) in &self.conf.headers {
+            rb = rb.header(k.as_str(), v.as_str());
+        }
+        let resp = match rb.json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                if ep.discovered {
+                    oc_endpoint_evict();
+                }
+                return Err(e).context("opencode request failed (is `opencode serve`/`opencode service` running?)");
+            }
+        };
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let msg = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|v| v["message"].as_str().map(str::to_string))
+                .unwrap_or(text);
+            bail!("opencode HTTP {status}: {msg}");
+        }
+        let v: Value = serde_json::from_str(&text).context("opencode response parse")?;
+        let out = v["data"]["text"].as_str().unwrap_or_default();
+        if out.is_empty() {
+            bail!("opencode returned no text: {text}");
+        }
+        let _ = tx.send(StreamEvent::Text(out.into()));
+        let _ = tx.send(StreamEvent::Done);
+        Ok(())
+    }
+}
+
 /// Known model ids for the model picker. Command Code is enumerated live via
 /// `cmdc --list-models` (cached); other providers use a static shortlist —
 /// the field stays free-text so anything works.
@@ -951,6 +1287,8 @@ pub fn model_suggestions(kind: crate::config::ProviderKind) -> Vec<String> {
     use crate::config::ProviderKind as K;
     match kind {
         K::CommandCode => FALLBACK_CC_MODELS.iter().map(|s| s.to_string()).collect(),
+        // live list comes from opencode_models(); static guesses would be wrong
+        K::OpenCode => vec![],
         K::Anthropic => [
             "claude-sonnet-4-5",
             "claude-opus-4-1",
@@ -1057,6 +1395,14 @@ pub fn context_window(conf: &ProviderConf, model: &str) -> u64 {
             .as_ref()
             .and_then(|ms| ms.iter().find(|m| m.id == model))
             .map(|m| m.context_length)
+            .filter(|n| *n > 0)
+            .unwrap_or(200_000),
+        crate::config::ProviderKind::OpenCode => OC_MODELS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|(_, ms)| ms.iter().find(|m| m.id == model))
+            .map(|m| m.context)
             .filter(|n| *n > 0)
             .unwrap_or(200_000),
         crate::config::ProviderKind::Anthropic => 200_000,
@@ -1308,6 +1654,54 @@ mod tests {
         }
     }
 
+    /// /api/experimental/generate takes one prompt string; the transcript is
+    /// flattened into a `role:`-headed chat that ends on an `assistant:` cue.
+    #[test]
+    fn oc_prompt_flattens_transcript() {
+        let r = ChatRequest {
+            model: "m".into(), max_tokens: 1,
+            system: Some("be brief".into()),
+            system_tail: Some("skill idx".into()),
+            messages: req_msgs(), tools: vec![],
+        };
+        let p = oc_prompt(&r);
+        assert!(p.starts_with("be briefskill idx\n\n")); // system_tail is appended raw
+        assert!(p.contains("user:\nhi\n"));
+        assert!(p.contains("assistant:\nreading\n[tool call: fs_read {\"path\":\"/a\"}]"));
+        assert!(p.contains("user:\n[tool result t1]: data"));
+        assert!(p.ends_with("assistant:\n"));
+    }
+
+    #[test]
+    fn oc_model_ref_splits_once() {
+        // model ids may contain '/' — only the first separates providerID
+        let v = oc_model_ref("commandcode/deepseek/deepseek-v4-flash").unwrap();
+        assert_eq!(v["providerID"], "commandcode");
+        assert_eq!(v["id"], "deepseek/deepseek-v4-flash");
+        assert!(oc_model_ref("").is_none());
+        assert!(oc_model_ref("noslash").is_none());
+        assert!(oc_model_ref("/id").is_none());
+        assert!(oc_model_ref("p/").is_none());
+    }
+
+    #[test]
+    fn oc_parse_models_filters_and_joins() {
+        let v = json!({"data": [
+            {"providerID": "commandcode", "modelID": "deepseek/deepseek-v4-flash",
+             "enabled": true, "status": "active", "limit": {"context": 200000, "output": 32000}},
+            {"providerID": "opencode", "modelID": "free-x",
+             "enabled": false, "status": "active", "limit": {"context": 128000, "output": 1}},
+            {"providerID": "anthropic", "modelID": "old",
+             "enabled": true, "status": "deprecated", "limit": {"context": 1, "output": 1}},
+            {"providerID": "broken"},
+        ]});
+        let ms = oc_parse_models(&v);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].id, "commandcode/deepseek/deepseek-v4-flash");
+        assert_eq!(ms[0].context, 200000);
+        assert!(oc_parse_models(&json!({})).is_empty());
+    }
+
     #[test]
     fn anthropic_shape() {
         let v = anthropic_messages(&req_msgs());
@@ -1423,6 +1817,19 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // requires a running `opencode` service
+    fn opencode_models_real() {
+        let conf = crate::config::ProviderConf {
+            kind: crate::config::ProviderKind::OpenCode,
+            ..Default::default()
+        };
+        let (models, err) = opencode_models(&conf);
+        eprintln!("parsed {} models (err={:?})", models.len(), err);
+        eprintln!("{:?}", &models[..models.len().min(10)]);
+        assert!(err.is_none() && !models.is_empty());
+    }
+
+    #[test]
     #[ignore] // requires network + api key
     fn cmdc_models_real() {
         let conf = crate::config::ProviderConf {
@@ -1468,6 +1875,42 @@ mod live_tests {
                 break;
             }
         }
+    }
+
+    /// End-to-end chat turn through a running opencode server (background
+    /// service discovered via `opencode service status`, or set base_url).
+    ///
+    ///   cargo test opencode_live_generate -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn opencode_live_generate() {
+        let conf = ProviderConf {
+            kind: ProviderKind::OpenCode,
+            model: "commandcode/deepseek/deepseek-v4-flash".into(),
+            ..Default::default()
+        };
+        let p = build(&conf);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let req = ChatRequest {
+            model: conf.model.clone(),
+            max_tokens: 100,
+            system: Some("Reply concisely.".into()),
+            system_tail: None,
+            messages: vec![ChatMessage::user("Say the word PONG and nothing else.")],
+            tools: vec![],
+        };
+        p.stream(&req, tx).await;
+        let mut text = String::new();
+        while let Some(ev) = rx.recv().await {
+            println!("EV: {ev:?}");
+            match ev {
+                StreamEvent::Text(t) => text.push_str(&t),
+                StreamEvent::Done => break,
+                StreamEvent::Err(e) => panic!("{e}"),
+                _ => {}
+            }
+        }
+        assert!(text.to_uppercase().contains("PONG"), "got: {text}");
     }
 
     /// End-to-end check against the live Command Code API: the stream must

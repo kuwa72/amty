@@ -790,6 +790,10 @@ impl eframe::App for GuiApp {
                             let conf = self.app.cfg.read().unwrap().providers.get(&prov).cloned().unwrap_or_default();
                             crate::provider::cmdc_models(&conf)
                         }
+                        Some(crate::config::ProviderKind::OpenCode) => {
+                            let conf = self.app.cfg.read().unwrap().providers.get(&prov).cloned().unwrap_or_default();
+                            crate::provider::opencode_models(&conf)
+                        }
                         _ => (kind.map(crate::provider::model_suggestions).unwrap_or_default(), None),
                     };
                     let suggestions_label = if suggestions.is_empty() {
@@ -2593,11 +2597,13 @@ fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut S
                                 ProviderKind::Anthropic => "anthropic",
                                 ProviderKind::OpenAi => "openai",
                                 ProviderKind::CommandCode => "commandcode",
+                                ProviderKind::OpenCode => "opencode",
                             })
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut p.kind, ProviderKind::Anthropic, "anthropic");
                                 ui.selectable_value(&mut p.kind, ProviderKind::OpenAi, "openai (compatible)");
                                 ui.selectable_value(&mut p.kind, ProviderKind::CommandCode, "commandcode");
+                                ui.selectable_value(&mut p.kind, ProviderKind::OpenCode, "opencode");
                             });
                     });
                     egui::Grid::new("pgrid").num_columns(2).show(ui, |ui| {
