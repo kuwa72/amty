@@ -201,6 +201,13 @@ impl App {
         self.runs.lock().unwrap().contains_key(session)
     }
 
+    /// Drop memoized read-only tool results for a session — after a
+    /// write/exec that could invalidate their answers (agent loop), or when
+    /// the session is deleted so its entries don't linger forever.
+    pub fn purge_tool_cache(&self, sid: &str) {
+        self.tool_cache.lock().unwrap().retain(|(s, ..), _| s != sid);
+    }
+
     /// Run a catalog entry's auth flow: `npx -y <pkg> auth` for package-based
     /// servers, or the built-in OAuth client for hosted (streamable HTTP)
     /// entries. Progress goes to `<data_dir>/auth-<id>.log`. On completion

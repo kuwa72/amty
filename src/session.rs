@@ -208,20 +208,23 @@ impl SessionStore {
         self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Write the session's jsonl file. Serialized straight into a BufWriter
+    /// so persisting neither deep-copies the session nor materializes the
+    /// whole file in memory — peak overhead is one serialized line. Safe to
+    /// call while holding the map write guard: this touches no shared state.
     fn persist(&self, s: &Session) {
+        use std::io::Write as _;
         let _ = std::fs::create_dir_all(&self.dir);
-        let mut out = String::new();
+        let Ok(f) = std::fs::File::create(self.dir.join(format!("{}.jsonl", s.id))) else { return };
+        let mut w = std::io::BufWriter::new(f);
         if let Ok(m) = serde_json::to_string(&serde_json::json!({"meta": MetaOnly::from(s)})) {
-            out.push_str(&m);
-            out.push('\n');
+            let _ = w.write_all(m.as_bytes()).and_then(|_| w.write_all(b"\n"));
         }
         for msg in &s.messages {
             if let Ok(l) = serde_json::to_string(msg) {
-                out.push_str(&l);
-                out.push('\n');
+                let _ = w.write_all(l.as_bytes()).and_then(|_| w.write_all(b"\n"));
             }
         }
-        let _ = std::fs::write(self.dir.join(format!("{}.jsonl", s.id)), out);
     }
 
     pub fn create(&self, provider: Option<String>, model: Option<String>) -> String {
@@ -234,6 +237,16 @@ impl SessionStore {
 
     pub fn get(&self, id: &str) -> Option<Session> {
         self.map.read().unwrap().get(id).cloned()
+    }
+
+    /// Provider/model overrides only — avoids cloning the whole message
+    /// history when the caller just needs routing fields (agent loop).
+    pub fn overrides(&self, id: &str) -> Option<(Option<String>, Option<String>)> {
+        self.map
+            .read()
+            .unwrap()
+            .get(id)
+            .map(|s| (s.provider.clone(), s.model.clone()))
     }
 
     /// `id` may be a full id, unique prefix, or empty (→ most recently updated).
@@ -286,9 +299,7 @@ impl SessionStore {
             s.messages.push(msg);
             s.updated = now_secs();
             s.seq = self.next_seq();
-            let s = s.clone();
-            drop(map);
-            self.persist(&s);
+            self.persist(s);
         }
     }
 
@@ -299,9 +310,7 @@ impl SessionStore {
             s.title = title.to_string();
             s.updated = now_secs();
             s.seq = self.next_seq();
-            let s = s.clone();
-            drop(map);
-            self.persist(&s);
+            self.persist(s);
             true
         } else {
             false
@@ -315,9 +324,7 @@ impl SessionStore {
             s.model = model.or(s.model.take());
             s.updated = now_secs();
             s.seq = self.next_seq();
-            let s = s.clone();
-            drop(map);
-            self.persist(&s);
+            self.persist(s);
         }
     }
 
@@ -329,9 +336,7 @@ impl SessionStore {
             s.messages = messages;
             s.updated = now_secs();
             s.seq = self.next_seq();
-            let s = s.clone();
-            drop(map);
-            self.persist(&s);
+            self.persist(s);
             true
         } else {
             false
@@ -346,9 +351,7 @@ impl SessionStore {
         if let Some(f) = s.files.iter_mut().find(|f| f.path == path) {
             f.tool = tool.to_string();
             f.ts = now_secs();
-            let s = s.clone();
-            drop(map);
-            self.persist(&s);
+            self.persist(s);
             return false;
         }
         if s.files.len() >= MAX_SESSION_FILES {
@@ -359,9 +362,7 @@ impl SessionStore {
             tool: tool.to_string(),
             ts: now_secs(),
         });
-        let s = s.clone();
-        drop(map);
-        self.persist(&s);
+        self.persist(s);
         true
     }
 
@@ -373,9 +374,7 @@ impl SessionStore {
         let mut map = self.map.write().unwrap();
         let Some(s) = map.get_mut(id) else { return false };
         s.usage.add(u);
-        let s = s.clone();
-        drop(map);
-        self.persist(&s);
+        self.persist(s);
         true
     }
 
@@ -386,9 +385,7 @@ impl SessionStore {
             s.messages.truncate(keep);
             s.updated = now_secs();
             s.seq = self.next_seq();
-            let s = s.clone();
-            drop(map);
-            self.persist(&s);
+            self.persist(s);
             true
         } else {
             false
@@ -407,9 +404,7 @@ impl SessionStore {
                 s.messages = src.messages[..keep.min(src.messages.len())].to_vec();
                 s.updated = now_secs();
                 s.seq = self.next_seq();
-                let s = s.clone();
-                drop(map);
-                self.persist(&s);
+                self.persist(s);
             }
         }
         Some(new_id)
@@ -421,22 +416,21 @@ impl SessionStore {
     }
 
     /// Cross-session full-text search over titles, message text and tool
-    /// inputs. Sessions are all in memory, so this is a plain scan; results
-    /// are newest-first and capped at `limit` overall and
+    /// inputs. Sessions are all in memory, so this is a plain scan by
+    /// reference under the read lock — cloning every session's message
+    /// history first (the old behaviour) doubled RSS for the scan's
+    /// duration. Results are newest-first and capped at `limit` overall and
     /// `MAX_HITS_PER_SESSION` per session.
     pub fn search(&self, query: &str, limit: usize) -> Vec<SearchHit> {
         let needle = query.trim().to_lowercase();
         if needle.is_empty() || limit == 0 {
             return vec![];
         }
-        let sessions: Vec<Session> = {
-            let map = self.map.read().unwrap();
-            let mut v: Vec<Session> = map.values().cloned().collect();
-            v.sort_by(|a, b| (b.updated, b.seq).cmp(&(a.updated, a.seq)));
-            v
-        };
+        let map = self.map.read().unwrap();
+        let mut sessions: Vec<&Session> = map.values().collect();
+        sessions.sort_by(|a, b| (b.updated, b.seq).cmp(&(a.updated, a.seq)));
         let mut hits = Vec::new();
-        for s in &sessions {
+        for s in sessions {
             search_session(s, &needle, &mut hits, limit);
             if hits.len() >= limit {
                 hits.truncate(limit);
@@ -814,6 +808,56 @@ mod tests {
         store.push_message(&new, ChatMessage::user("shared term again"));
         let hits = store.search("shared term", 10);
         assert_eq!(hits[0].id, new, "newest session first");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Memory probe, not a real test — run manually with:
+    /// `cargo test --release mem_report -- --ignored --nocapture`
+    /// Prints VmRSS/VmHWM around the store's heavy paths on synthetic data
+    /// (~100 sessions × 40 × ~16 KiB messages ≈ 64 MiB retained).
+    #[test]
+    #[ignore]
+    fn mem_report() {
+        fn rss() -> String {
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.starts_with("VmRSS") || l.starts_with("VmHWM"))
+                .map(|l| l.trim().to_string())
+                .collect::<Vec<_>>()
+                .join("  ")
+        }
+        let dir = std::env::temp_dir().join(format!("amty-mem-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = "the quick brown fox jumps over the lazy dog 0123456789abcdef\n".repeat(256);
+        let msg = serde_json::to_string(&ChatMessage::user(&body)).unwrap();
+        let ids: Vec<String> = (0..100)
+            .map(|i| {
+                let id = format!("mem{i:06}");
+                let meta = serde_json::json!({"meta": {
+                    "id": id, "title": format!("session {i}"), "provider": null,
+                    "model": null, "created": i, "updated": i, "seq": i,
+                }});
+                let mut text = meta.to_string() + "\n";
+                for _ in 0..40 {
+                    text.push_str(&msg);
+                    text.push('\n');
+                }
+                std::fs::write(dir.join(format!("{id}.jsonl")), text).unwrap();
+                id
+            })
+            .collect();
+        let store = SessionStore::load(dir.clone());
+        println!("after load          {}", rss());
+        store.push_message(&ids[0], ChatMessage::user("one more"));
+        println!("after push_message  {}", rss());
+        store.set_title(&ids[1], "renamed");
+        println!("after set_title     {}", rss());
+        let hits = store.search("brown fox", 50);
+        println!("after search ({} hits) {}", hits.len(), rss());
+        let s = store.get(&ids[0]).unwrap();
+        println!("after get ({} msgs)  {}", s.messages.len(), rss());
+        drop(store);
         std::fs::remove_dir_all(dir).ok();
     }
 }

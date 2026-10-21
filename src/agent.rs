@@ -92,12 +92,17 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
             return Ok(());
         }
 
-        let session = app.sessions.get(sid).ok_or_else(|| anyhow!("session gone"))?;
+        // routing fields only — a full `get` would clone the whole message
+        // history; the messages themselves are fetched after compaction below
+        let (s_provider, s_model) = app
+            .sessions
+            .overrides(sid)
+            .ok_or_else(|| anyhow!("session gone"))?;
         let (prov_name, prov_conf, model, system, system_tail, self_modify) = {
             let cfg = app.cfg.read().unwrap();
-            let name = session.provider.clone().unwrap_or_else(|| cfg.provider.clone());
+            let name = s_provider.unwrap_or_else(|| cfg.provider.clone());
             let conf = cfg.providers.get(&name).cloned().ok_or_else(|| anyhow!("provider '{name}' not defined"))?;
-            let model = session.model.clone().unwrap_or_else(|| conf.model.clone());
+            let model = s_model.unwrap_or_else(|| conf.model.clone());
             // skills index + memory are volatile (re-scanned each turn): send
             // them as a tail so the static system_prompt stays cache-stable
             let tail = format!("{}{}", crate::config::skills_prompt(), crate::evolve::memory_prompt());
@@ -278,7 +283,12 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
                         preview: preview(&text),
                     });
                     if let Some(k) = cache_key {
-                        app.tool_cache.lock().unwrap().insert(k, (text.clone(), false));
+                        let mut cache = app.tool_cache.lock().unwrap();
+                        if cache.len() >= TOOL_CACHE_MAX {
+                            // memo only — a miss just re-runs the tool
+                            cache.clear();
+                        }
+                        cache.insert(k, (text.clone(), false));
                     }
                     results.push(Block::ToolResult { tool_use_id: id, content: text, is_error: false });
                 }
@@ -371,10 +381,16 @@ fn cacheable(name: &str, input: &serde_json::Value) -> bool {
     }
 }
 
+/// Cap on memoized read-only tool results across all sessions. Each entry
+/// holds a full tool output (≤ `tools::MAX_OUT` bytes) plus its canonicalized
+/// input key, so an unbounded map would grow for the life of the process —
+/// deleted sessions' entries included. On overflow we just clear the memo.
+const TOOL_CACHE_MAX: usize = 256;
+
 /// Drop memoized reads for a session after anything that could change their
 /// answer. Called from the write/exec tools' call sites via `run_tool`.
 fn invalidate_tool_cache(app: &App, sid: &str) {
-    app.tool_cache.lock().unwrap().retain(|(s, ..), _| s != sid);
+    app.purge_tool_cache(sid);
 }
 
 // ---------- session file tracking (issue #19) ----------
