@@ -148,11 +148,18 @@ pub async fn maybe_compact(
     cancelled: impl Fn() -> bool,
 ) {
     let Some(session) = app.sessions.get(sid) else { return };
-    // The Command Code context length lives in the model list — warm the
-    // cache once (blocking HTTP) so context_window() can read it cheaply.
-    if conf.context_window.is_none() && conf.kind == ProviderKind::CommandCode {
+    // The Command Code / OpenCode context length lives in the model list —
+    // warm the cache once (blocking HTTP) so context_window() can read it.
+    if conf.context_window.is_none() && matches!(conf.kind, ProviderKind::CommandCode | ProviderKind::OpenCode) {
         let c = conf.clone();
-        let _ = tokio::task::spawn_blocking(move || crate::provider::ensure_cc_models(&c)).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            if c.kind == ProviderKind::CommandCode {
+                crate::provider::ensure_cc_models(&c)
+            } else {
+                crate::provider::ensure_oc_models(&c)
+            }
+        })
+        .await;
     }
     let input_cap = crate::provider::context_window(conf, model).saturating_sub(max_tokens as u64);
     if estimate(&session.messages, system, tools) <= input_cap * 9 / 10 {
