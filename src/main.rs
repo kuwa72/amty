@@ -75,6 +75,10 @@ pub enum Cmd {
         session: Option<String>,
         #[arg(long, default_value = "50")] last: usize,
     },
+    /// List files/folders created during a session (empty = most recent).
+    Files {
+        session: Option<String>,
+    },
     /// Delete a session.
     Delete { session: String },
     /// Stream a session's events (SSE).

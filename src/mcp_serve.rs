@@ -48,6 +48,13 @@ fn tool_defs() -> Vec<Value> {
             "session": {"type": "string"}, "last": {"type": "integer", "default": 20}}}),
     ),
     (
+        "amty_session_files",
+        "List files/folders created during a session by tool calls (fs_write/fs_edit, and shell via a workdir diff). Returns path, tool and timestamp per entry.",
+        json!({"type": "object", "properties": {
+            "session": {"type": "string", "description": "session id or unique prefix; empty = most recent"}},
+         "required": []}),
+    ),
+    (
         "amty_get_config",
         "Read amty configuration (api keys masked).",
         json!({"type": "object", "properties": {"key": {"type": "string"}}}),
@@ -154,6 +161,17 @@ async fn call_tool(name: &str, args: &Value) -> Result<Value> {
             let msgs = v["messages"].as_array().cloned().unwrap_or_default();
             let tail: Vec<Value> = msgs.into_iter().rev().take(last).rev().collect();
             Ok(json!({"session": v["id"], "title": v["title"], "messages": tail}))
+        }
+        "amty_session_files" => {
+            let sid = args["session"].as_str().unwrap_or("");
+            // empty = most recent (the API route needs a real path segment)
+            let sid = if sid.is_empty() {
+                let v = crate::cli::get(&base, &tok, "/v1/sessions").await?;
+                v[0]["id"].as_str().unwrap_or_default().to_string()
+            } else {
+                sid.to_string()
+            };
+            crate::cli::get(&base, &tok, &format!("/v1/sessions/{sid}/files")).await
         }
         "amty_get_config" => {
             let v = crate::cli::get(&base, &tok, "/v1/config").await?;

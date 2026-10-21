@@ -23,6 +23,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/sessions", get(list_sessions).post(new_session))
         .route("/v1/search", get(search_sessions))
         .route("/v1/sessions/{id}", get(get_session).delete(delete_session))
+        .route("/v1/sessions/{id}/files", get(session_files))
         .route("/v1/sessions/{id}/messages", post(send_message))
         .route("/v1/sessions/{id}/cancel", post(cancel))
         .route("/v1/sessions/{id}/events", get(events))
@@ -148,6 +149,14 @@ async fn get_session(State(app): State<Arc<App>>, Path(id): Path<String>) -> Res
     let sid = app.sessions.resolve(&id).ok_or((StatusCode::NOT_FOUND, "no such session".into()))?;
     let s = app.sessions.get(&sid).ok_or((StatusCode::NOT_FOUND, "gone".into()))?;
     Ok(Json(json!(s)))
+}
+
+/// `GET /v1/sessions/{id}/files` — paths created by tool calls during the
+/// session (fs_write/fs_edit directly, shell via a workdir snapshot diff).
+async fn session_files(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, String)> {
+    let sid = app.sessions.resolve(&id).ok_or((StatusCode::NOT_FOUND, "no such session".into()))?;
+    let s = app.sessions.get(&sid).ok_or((StatusCode::NOT_FOUND, "gone".into()))?;
+    Ok(Json(json!({"session": sid, "files": s.files})))
 }
 
 async fn delete_session(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, String)> {

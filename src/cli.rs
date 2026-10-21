@@ -242,6 +242,27 @@ pub async fn run(cmd: crate::Cmd) -> Result<()> {
                 }
             }
         }
+        Files { session } => {
+            let (base, tok) = runtime_info()?;
+            // empty id = most recent session (the API route needs a real
+            // segment, so resolve it client-side)
+            let sid = match session.filter(|s| !s.is_empty()) {
+                Some(s) => s,
+                None => {
+                    let v = get(&base, &tok, "/v1/sessions").await?;
+                    v[0]["id"].as_str().unwrap_or_default().to_string()
+                }
+            };
+            let v = get(&base, &tok, &format!("/v1/sessions/{sid}/files")).await?;
+            for f in v["files"].as_array().cloned().unwrap_or_default() {
+                println!(
+                    "{}\t{:<8}\t{}",
+                    crate::session::fmt_stamp(f["ts"].as_u64().unwrap_or(0)),
+                    f["tool"].as_str().unwrap_or(""),
+                    f["path"].as_str().unwrap_or(""),
+                );
+            }
+        }
         Delete { session } => {
             let (base, tok) = runtime_info()?;
             print_json(&delete(&base, &tok, &format!("/v1/sessions/{session}")).await?);

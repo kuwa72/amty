@@ -4,6 +4,8 @@ use crate::provider;
 use crate::tools;
 use crate::types::*;
 use anyhow::{anyhow, Result};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -252,6 +254,13 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
                 continue;
             }
 
+            // a `shell` call can create files anywhere under its workdir, so
+            // snapshot the tree first; the post-call diff is what it created
+            let before = if name == "shell" {
+                shell_workdir(&input).map(|wd| { let s = snapshot_tree(&wd); (wd, s) })
+            } else {
+                None
+            };
             let out = run_tool(app, &name, &input, &cancelled).await;
             // a write or an exec can invalidate every memoized read
             if !cacheable(&name, &input) {
@@ -260,6 +269,9 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
             crate::evolve::record_tool(app, &name, out.is_ok());
             match out {
                 Ok(text) => {
+                    if record_created(app, sid, &name, &input, before) > 0 {
+                        app.emit(sid, EvKind::Touched);
+                    }
                     app.emit(sid, EvKind::ToolEnd {
                         name: name.clone(),
                         ok: true,
@@ -365,6 +377,96 @@ fn invalidate_tool_cache(app: &App, sid: &str) {
     app.tool_cache.lock().unwrap().retain(|(s, ..), _| s != sid);
 }
 
+// ---------- session file tracking (issue #19) ----------
+
+/// Directory names skipped when snapshotting a shell workdir — build
+/// artifacts and VCS internals would flood the session file list.
+const SNAPSHOT_SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", "__pycache__", ".venv"];
+/// Entries walked per snapshot; bounds the cost on huge trees.
+const SNAPSHOT_CAP: usize = 50_000;
+/// New paths attributed to a single `shell` call.
+const MAX_NEW_PER_CMD: usize = 64;
+
+/// Every path (files and dirs, recursively) under `root`, minus noise dirs.
+/// Errors are ignored — a partial snapshot still yields a useful diff.
+/// Symlinked dirs are not descended into (cycles / tree escapes).
+fn snapshot_tree(root: &Path) -> HashSet<PathBuf> {
+    let mut out = HashSet::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if out.len() >= SNAPSHOT_CAP {
+            break;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            if SNAPSHOT_SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()) {
+                continue;
+            }
+            let p = e.path();
+            out.insert(p.clone());
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                stack.push(p);
+            }
+            if out.len() >= SNAPSHOT_CAP {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Working dir a `shell` call runs in (same resolution as
+/// `tools::run_shell`), absolutized so recorded paths are usable from the
+/// GUI. `None` = don't snapshot: on Windows a UNC workdir is remapped to
+/// the home dir inside cmd.exe, so diffing it would record the wrong tree.
+fn shell_workdir(input: &serde_json::Value) -> Option<PathBuf> {
+    let wd = input["workdir"]
+        .as_str()
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())?;
+    if cfg!(windows) && wd.to_string_lossy().starts_with("\\\\") {
+        return None;
+    }
+    Some(absolutize(&wd))
+}
+
+fn absolutize(p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(p)
+    }
+}
+
+/// Attribute created paths to the session: fs_write/fs_edit carry the path
+/// directly; `shell` is diffed against the pre-call workdir snapshot.
+/// Returns the number of *new* paths recorded.
+fn record_created(
+    app: &App,
+    sid: &str,
+    name: &str,
+    input: &serde_json::Value,
+    before: Option<(PathBuf, HashSet<PathBuf>)>,
+) -> usize {
+    match name {
+        "fs_write" | "fs_edit" => {
+            let Some(p) = input["path"].as_str() else { return 0 };
+            let abs = std::fs::canonicalize(p).unwrap_or_else(|_| absolutize(Path::new(p)));
+            app.sessions.add_file(sid, &abs.display().to_string(), name) as usize
+        }
+        "shell" => {
+            let Some((wd, before)) = before else { return 0 };
+            let mut new: Vec<PathBuf> = snapshot_tree(&wd).difference(&before).cloned().collect();
+            new.sort();
+            new.into_iter()
+                .take(MAX_NEW_PER_CMD)
+                .filter(|p| app.sessions.add_file(sid, &p.display().to_string(), "shell"))
+                .count()
+        }
+        _ => 0,
+    }
+}
+
 async fn approval_gate(
     app: &Arc<App>,
     sid: &str,
@@ -429,5 +531,34 @@ mod tests {
         assert!(!cacheable("mcp_install", &json!({})));
         assert!(!cacheable("self_update", &json!({"action": "status"})));
         assert!(!cacheable("mcp__github__get_file_contents", &json!({})));
+    }
+
+    #[test]
+    fn snapshot_diff_finds_new_paths_and_skips_noise() {
+        let dir = std::env::temp_dir().join(format!("amty-snap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let before = snapshot_tree(&dir);
+        std::fs::write(dir.join("made.txt"), "x").unwrap();
+        std::fs::create_dir_all(dir.join("out/inner")).unwrap();
+        // noise trees are invisible to the diff even when newly created
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(dir.join("target/built.o"), "x").unwrap();
+        std::fs::create_dir_all(dir.join(".git/objects")).unwrap();
+        let new: Vec<PathBuf> = snapshot_tree(&dir).difference(&before).cloned().collect();
+        assert!(new.contains(&dir.join("made.txt")));
+        assert!(new.contains(&dir.join("out")));
+        assert!(new.contains(&dir.join("out/inner")));
+        assert!(!new.iter().any(|p| p.starts_with(dir.join("target"))));
+        assert!(!new.iter().any(|p| p.starts_with(dir.join(".git"))));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn shell_workdir_resolves_relative_and_absolute() {
+        let abs = shell_workdir(&json!({"command": "x", "workdir": "/tmp"})).unwrap();
+        assert_eq!(abs, PathBuf::from("/tmp"));
+        // missing workdir falls back to the process cwd
+        let cwd = shell_workdir(&json!({"command": "x"})).unwrap();
+        assert_eq!(cwd, std::env::current_dir().unwrap());
     }
 }

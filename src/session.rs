@@ -4,6 +4,18 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
+/// A file or directory created by a tool call during the session
+/// (fs_write/fs_edit directly, shell via a workdir snapshot diff).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionFile {
+    /// Absolute path.
+    pub path: String,
+    /// Tool that created it: fs_write | fs_edit | shell.
+    pub tool: String,
+    /// Last touch time (unix secs).
+    pub ts: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -22,6 +34,10 @@ pub struct Session {
     /// accumulated across turns and persisted in the meta line.
     #[serde(default)]
     pub usage: Usage,
+    /// Paths created by tool calls during this session (deduped by path),
+    /// persisted in the meta line and listed in the GUI files tray.
+    #[serde(default)]
+    pub files: Vec<SessionFile>,
 }
 
 impl Session {
@@ -37,6 +53,7 @@ impl Session {
             seq,
             messages: vec![],
             usage: crate::types::Usage::default(),
+            files: vec![],
         }
     }
 }
@@ -51,6 +68,8 @@ pub struct SessionMeta {
     pub n_messages: usize,
     /// Session-lifetime token totals (persisted in the meta line).
     pub usage: crate::types::Usage,
+    /// Paths created by tool calls in this session.
+    pub n_files: usize,
 }
 
 /// One cross-session search hit: a matching title or a matching message.
@@ -74,6 +93,8 @@ const SNIPPET_BEFORE: usize = 40;
 const SNIPPET_AFTER: usize = 120;
 /// Hits reported per session, so one long conversation can't flood results.
 const MAX_HITS_PER_SESSION: usize = 3;
+/// Cap on `Session::files` — a runaway `shell` diff can't grow it forever.
+const MAX_SESSION_FILES: usize = 500;
 
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -246,6 +267,7 @@ impl SessionStore {
                 updated: s.updated,
                 n_messages: s.messages.len(),
                 usage: s.usage,
+                n_files: s.files.len(),
             })
             .collect();
         v.sort_by(|a, b| b.updated.cmp(&a.updated));
@@ -314,6 +336,33 @@ impl SessionStore {
         } else {
             false
         }
+    }
+
+    /// Record a path created by a tool call. Dedupes by path — a re-touch
+    /// just refreshes tool/ts. Returns true when a new path was appended.
+    pub fn add_file(&self, id: &str, path: &str, tool: &str) -> bool {
+        let mut map = self.map.write().unwrap();
+        let Some(s) = map.get_mut(id) else { return false };
+        if let Some(f) = s.files.iter_mut().find(|f| f.path == path) {
+            f.tool = tool.to_string();
+            f.ts = now_secs();
+            let s = s.clone();
+            drop(map);
+            self.persist(&s);
+            return false;
+        }
+        if s.files.len() >= MAX_SESSION_FILES {
+            return false;
+        }
+        s.files.push(SessionFile {
+            path: path.to_string(),
+            tool: tool.to_string(),
+            ts: now_secs(),
+        });
+        let s = s.clone();
+        drop(map);
+        self.persist(&s);
+        true
     }
 
     /// Fold one provider call's usage into the session total and persist it.
@@ -490,6 +539,9 @@ struct MetaOnly {
     /// Session-lifetime token totals (see `Session::usage`).
     #[serde(default)]
     usage: crate::types::Usage,
+    /// Paths created by tool calls (see `Session::files`).
+    #[serde(default)]
+    files: Vec<SessionFile>,
 }
 
 impl From<&Session> for MetaOnly {
@@ -503,6 +555,7 @@ impl From<&Session> for MetaOnly {
             updated: s.updated,
             seq: s.seq,
             usage: s.usage,
+            files: s.files.clone(),
         }
     }
 }
@@ -568,6 +621,28 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    #[test]
+    fn files_are_tracked_deduped_and_persisted() {
+        let (store, dir) = temp_store();
+        let id = store.create(None, None);
+        assert!(store.add_file(&id, "/tmp/made.txt", "fs_write"));
+        assert!(store.add_file(&id, "/tmp/outdir", "shell"));
+        // same path again: deduped (list stays), tool/ts refreshed
+        assert!(!store.add_file(&id, "/tmp/made.txt", "fs_edit"));
+        assert!(!store.add_file("no-such-session", "/x", "fs_write"));
+        let s = store.get(&id).unwrap();
+        assert_eq!(s.files.len(), 2);
+        assert_eq!(s.files[0].path, "/tmp/made.txt");
+        assert_eq!(s.files[0].tool, "fs_edit");
+        let meta = store.list().into_iter().find(|m| m.id == id).unwrap();
+        assert_eq!(meta.n_files, 2);
+        // the list lives in the meta line, so it survives a reload
+        drop(store);
+        let store2 = SessionStore::load(dir.clone());
+        assert_eq!(store2.get(&id).unwrap().files.len(), 2);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     /// Old session files have no `usage` in the meta line and must still load.
     #[test]
     fn sessions_without_usage_field_still_load() {
@@ -589,6 +664,7 @@ mod tests {
         let s = store.get("legacy1").expect("legacy session loads");
         assert_eq!(s.messages.len(), 1);
         assert!(s.usage.is_zero());
+        assert!(s.files.is_empty());
         std::fs::remove_dir_all(dir).ok();
     }
 

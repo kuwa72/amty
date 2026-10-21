@@ -113,6 +113,12 @@ static JA: &[(&str, &str)] = &[
     ("paste", "貼り付け"),
     ("select all", "すべて選択"),
     ("double-click to rename", "ダブルクリックで名前変更"),
+    // session files tray
+    ("session files", "セッションファイル"),
+    ("open", "開く"),
+    ("reveal in file manager", "ファイルマネージャで表示"),
+    ("copy path", "パスをコピー"),
+    ("(no longer exists)", "(存在しません)"),
     ("approval:", "承認モード:"),
     ("allowed command prefixes (one per line):", "確認なしで実行するコマンド接頭辞 (1行に1つ):"),
     ("allowed write paths (one per line):", "確認なしで書き込めるパス接頭辞 (1行に1つ):"),
