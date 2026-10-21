@@ -54,7 +54,12 @@ do via `config_set`, a script can do via `POST /v1/config`, and vice versa.
   (e.g. `windows-env`, `wsl-env`, `gws`) instead of probing the environment.
 - memory: `$XDG_CONFIG_HOME/amty/MEMORY.md` — written by the reflection pass,
   injected into the system tail each turn (`evolve::memory_prompt`, ~6 KB cap)
-- sessions: `$XDG_DATA_HOME/amty/sessions/<id>.jsonl` (meta line + messages)
+- sessions: `$XDG_DATA_HOME/amty/sessions/<id>.jsonl` (meta line + messages).
+  `SessionStore::search` / `search_in` do a plain in-memory scan over titles,
+  message text and tool calls (no index; the whole store is already loaded);
+  exposed as `GET /v1/search?q=…[&session=…][&limit=N]`, `amty search <query>
+  [-s <id>] [--limit N] [--json]`, the `amty_search_sessions` MCP tool, and the
+  GUI sidebar box (typing filters titles, Enter runs the full-text search).
 - runtime discovery: `$XDG_DATA_HOME/amty/runtime.json` (0600)
 - evolve state: `$XDG_DATA_HOME/amty/evolve.json` (tool stats, learned
   approvals, reflection watermarks), `evolve.log`, `self-update.log`
@@ -71,6 +76,7 @@ cargo build --release
                                  #   XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir)
 ./target/debug/amty status       # requires a running instance
 ./target/debug/amty send "hi"    # most recent session; --new, -s <id>, --no-wait
+./target/debug/amty search rust -s <id>   # cross-session full-text search; --limit N --json
 ./target/debug/amty mcp-serve    # stdio MCP server for external agents
 ./target/debug/amty catalog      # list installable MCP servers
 ./target/debug/amty mcp remove <name>      # delete a server from config
@@ -81,6 +87,9 @@ cargo build --release
 ./target/debug/amty evolve <session>  # force a reflection pass on a session
 
 # Windows native binary (cross-compiled from WSL; needs mingw-w64 incl. windres):
+./scripts/build-windows.sh          # build + deploy to %USERPROFILE%\.local\bin\amty.exe
+                                    # (refuses while amty.exe runs; --force kills it first)
+# equivalent by hand:
 cargo build --release --target x86_64-pc-windows-gnu
 # -> target/x86_64-pc-windows-gnu/release/amty.exe  (~24 MB, static, no DLLs)
 # release uses thin LTO — fat LTO + codegen-units=1 spent ~5 min in rustc.
@@ -130,13 +139,38 @@ amty continuously improves itself; toggles live under `evolve.*` config keys
   Unlearn via `POST /v1/evolve/forget`, `self_update forget <command>`, or
   `amty evolve forget <cmd>`.
 - **Self-rebuild** (`evolve.self_modify`): the `self_update` tool —
-  `status | reflect [session] | rebuild | restart`. `rebuild` runs `cargo
-  build` detached in `CARGO_MANIFEST_DIR` (profile matches the running exe:
-  target/debug → debug, else release) logging to `self-update.log`, since a
-  cold build can exceed the 300 s tool cap. If the artifact path equals the
-  running exe the build is redirected to `target/self-update/` — a running
-  exe can't be linked over (Windows lock, unix ETXTBSY), so it builds out of
-  the way and the swap handles installation.
+  `status | reflect [session] | rebuild | install <path> | restart | forget`.
+  `rebuild` runs `cargo build` detached in `CARGO_MANIFEST_DIR` (profile matches
+  the running exe: target/debug → debug, else release) logging to
+  `self-update.log`, since a cold build can exceed the 300 s tool cap. If the
+  artifact path equals the running exe the build is redirected to
+  `target/self-update/` — a running exe can't be linked over (Windows lock,
+  unix ETXTBSY), so it builds out of the way and the swap handles installation.
+- **Install a prebuilt binary** (`install`): for machines where `rebuild`
+  cannot run — e.g. a Windows amty cross-built from WSL, whose
+  `CARGO_MANIFEST_DIR` is a `/home/...` path (`source_dir: null`) and where no
+  Windows cargo exists. `install` takes the artifact path, validates it
+  (exists, is a file, `.exe` on Windows, not the running exe, >1 MiB, and
+  `<artifact> --version` actually runs and prints `amty`), sets
+  `built_binary`, and hands off to the same restart path. Smoke-testing
+  *before* the swap matters: afterwards a rollback is the only recourse.
+  Deploy recipe: `cargo build --release --target x86_64-pc-windows-gnu` in
+  WSL → copy to a Windows path from the WSL side (`/mnt/c…`; `cmd /c copy
+  \\wsl.localhost\…` silently copies 0 files) → `self_update install path=…`.
+  Deploying *from* a binary older than the `install` action needs one manual
+  rename-aside/copy (renaming a running exe is legal on Windows); after that,
+  `install` works. Machine-specific notes live in the `amty-self-update` skill.
+- **Trigger paths**: rebuild/install/restart are only reachable through the
+  `self_update` agent tool — drive it by asking the agent (`amty send "call
+  self_update rebuild"` or the GUI). There is no CLI subcommand or API
+  endpoint that builds (`amty evolve` and `GET /v1/evolve` are read-only; the
+  `amty_evolve` MCP facade exposes status|reflect|forget only). rebuild/
+  install/restart count as `Risk::Exec` → they prompt for approval in `ask`
+  mode. `self_update restart` with no freshly `built_binary` only re-launches
+  the same exe (install == target → swap helper skips the copy); replacing the
+  exe requires a `rebuild`- or `install`-produced artifact. `self_update
+  status` shows `source_dir`/`build_profile`/`building`/`built_binary`/
+  `restart_pending` — check it before claiming a rebuild is possible.
 - **Restart/swap** (`evolve.auto_restart`): when all runs are idle (checked
   after `end_run`), `maybe_restart` copies the running exe to
   `$XDG_DATA_HOME/amty/self-swap/amty-helper` and spawns it as the hidden
@@ -152,9 +186,15 @@ amty continuously improves itself; toggles live under `evolve.*` config keys
   with the five toggles plus a read-only MEMORY.md viewer.
 - **Verified on Windows**: `self_update restart` from an agent session drove
   the full swap (helper copy → pid wait → exe replace → relaunch) including
-  a real binary replacement (0.3.0 → 0.3.0-swaptest). A Windows binary whose
+  a real binary replacement (0.3.0 → 0.3.0-swaptest), and `self_update
+  install` deployed a cross-built artifact the same way (2026-10-21: exe
+  replaced, pid changed, new `amty search` working). A Windows binary whose
   CARGO_MANIFEST_DIR points into WSL reports `source_dir: null` — rebuild
-  there needs a Windows-side checkout + cargo.
+  there needs a Windows-side checkout + cargo. So the deployed
+  `%USERPROFILE%\.local\bin\amty.exe` (cross-built from WSL) can swap/restart
+  itself and install a prebuilt artifact, but cannot self-*rebuild*;
+  `./scripts/build-windows.sh` remains the build-and-deploy script for that
+  machine (it still requires amty to be stopped, `--force` to kill it).
 
 ## Known limits / TODO
 
