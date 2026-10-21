@@ -1,6 +1,6 @@
 [package]
 name = "amty"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 description = "amty - lightweight scriptable AI chat & agent client"
 license = "MIT OR Apache-2.0"
