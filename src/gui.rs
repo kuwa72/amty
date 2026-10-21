@@ -996,6 +996,63 @@ impl eframe::App for GuiApp {
                 self.app.approvals.resolve(&id, allow);
                 self.pending.retain(|p| p.id != id);
             }
+            // ----- session files tray: paths created by tool calls -----
+            // sits right above the input row like a task tray; a row opens
+            // on click, right-click offers reveal/copy. Hidden when empty.
+            if let Some(files) = self.view.as_ref().map(|s| s.files.clone()).filter(|f| !f.is_empty()) {
+                let (t_open, t_reveal, t_copy, t_missing) = (
+                    self.tr("open"),
+                    self.tr("reveal in file manager"),
+                    self.tr("copy path"),
+                    self.tr("(no longer exists)"),
+                );
+                egui::CollapsingHeader::new(format!("📁 {} ({})", self.tr("session files"), files.len()))
+                    .id_salt("session_files")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("session_files_rows")
+                            .max_height(140.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for f in &files {
+                                    let missing = !std::path::Path::new(&f.path).exists();
+                                    let mut text = egui::RichText::new(&f.path).monospace().small();
+                                    if missing {
+                                        text = text.weak();
+                                    }
+                                    let resp = ui.add(
+                                        egui::Label::new(text).truncate().sense(egui::Sense::click()),
+                                    );
+                                    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                                    let resp = resp.on_hover_text(format!(
+                                        "{}\n{} · {}{}",
+                                        f.path,
+                                        f.tool,
+                                        stamp(f.ts),
+                                        if missing { format!("\n{t_missing}") } else { String::new() },
+                                    ));
+                                    if resp.clicked() {
+                                        open_path(&f.path);
+                                    }
+                                    resp.context_menu(|ui| {
+                                        if ui.button(t_open).clicked() {
+                                            open_path(&f.path);
+                                            ui.close();
+                                        }
+                                        if ui.button(t_reveal).clicked() {
+                                            reveal_path(&f.path);
+                                            ui.close();
+                                        }
+                                        if ui.button(t_copy).clicked() {
+                                            ui.ctx().copy_text(f.path.clone());
+                                            ui.close();
+                                        }
+                                    });
+                                }
+                            });
+                    });
+            }
             // thumbnails of images queued for the next message, each removable
             if !self.pending_images.is_empty() {
                 let mut remove: Option<usize> = None;
@@ -1600,6 +1657,46 @@ enum MsgAction {
     Rewind(usize),
     /// new session with messages[..=idx]
     Fork(usize),
+}
+
+/// Open a path with the OS default handler (associated app / file manager).
+fn open_path(path: &str) {
+    #[cfg(target_os = "windows")]
+    let r = {
+        let mut c = std::process::Command::new("explorer");
+        crate::catalog::no_window(&mut c);
+        c.arg(path).spawn()
+    };
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let r = std::process::Command::new("xdg-open").arg(path).spawn();
+    #[cfg(not(any(unix, windows)))]
+    let r: std::io::Result<std::process::Child> = Err(std::io::Error::other("unsupported platform"));
+    let _ = r;
+}
+
+/// Reveal a path in the OS file manager. Linux has no standard "select this
+/// file" call, so the containing folder is opened instead.
+fn reveal_path(path: &str) {
+    #[cfg(target_os = "windows")]
+    let r = {
+        let mut c = std::process::Command::new("explorer");
+        crate::catalog::no_window(&mut c);
+        c.arg(format!("/select,{path}")).spawn()
+    };
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").args(["-R", path]).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let r = {
+        let p = std::path::Path::new(path);
+        std::process::Command::new("xdg-open")
+            .arg(p.parent().unwrap_or(p))
+            .spawn()
+    };
+    #[cfg(not(any(unix, windows)))]
+    let r: std::io::Result<std::process::Child> = Err(std::io::Error::other("unsupported platform"));
+    let _ = r;
 }
 
 /// A tool-only message is part of a run: the assistant message holding only
