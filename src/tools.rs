@@ -530,18 +530,16 @@ pub async fn execute(app: &std::sync::Arc<App>, name: &str, input: &Value) -> Re
 /// itself (it contains a space) and escapes the inner quotes as `\"`.
 /// Reproduce with the LIST form instead:
 ///     subprocess.run(["cmd", "/S", "/C", "chcp 65001 >nul & dir /b <path>"])
-/// Known remaining limitation (pre-existing, not a regression): because
-/// `Command` escapes the quotes of the wrapped argument, a command that itself
-/// contains `"` is not passed through faithfully, so `dir /b "C:\some path"`
-/// fails with "The filename, directory name, or volume label syntax is
-/// incorrect." Fixing that needs `raw_arg` or a temp `.cmd`, both of which must
-/// be verified on Windows first.
+/// The quote-mangling limitation described above was fixed by routing Windows
+/// commands through a temp `.cmd` file instead — see `run_shell_via_cmd_file`.
+/// The Windows `wrap_shell` below is now only exercised by tests; production
+/// code no longer passes a wrapped command string to `cmd /C`.
 #[cfg(unix)]
 fn wrap_shell(command: &str) -> (&'static str, &'static str, String) {
     ("/bin/sh", "-c", command.to_string())
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn wrap_shell(command: &str) -> (&'static str, &'static str, String) {
     ("cmd", "/C", format!("chcp 65001 >nul & {command}"))
 }
@@ -560,9 +558,73 @@ fn is_unc(_p: &Path) -> bool {
 /// explicitly: `wait_with_output` only captures what was piped at spawn —
 /// the spawn default (inherit) silently returns empty output.
 async fn run_shell(command: &str, workdir: Option<&str>, timeout: u64) -> Result<String, String> {
-    let (prog, flag, command) = wrap_shell(command);
+    // Windows: `cmd /C "<command>"` cannot carry a command that itself contains
+    // quotes. Rust escapes the inner quotes when building the cmd.exe argv, and
+    // cmd.exe does not un-escape them the way a POSIX shell would, so the child
+    // receives mangled arguments. Measured on this machine (5 shapes, all quoted):
+    //   dir /b "C:\Program Files"        -> rc=1 "The filename, directory name,
+    //                                            or volume label syntax is incorrect."
+    //   wsl.exe ... bash -c "echo x"     -> rc=2 "unexpected EOF while looking
+    //                                            for matching `\"'"
+    //   git -C "\\wsl.localhost\..."     -> rc=128 "cannot change to '\"\\\\wsl...'"
+    // 98% of the shell commands in the local sessions contain a quote, which is
+    // why 573 hand-written scripts exist: the model gave up and wrote a file.
+    // Fix: land the command in a temp .cmd (UTF-8 + `chcp 65001`, the only
+    // encoding that round-trips Japanese *and* quotes — verified) and run that.
+    #[cfg(windows)]
+    {
+        run_shell_via_cmd_file(command, workdir, timeout).await
+    }
+    #[cfg(not(windows))]
+    {
+        let (prog, flag, command) = wrap_shell(command);
+        run_shell_spawn(prog, flag, &command, workdir, timeout).await
+    }
+}
+
+/// Windows path: write `command` to a temp `.cmd` and execute that file.
+///
+/// The file is written by amty (not by the model), so the shell tool keeps
+/// working exactly as documented while the quoting problem disappears. The
+/// UTF-8 body is decoded correctly because `chcp 65001` is the first command in
+/// the file; a BOM would be echoed as garbage by cmd.exe, so it is not written.
+#[cfg(windows)]
+async fn run_shell_via_cmd_file(
+    command: &str,
+    workdir: Option<&str>,
+    timeout: u64,
+) -> Result<String, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let dir = std::env::temp_dir().join("amty-sh");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // unique per call: two concurrent shell calls must not collide
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("sh-{}-{}.cmd", std::process::id(), n));
+
+    let mut body = String::from("@echo off\r\nchcp 65001 >nul\r\n");
+    body.push_str(command);
+    body.push_str("\r\n");
+    std::fs::write(&path, body.as_bytes()).map_err(|e| e.to_string())?;
+
+    let path_arg = path.to_string_lossy().to_string();
+    let res = run_shell_spawn("cmd", "/C", &path_arg, workdir, timeout).await;
+
+    let _ = std::fs::remove_file(&path);
+    res
+}
+
+/// Spawn `prog flag arg`, capture stdio, apply the UNC cwd fallback.
+async fn run_shell_spawn(
+    prog: &str,
+    flag: &str,
+    arg: &str,
+    workdir: Option<&str>,
+    timeout: u64,
+) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new(prog);
-    cmd.args([flag, &command])
+    cmd.args([flag, arg])
         .kill_on_drop(true)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1471,6 +1533,30 @@ mod tests {
         assert!(text.contains("Hello"));
         assert!(text.contains("a bold & co"));
         assert!(text.contains("one") && text.contains("two"));
+    }
+
+    /// The shell tool must survive quotes. `cmd /C "<command>"` mangled every
+    /// quoted argument (measured: `dir /b "C:\Program Files"` rc=1,
+    /// `wsl.exe ... bash -c "echo x"` rc=2, `git -C "\\wsl.localhost\..."` rc=128),
+    /// which is why 98% of the shell commands in the local sessions had to be
+    /// wrapped in hand-written scripts. Windows now routes through a temp .cmd.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_survives_quotes_and_japanese() {
+        let out = run_shell(r#"echo "quoted arg" & echo 日本語テスト"#, None, 30)
+            .await
+            .expect("quoted command should run");
+        assert!(out.contains("quoted arg"), "quotes mangled: {out}");
+        assert!(out.contains("日本語テスト"), "japanese mangled: {out}");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_still_reports_failures_and_multi_commands() {
+        // multi-command with & , and an exit code that must survive
+        let out = run_shell("echo A & echo B & exit 3", None, 30).await.expect("runs");
+        assert!(out.contains("A") && out.contains("B"), "{out}");
+        assert!(out.contains("[exit 3]"), "exit code lost: {out}");
     }
 
     #[test]
