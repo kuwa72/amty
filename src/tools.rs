@@ -18,7 +18,7 @@ pub enum Risk {
 pub fn risk_of(name: &str) -> Risk {
     match name {
         "fs_read" | "fs_list" | "config_get" | "mcp" | "web_search" | "web_fetch"
-        | "self_update" => Risk::Safe,
+        | "self_update" | "note_list" | "note_read" | "note_search" => Risk::Safe,
         "shell" => Risk::Exec,
         _ => {
             if name.starts_with("mcp__") {
@@ -134,6 +134,40 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
             ),
         },
         ToolSpec {
+            name: "note_list".into(),
+            description: "List notes in the markdown knowledge store (name, title, size, mtime). Note names are '/'-separated paths without .md, e.g. 'projects/amty/decisions'.".into(),
+            schema: schema(json!({}), &[]),
+        },
+        ToolSpec {
+            name: "note_read".into(),
+            description: "Read a note's markdown content.".into(),
+            schema: schema(json!({"name": {"type": "string"}}), &["name"]),
+        },
+        ToolSpec {
+            name: "note_write".into(),
+            description: "Create or overwrite a note (full content replace). Writes only inside the notes dir; nested paths create directories.".into(),
+            schema: schema(
+                json!({"name": {"type": "string"}, "content": {"type": "string"}}),
+                &["name", "content"],
+            ),
+        },
+        ToolSpec {
+            name: "note_delete".into(),
+            description: "Delete a note permanently.".into(),
+            schema: schema(json!({"name": {"type": "string"}}), &["name"]),
+        },
+        ToolSpec {
+            name: "note_search".into(),
+            description: "Full-text search over note names and contents (case-insensitive substring). Returns matching notes with a one-line excerpt.".into(),
+            schema: schema(
+                json!({
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "description": "max hits (default 20)"}
+                }),
+                &["query"],
+            ),
+        },
+        ToolSpec {
             name: "mcp".into(),
             description: "Manage MCP servers. actions: list | tools | enable <name> | disable <name> | reconnect <name> | remove <name>.".into(),
             schema: schema(
@@ -199,6 +233,10 @@ pub fn summarize(name: &str, input: &Value) -> String {
         "mcp_search" => format!("mcp_search: {}", input["query"].as_str().unwrap_or("")),
         "mcp_install" => format!("mcp_install: {} ({})", input["id"].as_str().unwrap_or(""), input["package"].as_str().unwrap_or("")),
         "self_update" => format!("self_update: {}", input["action"].as_str().unwrap_or("status")),
+        n if n.starts_with("note_") => {
+            let key = n.strip_prefix("note_").unwrap_or(n);
+            format!("{n}: {}", input["name"].as_str().or(input["query"].as_str()).unwrap_or(key))
+        }
         _ => {
             let s = input.to_string();
             format!("{name}: {}", &s[..s.len().min(300)])
@@ -246,6 +284,9 @@ fn allowlisted(cfg: &Config, name: &str, input: &Value) -> bool {
                 canon.starts_with(&base)
             })
         }
+        // note writes/deletes only ever touch the notes dir — an app-owned
+        // sandbox — so there's no path for a user allowlist to match against.
+        "note_write" | "note_delete" => true,
         _ => false,
     }
 }
@@ -512,6 +553,61 @@ pub async fn execute(app: &std::sync::Arc<App>, name: &str, input: &Value) -> Re
                 msg.push_str(&format!("\nwarning: {w}"));
             }
             Ok(msg)
+        }
+        "note_list" | "note_read" | "note_write" | "note_delete" | "note_search" => {
+            let dir = {
+                let cfg = app.cfg.read().map_err(|e| e.to_string())?;
+                crate::notes::dir(&cfg)
+            };
+            match name {
+                "note_list" => {
+                    let metas = crate::notes::list(&dir);
+                    let mut out = format!("# notes dir: {}\n", dir.display());
+                    if metas.is_empty() {
+                        out.push_str("(no notes yet)");
+                    }
+                    for m in metas {
+                        out.push_str(&format!(
+                            "{}\t{} B\t{}\t{}\n",
+                            m.name,
+                            m.bytes,
+                            crate::session::fmt_stamp(m.updated),
+                            m.title,
+                        ));
+                    }
+                    Ok(out.trim_end().to_string())
+                }
+                "note_read" => {
+                    let n = input["name"].as_str().ok_or("name required")?;
+                    crate::notes::read(&dir, n).map(truncate)
+                }
+                "note_write" => {
+                    let n = input["name"].as_str().ok_or("name required")?;
+                    let content = input["content"].as_str().unwrap_or("");
+                    let bytes = crate::notes::write(&dir, n, content)?;
+                    app.emit("", crate::types::EvKind::Touched);
+                    Ok(format!("wrote {bytes} bytes to note '{n}'"))
+                }
+                "note_delete" => {
+                    let n = input["name"].as_str().ok_or("name required")?;
+                    crate::notes::delete(&dir, n)?;
+                    app.emit("", crate::types::EvKind::Touched);
+                    Ok(format!("deleted note '{n}'"))
+                }
+                _ => {
+                    let q = input["query"].as_str().ok_or("query required")?;
+                    let limit = input["limit"].as_u64().unwrap_or(20).clamp(1, 200) as usize;
+                    let hits = crate::notes::search(&dir, q, limit);
+                    if hits.is_empty() {
+                        return Ok("no matching notes".into());
+                    }
+                    Ok(hits
+                        .iter()
+                        .map(|h| format!("{}\t{}\t{}", h.name, h.title, h.snippet))
+                        .collect::<Vec<_>>()
+                        .join("\n"))
+                }
+            }
         }
         _ => Err(format!("unknown builtin tool '{name}'")),
     }

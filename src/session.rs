@@ -149,7 +149,8 @@ fn collapse_ws(s: &str) -> String {
 /// Excerpt around the first case-insensitive match of `needle` (already
 /// lowercased). Windows are measured in characters, not bytes, so CJK text
 /// (~3 bytes/char) still gets a readable snippet. `None` = no match.
-fn snippet_around(text: &str, needle: &str) -> Option<String> {
+/// Shared with the notes store's search snippets.
+pub(crate) fn snippet_around(text: &str, needle: &str) -> Option<String> {
     let lower = text.to_lowercase();
     let at = lower.find(needle)?;
     // Lowercasing can change byte lengths for a few exotic characters; only

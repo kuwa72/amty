@@ -134,6 +134,16 @@ impl SearchConf {
     }
 }
 
+/// Markdown knowledge-store settings (`notes.*` keys).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotesConf {
+    /// Notes root; empty = `<data_dir>/notes`. Point it at an existing
+    /// directory of markdown files — e.g. an Obsidian vault — to share the
+    /// store with a human-facing editor.
+    pub dir: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -242,6 +252,8 @@ pub struct Config {
     pub last_session: Option<String>,
     /// Self-evolution toggles.
     pub evolve: EvolveConf,
+    /// Markdown notes store (agent knowledge base / Obsidian-compatible).
+    pub notes: NotesConf,
 }
 
 impl Default for Config {
@@ -303,6 +315,7 @@ impl Default for Config {
             mcp_servers: BTreeMap::new(),
             last_session: None,
             evolve: EvolveConf::default(),
+            notes: NotesConf::default(),
         }
     }
 }
@@ -579,6 +592,15 @@ impl Config {
                 }
                 Ok(format!("{key} updated"))
             }
+            _ if key.starts_with("notes.") => {
+                match &key["notes.".len()..] {
+                    "dir" => {
+                        self.notes.dir = (!value.is_empty()).then(|| value.into());
+                    }
+                    f => bail!("unknown notes field '{f}'"),
+                }
+                Ok(format!("{key} updated"))
+            }
             _ if key.starts_with("evolve.") => {
                 let field = &key["evolve.".len()..];
                 let v = matches!(value, "true" | "1" | "on" | "yes");
@@ -658,6 +680,13 @@ impl Config {
             }
             return Ok(format!("{key} cleared"));
         }
+        if let Some(field) = key.strip_prefix("notes.") {
+            match field {
+                "dir" => self.notes.dir = None,
+                _ => bail!("notes field '{field}' is not removable"),
+            }
+            return Ok(format!("{key} cleared"));
+        }
         bail!("unknown key '{key}'")
     }
 
@@ -674,6 +703,7 @@ impl Config {
             "providers" => Ok(self.providers.keys().cloned().collect::<Vec<_>>().join(", ")),
             "mcp_servers" => Ok(self.mcp_servers.keys().cloned().collect::<Vec<_>>().join(", ")),
             "search" => Ok(self.search.backend.clone()),
+            "notes" | "notes.dir" => Ok(crate::notes::dir(self).display().to_string()),
             "evolve" => Ok(format!(
                 "reflect={} skills={} self_modify={} auto_restart={} learn_approvals={}",
                 self.evolve.reflect, self.evolve.skills, self.evolve.self_modify,

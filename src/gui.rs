@@ -371,7 +371,29 @@ pub struct GuiApp {
     /// value of `search_buf` the current `search_hits` were computed for
     search_for: String,
     /// Windows: Ctrl+V is currently held (rising-edge debounce for image paste)
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     paste_hot: bool,
+    // ----- notes (markdown knowledge store) -----
+    /// right-side notes browser panel
+    show_notes: bool,
+    /// cached note list; reloaded when `notes_dirty` and the panel is visible
+    notes: Vec<crate::notes::NoteMeta>,
+    notes_dirty: bool,
+    notes_filter: String,
+    /// floating view/edit window for the selected note
+    note_win: Option<NoteWin>,
+}
+
+/// State of the floating note window. `is_new` keeps the name field editable
+/// until the first save assigns the note a real name.
+struct NoteWin {
+    name: String,
+    /// editor buffer; preview shows this too
+    text: String,
+    /// content as last loaded/saved (dirty = text != orig)
+    orig: String,
+    editing: bool,
+    is_new: bool,
 }
 
 impl GuiApp {
@@ -421,6 +443,11 @@ impl GuiApp {
             search_hits: None,
             search_for: String::new(),
             paste_hot: false,
+            show_notes: false,
+            notes: vec![],
+            notes_dirty: true,
+            notes_filter: String::new(),
+            note_win: None,
         }
     }
 
@@ -493,6 +520,10 @@ impl GuiApp {
                 self.live_text.remove(&ev.session);
                 if matches!(ev.kind, EvKind::Done) {
                     self.live_tool.remove(&ev.session);
+                }
+                // Touched with no session = global change (config/mcp/notes)
+                if ev.session.is_empty() {
+                    self.notes_dirty = true;
                 }
                 self.view_dirty = true;
             }
@@ -871,6 +902,9 @@ impl eframe::App for GuiApp {
                         if ui.button(self.tr("mcp")).clicked() {
                             self.show_mcp = !self.show_mcp;
                         }
+                        if ui.button(self.tr("notes")).clicked() {
+                            self.show_notes = !self.show_notes;
+                        }
                     });
                 });
 
@@ -1028,6 +1062,158 @@ impl eframe::App for GuiApp {
             });
         });
 
+        // ----- right: notes browser -----
+        // Declared before the bottom input panel so it claims the full window
+        // height; the input row stays under the chat area.
+        if self.show_notes {
+            if self.notes_dirty {
+                let dir = crate::notes::dir(&self.app.cfg.read().unwrap());
+                self.notes = crate::notes::list(&dir);
+                self.notes_dirty = false;
+                // an external edit (note_write tool / API / Obsidian) also
+                // refreshes an open window — only while the user hasn't typed
+                if let Some(w) = self.note_win.as_mut() {
+                    if !w.is_new && w.text == w.orig {
+                        if let Ok(text) = crate::notes::read(&dir, &w.name) {
+                            w.text = text.clone();
+                            w.orig = text;
+                        }
+                    }
+                }
+            }
+            let notes_dir = crate::notes::dir(&self.app.cfg.read().unwrap());
+            egui::Panel::right("notes")
+                .default_size(230.0)
+                .min_size(170.0)
+                .show(ui, |ui| {
+                    // session files claim the bottom of the pane first (the
+                    // side_footer pattern), notes list gets the rest
+                    let files = self.view.as_ref().map(|s| s.files.clone()).filter(|f| !f.is_empty());
+                    if let Some(files) = files {
+                        let lang = self.app.cfg.read().unwrap().lang.clone();
+                        egui::Panel::bottom("notes_files")
+                            .show_separator_line(false)
+                            .show(ui, |ui| {
+                                ui.separator();
+                                egui::CollapsingHeader::new(format!("📁 {} ({})", self.tr("session files"), files.len()))
+                                    .id_salt("notes_session_files")
+                                    .default_open(true)
+                                    .show(ui, |ui| {
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("notes_files_rows")
+                                            .max_height(180.0)
+                                            .auto_shrink([false, true])
+                                            .show(ui, |ui| render_file_rows(ui, &files, &lang));
+                                    });
+                            });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.heading(self.tr("notes"));
+                        if ui.small_button("📂").on_hover_text(self.tr("open notes dir")).clicked() {
+                            open_path(&notes_dir.display().to_string());
+                        }
+                        if ui.button(self.tr("＋ new")).clicked() {
+                            self.note_win = Some(NoteWin {
+                                name: String::new(),
+                                text: String::new(),
+                                orig: String::new(),
+                                editing: true,
+                                is_new: true,
+                            });
+                        }
+                    });
+                    let filter_hint = self.tr("filter");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.notes_filter)
+                            .hint_text(filter_hint)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt("notes")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let filter = self.notes_filter.trim().to_lowercase();
+                            let mut open: Option<String> = None;
+                            let mut delete: Option<String> = None;
+                            let mut shown = 0;
+                            for m in &self.notes {
+                                if !filter.is_empty()
+                                    && !m.name.to_lowercase().contains(&filter)
+                                    && !m.title.to_lowercase().contains(&filter)
+                                {
+                                    continue;
+                                }
+                                shown += 1;
+                                let resp = ui.add(
+                                    egui::Button::selectable(
+                                        self.note_win.as_ref().map(|w| w.name.as_str()) == Some(m.name.as_str()),
+                                        &m.title,
+                                    )
+                                    .truncate(),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&m.name).small()
+                                            .color(ui.visuals().weak_text_color()),
+                                    )
+                                    .truncate(),
+                                );
+                                let resp = resp.on_hover_text(format!(
+                                    "{}\n{} · {} B",
+                                    m.name,
+                                    crate::session::fmt_stamp(m.updated),
+                                    m.bytes,
+                                ));
+                                resp.context_menu(|ui| {
+                                    if ui.button(self.tr("reveal in file manager")).clicked() {
+                                        if let Ok(p) = crate::notes::file_path(&notes_dir, &m.name) {
+                                            reveal_path(&p.display().to_string());
+                                        }
+                                        ui.close();
+                                    }
+                                    if ui.button(self.tr("delete")).clicked() {
+                                        delete = Some(m.name.clone());
+                                        ui.close();
+                                    }
+                                });
+                                if resp.clicked() {
+                                    open = Some(m.name.clone());
+                                }
+                            }
+                            if shown == 0 {
+                                ui.weak(self.tr(if self.notes.is_empty() { "no notes yet" } else { "no matches" }));
+                            }
+                            if let Some(name) = delete {
+                                match crate::notes::delete(&notes_dir, &name) {
+                                    Ok(_) => {
+                                        if self.note_win.as_ref().map(|w| w.name.as_str()) == Some(name.as_str()) {
+                                            self.note_win = None;
+                                        }
+                                        self.notes_dirty = true;
+                                        self.toast(format!("{} {name}", self.tr("removed:")));
+                                    }
+                                    Err(e) => self.toast(format!("{} {e}", self.tr("remove failed:"))),
+                                }
+                            }
+                            if let Some(name) = open {
+                                match crate::notes::read(&notes_dir, &name) {
+                                    Ok(text) => {
+                                        self.note_win = Some(NoteWin {
+                                            name,
+                                            orig: text.clone(),
+                                            text,
+                                            editing: false,
+                                            is_new: false,
+                                        });
+                                    }
+                                    Err(e) => self.toast(format!("{} {e}", self.tr("error:"))),
+                                }
+                            }
+                        });
+                });
+        }
+
         // ----- bottom: input -----
         egui::Panel::bottom("input").show(ui, |ui| {
             // pending approvals sit right above the input row so they can't
@@ -1062,61 +1248,22 @@ impl eframe::App for GuiApp {
                 self.pending.retain(|p| p.id != id);
             }
             // ----- session files tray: paths created by tool calls -----
-            // sits right above the input row like a task tray; a row opens
-            // on click, right-click offers reveal/copy. Hidden when empty.
-            if let Some(files) = self.view.as_ref().map(|s| s.files.clone()).filter(|f| !f.is_empty()) {
-                let (t_open, t_reveal, t_copy, t_missing) = (
-                    self.tr("open"),
-                    self.tr("reveal in file manager"),
-                    self.tr("copy path"),
-                    self.tr("(no longer exists)"),
-                );
-                egui::CollapsingHeader::new(format!("📁 {} ({})", self.tr("session files"), files.len()))
-                    .id_salt("session_files")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("session_files_rows")
-                            .max_height(140.0)
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                for f in &files {
-                                    let missing = !std::path::Path::new(&f.path).exists();
-                                    let mut text = egui::RichText::new(&f.path).monospace().small();
-                                    if missing {
-                                        text = text.weak();
-                                    }
-                                    let resp = ui.add(
-                                        egui::Label::new(text).truncate().sense(egui::Sense::click()),
-                                    );
-                                    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-                                    let resp = resp.on_hover_text(format!(
-                                        "{}\n{} · {}{}",
-                                        f.path,
-                                        f.tool,
-                                        stamp(f.ts),
-                                        if missing { format!("\n{t_missing}") } else { String::new() },
-                                    ));
-                                    if resp.clicked() {
-                                        open_path(&f.path);
-                                    }
-                                    resp.context_menu(|ui| {
-                                        if ui.button(t_open).clicked() {
-                                            open_path(&f.path);
-                                            ui.close();
-                                        }
-                                        if ui.button(t_reveal).clicked() {
-                                            reveal_path(&f.path);
-                                            ui.close();
-                                        }
-                                        if ui.button(t_copy).clicked() {
-                                            ui.ctx().copy_text(f.path.clone());
-                                            ui.close();
-                                        }
-                                    });
-                                }
-                            });
-                    });
+            // When the notes side pane is open the list moves into it (see
+            // the "notes" right panel); the bottom tray is the fallback.
+            if !self.show_notes {
+                if let Some(files) = self.view.as_ref().map(|s| s.files.clone()).filter(|f| !f.is_empty()) {
+                    let lang = self.app.cfg.read().unwrap().lang.clone();
+                    egui::CollapsingHeader::new(format!("📁 {} ({})", self.tr("session files"), files.len()))
+                        .id_salt("session_files")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("session_files_rows")
+                                .max_height(140.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| render_file_rows(ui, &files, &lang));
+                        });
+                }
             }
             // thumbnails of images queued for the next message, each removable
             if !self.pending_images.is_empty() {
@@ -1668,6 +1815,125 @@ impl eframe::App for GuiApp {
             }
         }
 
+        // ----- floating note viewer/editor -----
+        if self.note_win.is_some() {
+            let lang = self.app.cfg.read().unwrap().lang.clone();
+            let t = |k: &'static str| crate::i18n::t(&lang, k);
+            let dir = crate::notes::dir(&self.app.cfg.read().unwrap());
+            let mut win = self.note_win.take().unwrap();
+            let mut open = true;
+            let mut close = false;
+            let mut save = false;
+            let mut delete = false;
+            let mut reveal = false;
+            let title = if win.name.is_empty() {
+                t("new note").to_string()
+            } else {
+                win.name.clone()
+            };
+            egui::Window::new(format!("📝 {title}"))
+                .id(egui::Id::new(format!("note.{}", if win.is_new { "new".into() } else { win.name.clone() })))
+                .open(&mut open)
+                .default_size([560.0, 460.0])
+                .show(&ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if win.is_new {
+                            ui.label(t("name:"));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut win.name)
+                                    .hint_text("dir/note")
+                                    .desired_width(220.0),
+                            );
+                        } else {
+                            ui.weak(&win.name);
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if win.editing {
+                                if ui.button(t("save")).clicked() {
+                                    save = true;
+                                }
+                                if ui.button(t("cancel")).clicked() {
+                                    if win.is_new {
+                                        close = true;
+                                    } else {
+                                        win.text = win.orig.clone();
+                                        win.editing = false;
+                                    }
+                                }
+                                if win.text != win.orig {
+                                    ui.weak(t("(unsaved)"));
+                                }
+                            } else {
+                                if ui.button(t("delete")).clicked() {
+                                    delete = true;
+                                }
+                                if ui.button(t("reveal")).clicked() {
+                                    reveal = true;
+                                }
+                                if ui.button(t("edit")).clicked() {
+                                    win.editing = true;
+                                }
+                            }
+                        });
+                    });
+                    ui.separator();
+                    if win.editing {
+                        // multiline TextEdit fills whatever the window leaves
+                        // below the button row; it scrolls internally
+                        let h = ui.available_height();
+                        ui.add(
+                            egui::TextEdit::multiline(&mut win.text)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(1)
+                                .min_size(egui::vec2(f32::INFINITY, h)),
+                        );
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                                render_md(ui, &mut self.mark, &win.text);
+                            });
+                    }
+                });
+            if save {
+                let name = win.name.trim().to_string();
+                if name.is_empty() {
+                    self.toast(t("name required"));
+                } else {
+                    match crate::notes::write(&dir, &name, &win.text) {
+                        Ok(_) => {
+                            win.name = name;
+                            win.orig = win.text.clone();
+                            win.editing = false;
+                            win.is_new = false;
+                            self.notes_dirty = true;
+                            self.toast(t("saved"));
+                        }
+                        Err(e) => self.toast(format!("{} {e}", t("save failed:"))),
+                    }
+                }
+            }
+            if delete {
+                match crate::notes::delete(&dir, &win.name) {
+                    Ok(_) => {
+                        open = false;
+                        self.notes_dirty = true;
+                        self.toast(format!("{} {}", t("removed:"), win.name));
+                    }
+                    Err(e) => self.toast(format!("{} {e}", t("remove failed:"))),
+                }
+            }
+            if reveal {
+                let p = crate::notes::file_path(&dir, &win.name)
+                    .unwrap_or_else(|_| dir.clone());
+                reveal_path(&p.display().to_string());
+            }
+            if open && !close {
+                self.note_win = Some(win);
+            }
+        }
+
         if self.settings.is_some() {
             let mut buf = self.settings.take().unwrap();
             let mut open = true;
@@ -1822,6 +2088,48 @@ fn short_tool(name: &str) -> &str {
         }
     }
     name
+}
+
+/// Rows of the session-files list — shared between the bottom input tray
+/// and the right notes pane's files section. A row opens on click;
+/// right-click offers reveal/copy.
+fn render_file_rows(ui: &mut egui::Ui, files: &[crate::session::SessionFile], lang: &str) {
+    let t = |k: &'static str| crate::i18n::t(lang, k);
+    for f in files {
+        let missing = !std::path::Path::new(&f.path).exists();
+        let mut text = egui::RichText::new(&f.path).monospace().small();
+        if missing {
+            text = text.weak();
+        }
+        let resp = ui.add(
+            egui::Label::new(text).truncate().sense(egui::Sense::click()),
+        );
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        let resp = resp.on_hover_text(format!(
+            "{}\n{} · {}{}",
+            f.path,
+            f.tool,
+            stamp(f.ts),
+            if missing { format!("\n{}", t("(no longer exists)")) } else { String::new() },
+        ));
+        if resp.clicked() {
+            open_path(&f.path);
+        }
+        resp.context_menu(|ui| {
+            if ui.button(t("open")).clicked() {
+                open_path(&f.path);
+                ui.close();
+            }
+            if ui.button(t("reveal in file manager")).clicked() {
+                reveal_path(&f.path);
+                ui.close();
+            }
+            if ui.button(t("copy path")).clicked() {
+                ui.ctx().copy_text(f.path.clone());
+                ui.close();
+            }
+        });
+    }
 }
 
 fn render_tool_msg(ui: &mut egui::Ui, msg: &crate::types::ChatMessage, lang: &str, key: &str) {

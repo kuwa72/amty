@@ -54,6 +54,19 @@ pub async fn delete(base: &str, token: &str, path: &str) -> Result<Value> {
     Ok(resp.json().await.unwrap_or(json!(null)))
 }
 
+pub async fn put(base: &str, token: &str, path: &str, body: Value) -> Result<Value> {
+    let resp = client(token).put(format!("{base}{path}")).json(&body).send().await?;
+    err_body(resp).await
+}
+
+/// Percent-encode a note name for a URL path, keeping `/` separators intact.
+fn note_url(name: &str) -> String {
+    name.split('/')
+        .map(url_encode)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn print_json(v: &Value) {
     println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
 }
@@ -392,6 +405,69 @@ pub async fn run(cmd: crate::Cmd) -> Result<()> {
                 }
                 Some(crate::SkillCmd::Remove { name }) => {
                     print_json(&delete(&base, &tok, &format!("/v1/skills/{name}")).await?)
+                }
+            }
+        }
+        Notes { sub } => {
+            let (base, tok) = runtime_info()?;
+            match sub {
+                None => {
+                    let v = get(&base, &tok, "/v1/notes").await?;
+                    println!("{}", v["dir"].as_str().unwrap_or(""));
+                    if let Some(arr) = v["notes"].as_array() {
+                        for n in arr {
+                            println!(
+                                "{}\t{} B\t{}\t{}",
+                                n["name"].as_str().unwrap_or(""),
+                                n["bytes"].as_u64().unwrap_or(0),
+                                crate::session::fmt_stamp(n["updated"].as_u64().unwrap_or(0)),
+                                n["title"].as_str().unwrap_or(""),
+                            );
+                        }
+                    }
+                }
+                Some(crate::NoteCmd::Read { name }) => {
+                    let v = get(&base, &tok, &format!("/v1/notes/{}", note_url(&name))).await?;
+                    print!("{}", v["content"].as_str().unwrap_or(""));
+                }
+                Some(crate::NoteCmd::Write { name, content }) => {
+                    let text = if content.is_empty() {
+                        // no inline content → take the note from stdin
+                        use std::io::Read;
+                        let mut buf = String::new();
+                        std::io::stdin().read_to_string(&mut buf)?;
+                        buf
+                    } else {
+                        content.join(" ")
+                    };
+                    print_json(&put(&base, &tok, &format!("/v1/notes/{}", note_url(&name)), json!({"content": text})).await?);
+                }
+                Some(crate::NoteCmd::Remove { name }) => {
+                    print_json(&delete(&base, &tok, &format!("/v1/notes/{}", note_url(&name))).await?);
+                }
+                Some(crate::NoteCmd::Search { query, limit, json: as_json }) => {
+                    let q = query.join(" ");
+                    if q.trim().is_empty() {
+                        bail!("usage: amty notes search <query> [--limit N]");
+                    }
+                    let v = get(&base, &tok, &format!("/v1/notes-search?q={}&limit={limit}", url_encode(&q))).await?;
+                    if as_json {
+                        print_json(&v);
+                    } else {
+                        for h in v["hits"].as_array().cloned().unwrap_or_default() {
+                            println!(
+                                "{}\t{}\t{}",
+                                h["name"].as_str().unwrap_or(""),
+                                crate::session::fmt_stamp(h["updated"].as_u64().unwrap_or(0)),
+                                h["snippet"].as_str().unwrap_or(""),
+                            );
+                        }
+                        eprintln!("\n{} hit(s) for \"{q}\"", v["n"].as_u64().unwrap_or(0));
+                    }
+                }
+                Some(crate::NoteCmd::Dir) => {
+                    let v = get(&base, &tok, "/v1/notes").await?;
+                    println!("{}", v["dir"].as_str().unwrap_or(""));
                 }
             }
         }

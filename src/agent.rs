@@ -105,7 +105,12 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
             let model = s_model.unwrap_or_else(|| conf.model.clone());
             // skills index + memory are volatile (re-scanned each turn): send
             // them as a tail so the static system_prompt stays cache-stable
-            let tail = format!("{}{}", crate::config::skills_prompt(), crate::evolve::memory_prompt());
+            let tail = format!(
+                "{}{}{}",
+                crate::config::skills_prompt(),
+                crate::evolve::memory_prompt(),
+                crate::notes::prompt(&cfg),
+            );
             (name, conf, model, cfg.system_prompt.clone(), tail, cfg.evolve.self_modify)
         };
         if model.is_empty() {
@@ -454,6 +459,21 @@ fn absolutize(p: &Path) -> PathBuf {
     }
 }
 
+/// `canonicalize` on Windows yields verbatim `\\?\…` paths, which the GUI
+/// can't open/reveal and which paste badly into other tools. Normalize back
+/// to the plain form for storage; `\\?\UNC\server\share` → `\\server\share`.
+/// A no-op on paths that aren't verbatim.
+fn plain_path_str(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s.into_owned()
+    }
+}
+
 /// Attribute created paths to the session: fs_write/fs_edit carry the path
 /// directly; `shell` is diffed against the pre-call workdir snapshot.
 /// Returns the number of *new* paths recorded.
@@ -468,7 +488,7 @@ fn record_created(
         "fs_write" | "fs_edit" => {
             let Some(p) = input["path"].as_str() else { return 0 };
             let abs = std::fs::canonicalize(p).unwrap_or_else(|_| absolutize(Path::new(p)));
-            app.sessions.add_file(sid, &abs.display().to_string(), name) as usize
+            app.sessions.add_file(sid, &plain_path_str(&abs), name) as usize
         }
         "shell" => {
             let Some((wd, before)) = before else { return 0 };
@@ -476,7 +496,7 @@ fn record_created(
             new.sort();
             new.into_iter()
                 .take(MAX_NEW_PER_CMD)
-                .filter(|p| app.sessions.add_file(sid, &p.display().to_string(), "shell"))
+                .filter(|p| app.sessions.add_file(sid, &plain_path_str(p), "shell"))
                 .count()
         }
         _ => 0,
@@ -567,6 +587,15 @@ mod tests {
         assert!(!new.iter().any(|p| p.starts_with(dir.join("target"))));
         assert!(!new.iter().any(|p| p.starts_with(dir.join(".git"))));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn verbatim_paths_normalize_to_plain() {
+        // canonicalize on Windows returns \\?\… — stored paths must be plain
+        assert_eq!(plain_path_str(Path::new(r"\\?\C:\a\b.md")), r"C:\a\b.md");
+        assert_eq!(plain_path_str(Path::new(r"\\?\UNC\srv\share\f.txt")), r"\\srv\share\f.txt");
+        assert_eq!(plain_path_str(Path::new("/tmp/x")), "/tmp/x");
+        assert_eq!(plain_path_str(Path::new(r"C:\plain\already")), r"C:\plain\already");
     }
 
     #[test]

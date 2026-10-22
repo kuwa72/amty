@@ -26,6 +26,11 @@ App core (src/app.rs)           -- config, sessions, approvals, event broadcast
   |                               shown in the GUI header + `amty usage`
   |- MCP client (src/mcp.rs)    -- stdio JSON-RPC + streamable HTTP transports,
   |                               tools exposed as mcp__<srv>__<tool>
+  |- notes (src/notes.rs)       -- plain-markdown knowledge store; a note's
+  |                               name is its /-separated path under the root
+  |                               minus .md. note_* tools / /v1/notes API /
+  |                               `amty notes` CLI / amty_*_notes MCP tools /
+  |                               GUI right panel + floating editor window
   |- OAuth client (src/oauth.rs) -- auth-code + PKCE + localhost:8571 callback,
   |                               RFC 9728/8414 discovery, dynamic client
   |                               registration, tokens in $XDG_DATA_HOME/amty/oauth/
@@ -60,6 +65,15 @@ do via `config_set`, a script can do via `POST /v1/config`, and vice versa.
   exposed as `GET /v1/search?q=…[&session=…][&limit=N]`, `amty search <query>
   [-s <id>] [--limit N] [--json]`, the `amty_search_sessions` MCP tool, and the
   GUI sidebar box (typing filters titles, Enter runs the full-text search).
+- notes: `$XDG_DATA_HOME/amty/notes/**/*.md`, or `notes.dir` in config
+  (`~` expanded) — point it at an Obsidian vault to share the store with a
+  human editor. Writes are atomic (tmp+rename); `note_write`/`note_delete`
+  are Write-risk but implicitly allowlisted (they can only touch the notes
+  root). Surfaced as `GET /v1/notes`, `GET /v1/notes-search?q=…`,
+  `GET|PUT|DELETE /v1/notes/{*name}` (name keeps its `/`s), `amty notes
+  [read|write|remove|search|dir]` (write takes args or stdin), and the
+  GUI's right panel (list/filter) + floating viewer/editor window.
+  `notes::prompt` appends the dir location to the system tail each turn.
 - runtime discovery: `$XDG_DATA_HOME/amty/runtime.json` (0600)
 - evolve state: `$XDG_DATA_HOME/amty/evolve.json` (tool stats, learned
   approvals, reflection watermarks), `evolve.log`, `self-update.log`
@@ -77,6 +91,7 @@ cargo build --release
 ./target/debug/amty status       # requires a running instance
 ./target/debug/amty send "hi"    # most recent session; --new, -s <id>, --no-wait
 ./target/debug/amty search rust -s <id>   # cross-session full-text search; --limit N --json
+./target/debug/amty notes        # list notes; read/write/rm/search/dir subs
 ./target/debug/amty mcp-serve    # stdio MCP server for external agents
 ./target/debug/amty catalog      # list installable MCP servers
 ./target/debug/amty mcp remove <name>      # delete a server from config
