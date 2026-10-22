@@ -94,6 +94,36 @@ fn tool_defs() -> Vec<Value> {
         json!({"type": "object", "properties": {"session": {"type": "string"}}, "required": []}),
     ),
     (
+        "amty_list_notes",
+        "List notes in amty's markdown knowledge store (name, title, size, mtime). Note names are '/'-separated paths without .md.",
+        json!({"type": "object", "properties": {}}),
+    ),
+    (
+        "amty_read_note",
+        "Read a note's markdown content.",
+        json!({"type": "object", "properties": {
+            "name": {"type": "string", "description": "e.g. projects/amty/decisions"}}, "required": ["name"]}),
+    ),
+    (
+        "amty_write_note",
+        "Create or overwrite a note (full content replace). Nested names create directories.",
+        json!({"type": "object", "properties": {
+            "name": {"type": "string"}, "content": {"type": "string"}}, "required": ["name", "content"]}),
+    ),
+    (
+        "amty_delete_note",
+        "Delete a note permanently.",
+        json!({"type": "object", "properties": {
+            "name": {"type": "string"}}, "required": ["name"]}),
+    ),
+    (
+        "amty_search_notes",
+        "Full-text search over note names and contents. Returns matching notes with a one-line excerpt.",
+        json!({"type": "object", "properties": {
+            "query": {"type": "string"},
+            "limit": {"type": "integer", "description": "max hits (default 50)"}}, "required": ["query"]}),
+    ),
+    (
         "amty_evolve",
         "Self-evolution control. action=status (default) returns toggles/memory/stats; reflect forces a memory-distillation pass on a session; forget <command> erases a learned auto-approval.",
         json!({"type": "object", "properties": {
@@ -105,6 +135,14 @@ fn tool_defs() -> Vec<Value> {
     .iter()
     .map(|(n, d, s): &(&str, &str, Value)| json!({"name": n, "description": d, "inputSchema": s}))
     .collect()
+}
+
+/// Note names are '/'-separated; encode each segment so the path stays nested.
+fn note_url(name: &str) -> String {
+    name.split('/')
+        .map(crate::cli::url_encode)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn tool_result(v: Value) -> Value {
@@ -212,6 +250,29 @@ async fn call_tool(name: &str, args: &Value) -> Result<Value> {
         "amty_cancel" => {
             let sid = args["session"].as_str().unwrap_or("");
             crate::cli::post(&base, &tok, &format!("/v1/sessions/{sid}/cancel"), json!({})).await
+        }
+        "amty_list_notes" => crate::cli::get(&base, &tok, "/v1/notes").await,
+        "amty_read_note" => {
+            let name = args["name"].as_str().unwrap_or("");
+            crate::cli::get(&base, &tok, &format!("/v1/notes/{}", note_url(name))).await
+        }
+        "amty_write_note" => {
+            let name = args["name"].as_str().unwrap_or("");
+            crate::cli::put(
+                &base, &tok,
+                &format!("/v1/notes/{}", note_url(name)),
+                json!({"content": args["content"].as_str().unwrap_or("")}),
+            )
+            .await
+        }
+        "amty_delete_note" => {
+            let name = args["name"].as_str().unwrap_or("");
+            crate::cli::delete(&base, &tok, &format!("/v1/notes/{}", note_url(name))).await
+        }
+        "amty_search_notes" => {
+            let q = crate::cli::url_encode(args["query"].as_str().unwrap_or(""));
+            let limit = args["limit"].as_u64().unwrap_or(50);
+            crate::cli::get(&base, &tok, &format!("/v1/notes-search?q={q}&limit={limit}")).await
         }
         "amty_evolve" => {
             match args["action"].as_str().unwrap_or("status") {

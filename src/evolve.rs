@@ -274,7 +274,12 @@ pub fn self_swap(wait_pid: u32, install: PathBuf, target: PathBuf) -> anyhow::Re
     ));
     wait_for_exit(wait_pid);
     if install != target {
-        install_binary(&install, &target).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // A failed install (e.g. the artifact vanished mid-wait) must not
+        // leave the app dead: install_binary restores the old exe into the
+        // slot, so fall through and relaunch whatever is there.
+        if let Err(e) = install_binary(&install, &target) {
+            log_line(&format!("self-swap: install failed: {e}"));
+        }
     }
     log_line(&format!("self-swap: relaunching {}", target.display()));
     match std::process::Command::new(&target).spawn() {

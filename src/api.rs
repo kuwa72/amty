@@ -40,6 +40,9 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/mcp-keys", post(mcp_keys))
         .route("/v1/skills", get(skills_list))
         .route("/v1/skills/{name}", delete(skill_remove))
+        .route("/v1/notes", get(notes_list))
+        .route("/v1/notes-search", get(notes_search))
+        .route("/v1/notes/{*name}", get(note_read).put(note_write).delete(note_delete))
         .route("/v1/evolve", get(evolve_status))
         .route("/v1/evolve/reflect", post(evolve_reflect))
         .route("/v1/evolve/forget", post(evolve_forget))
@@ -420,6 +423,77 @@ async fn skill_remove(
     }
     std::fs::remove_dir_all(&dir).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(json!({"removed": name})))
+}
+
+/// `GET /v1/notes` — list all notes in the markdown knowledge store.
+async fn notes_list(State(app): State<Arc<App>>) -> Json<Value> {
+    let dir = crate::notes::dir(&app.cfg.read().unwrap());
+    Json(json!({
+        "dir": dir.display().to_string(),
+        "notes": crate::notes::list(&dir),
+    }))
+}
+
+#[derive(Deserialize)]
+struct NotesSearchQuery {
+    #[serde(default)]
+    q: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// `GET /v1/notes-search?q=…[&limit=N]` — full-text search over notes.
+/// (Separate route: `/v1/notes/{*name}`'s catch-all would shadow a `search`
+/// path segment.)
+async fn notes_search(
+    State(app): State<Arc<App>>,
+    axum::extract::Query(q): axum::extract::Query<NotesSearchQuery>,
+) -> Json<Value> {
+    let dir = crate::notes::dir(&app.cfg.read().unwrap());
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let hits = crate::notes::search(&dir, &q.q, limit);
+    Json(json!({"query": q.q, "limit": limit, "n": hits.len(), "hits": hits}))
+}
+
+async fn note_read(
+    State(app): State<Arc<App>>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let dir = crate::notes::dir(&app.cfg.read().unwrap());
+    let content = crate::notes::read(&dir, &name)
+        .map_err(|e| (StatusCode::NOT_FOUND, e))?;
+    Ok(Json(json!({"name": name, "content": content})))
+}
+
+#[derive(Deserialize)]
+struct NoteWriteBody {
+    #[serde(default)]
+    content: String,
+}
+
+/// `PUT /v1/notes/{name}` — create/overwrite a note (name may contain `/`).
+async fn note_write(
+    State(app): State<Arc<App>>,
+    Path(name): Path<String>,
+    Json(b): Json<NoteWriteBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let dir = crate::notes::dir(&app.cfg.read().unwrap());
+    let bytes = crate::notes::write(&dir, &name, &b.content)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    app.emit("", EvKind::Touched);
+    Ok(Json(json!({"name": name, "bytes": bytes})))
+}
+
+/// `DELETE /v1/notes/{name}` — remove a note permanently.
+async fn note_delete(
+    State(app): State<Arc<App>>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let dir = crate::notes::dir(&app.cfg.read().unwrap());
+    crate::notes::delete(&dir, &name)
+        .map_err(|e| (StatusCode::NOT_FOUND, e))?;
+    app.emit("", EvKind::Touched);
+    Ok(Json(json!({"deleted": name})))
 }
 
 /// `DELETE /v1/mcp/{name}` — remove a server from the config entirely

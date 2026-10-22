@@ -15,6 +15,7 @@ mod gui;
 mod i18n;
 mod mcp;
 mod mcp_serve;
+mod notes;
 mod oauth;
 mod provider;
 mod session;
@@ -125,6 +126,12 @@ pub enum Cmd {
         #[command(subcommand)]
         sub: Option<SkillCmd>,
     },
+    /// Manage markdown notes (the notes dir — Obsidian-compatible).
+    /// Bare `amty notes` lists all notes.
+    Notes {
+        #[command(subcommand)]
+        sub: Option<NoteCmd>,
+    },
     /// Show self-evolution state (memory, stats, pending restart) or manage it.
     Evolve {
         #[command(subcommand)]
@@ -167,6 +174,27 @@ pub enum McpCmd {
 pub enum SkillCmd {
     /// Remove a skill (only ones managed inside amty's own skills dir).
     Remove { name: String },
+}
+
+#[derive(Subcommand)]
+pub enum NoteCmd {
+    /// Print a note's markdown content.
+    Read { name: String },
+    /// Create/overwrite a note. Content comes from the args, or stdin when
+    /// none are given (`amty notes write x < file.md`).
+    Write { name: String, content: Vec<String> },
+    /// Delete a note permanently.
+    #[command(alias = "rm")]
+    Remove { name: String },
+    /// Full-text search over note names and contents.
+    Search {
+        query: Vec<String>,
+        #[arg(long, default_value = "50")] limit: usize,
+        /// print the raw API JSON instead of a table
+        #[arg(long)] json: bool,
+    },
+    /// Print the notes directory path.
+    Dir,
 }
 
 #[derive(Subcommand)]

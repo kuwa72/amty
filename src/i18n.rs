@@ -126,6 +126,18 @@ static JA: &[(&str, &str)] = &[
     ("import Claude Desktop mcpServers", "Claude Desktop の mcpServers をインポート"),
     ("save", "保存"),
     ("saved", "保存しました"),
+    // notes
+    ("notes", "ノート"),
+    ("new note", "新規ノート"),
+    ("no notes yet", "ノートはまだありません"),
+    ("filter", "絞り込み"),
+    ("open notes dir", "ノートフォルダを開く"),
+    ("name:", "名前:"),
+    ("name required", "名前が必要です"),
+    ("edit", "編集"),
+    ("cancel", "キャンセル"),
+    ("(unsaved)", "(未保存)"),
+    ("reveal", "場所を開く"),
 ];
 
 pub fn t<'a>(lang: &str, key: &'a str) -> &'a str {
