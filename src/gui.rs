@@ -301,6 +301,11 @@ struct SettingsBuf {
     tab: usize,
     /// cached MEMORY.md contents for the evolve tab (loaded once per open)
     memory: String,
+    /// new-job form fields for the jobs tab
+    job_name: String,
+    job_spec: String,
+    job_prompt: String,
+    job_err: String,
 }
 
 /// `YYYY-MM-DD HH:MM` (UTC) from a unix timestamp — lives in `session` so the
@@ -896,6 +901,10 @@ impl eframe::App for GuiApp {
                                     tab: 0,
                                     memory: std::fs::read_to_string(crate::config::memory_path())
                                         .unwrap_or_default(),
+                                    job_name: String::new(),
+                                    job_spec: String::new(),
+                                    job_prompt: String::new(),
+                                    job_err: String::new(),
                                 });
                             }
                         }
@@ -1941,7 +1950,7 @@ impl eframe::App for GuiApp {
             let mut import = false;
             let mut skill_rm: Option<String> = None;
             let lang = self.app.cfg.read().unwrap().lang.clone();
-            settings_window(&ctx, &lang, &mut open, &mut buf, &mut save, &mut import, &mut skill_rm);
+            settings_window(&ctx, &lang, &mut open, &mut buf, &mut save, &mut import, &mut skill_rm, &self.app);
             if let Some(name) = skill_rm {
                 let dir = crate::config::skills_dir().join(&name);
                 match std::fs::remove_dir_all(&dir) {
@@ -2822,7 +2831,7 @@ fn linkify_line(line: &str) -> String {
     out
 }
 
-fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut SettingsBuf, save: &mut bool, import: &mut bool, skill_rm: &mut Option<String>) {
+fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut SettingsBuf, save: &mut bool, import: &mut bool, skill_rm: &mut Option<String>, app: &Arc<App>) {
     let t = |k: &'static str| crate::i18n::t(lang, k);
     egui::Window::new(t("settings")).open(open).default_size([560.0, 480.0]).show(ctx, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -2838,7 +2847,7 @@ fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut S
             });
             ui.separator();
             // ----- tabs: providers / mcp / skills / behavior -----
-            let tabs = [t("providers"), t("mcp"), t("skills"), t("behavior"), t("evolve")];
+            let tabs = [t("providers"), t("mcp"), t("skills"), t("behavior"), t("evolve"), t("jobs")];
             ui.horizontal_wrapped(|ui| {
                 for (i, label) in tabs.iter().enumerate() {
                     if ui.selectable_label(buf.tab == i, *label).clicked() {
@@ -3116,6 +3125,56 @@ fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut S
                     .desired_rows(12)
                     .desired_width(520.0),
             );
+            }
+            if buf.tab == 5 {
+            ui.heading(t("jobs"));
+            ui.weak(t("scheduled prompts that run on a timer"));
+            ui.add_space(4.0);
+            let jobs = app.jobs.lock().unwrap().clone();
+            if jobs.is_empty() {
+                ui.weak(t("no jobs yet"));
+            }
+            for j in &jobs {
+                ui.horizontal_wrapped(|ui| {
+                    let mut en = j.enabled;
+                    if ui.checkbox(&mut en, "").changed() {
+                        let _ = crate::jobs::set_enabled(app, &j.id, en);
+                    }
+                    ui.label(format!("{}  {}", j.name, j.spec));
+                    ui.weak(format!("{} {}", t("next:"), stamp(j.next_run)));
+                    if !j.last_status.is_empty() {
+                        ui.weak(&j.last_status);
+                    }
+                    if ui.small_button(t("run")).clicked() {
+                        let _ = crate::jobs::run_now(app, &j.id);
+                    }
+                    if ui.small_button(t("delete")).clicked() {
+                        let _ = crate::jobs::remove(app, &j.id);
+                    }
+                });
+            }
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut buf.job_name).hint_text(t("name:")).desired_width(130.0));
+                ui.add(egui::TextEdit::singleline(&mut buf.job_spec).hint_text("every 30m / at 09:00").desired_width(160.0));
+            });
+            ui.add(egui::TextEdit::multiline(&mut buf.job_prompt).hint_text(t("prompt:")).desired_rows(2).desired_width(420.0));
+            ui.horizontal(|ui| {
+                if ui.button(t("add")).clicked() {
+                    match crate::jobs::add(app, &buf.job_name, &buf.job_spec, &buf.job_prompt, "") {
+                        Ok(_) => {
+                            buf.job_name.clear();
+                            buf.job_spec.clear();
+                            buf.job_prompt.clear();
+                            buf.job_err.clear();
+                        }
+                        Err(e) => buf.job_err = e,
+                    }
+                }
+                if !buf.job_err.is_empty() {
+                    ui.colored_label(egui::Color32::from_rgb(255, 200, 80), &buf.job_err);
+                }
+            });
             }
         });
         ui.separator();

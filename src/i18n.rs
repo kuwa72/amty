@@ -138,6 +138,15 @@ static JA: &[(&str, &str)] = &[
     ("cancel", "キャンセル"),
     ("(unsaved)", "(未保存)"),
     ("reveal", "場所を開く"),
+    // jobs
+    ("jobs", "ジョブ"),
+    ("add", "追加"),
+    ("run", "実行"),
+    ("spec:", "スケジュール:"),
+    ("prompt:", "プロンプト:"),
+    ("no jobs yet", "ジョブはまだありません"),
+    ("next:", "次回:"),
+    ("scheduled prompts that run on a timer", "タイマーで実行されるプロンプト"),
 ];
 
 pub fn t<'a>(lang: &str, key: &'a str) -> &'a str {
