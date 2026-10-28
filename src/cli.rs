@@ -59,6 +59,11 @@ pub async fn put(base: &str, token: &str, path: &str, body: Value) -> Result<Val
     err_body(resp).await
 }
 
+pub async fn patch(base: &str, token: &str, path: &str, body: Value) -> Result<Value> {
+    let resp = client(token).patch(format!("{base}{path}")).json(&body).send().await?;
+    err_body(resp).await
+}
+
 /// Percent-encode a note name for a URL path, keeping `/` separators intact.
 fn note_url(name: &str) -> String {
     name.split('/')
@@ -468,6 +473,57 @@ pub async fn run(cmd: crate::Cmd) -> Result<()> {
                 Some(crate::NoteCmd::Dir) => {
                     let v = get(&base, &tok, "/v1/notes").await?;
                     println!("{}", v["dir"].as_str().unwrap_or(""));
+                }
+            }
+        }
+        Jobs { sub } => {
+            let (base, tok) = runtime_info()?;
+            match sub {
+                None => {
+                    let v = get(&base, &tok, "/v1/jobs").await?;
+                    for j in v["jobs"].as_array().cloned().unwrap_or_default() {
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}{}",
+                            j["id"].as_str().unwrap_or(""),
+                            j["spec"].as_str().unwrap_or(""),
+                            if j["enabled"].as_bool().unwrap_or(true) { "on " } else { "off" },
+                            crate::session::fmt_stamp(j["next_run"].as_u64().unwrap_or(0)),
+                            j["name"].as_str().unwrap_or(""),
+                            match j["last_status"].as_str() {
+                                Some(s) if !s.is_empty() => format!("\tlast: {s}"),
+                                _ => String::new(),
+                            },
+                        );
+                    }
+                }
+                Some(crate::JobCmd::Add { name, every, at, session, prompt }) => {
+                    let spec = match (every, at) {
+                        (Some(e), None) => format!("every {e}"),
+                        (None, Some(a)) => format!("at {a}"),
+                        _ => bail!("exactly one of --every / --at is required"),
+                    };
+                    let text = prompt.join(" ");
+                    print_json(&post(
+                        &base, &tok, "/v1/jobs",
+                        json!({
+                            "name": name.unwrap_or_default(),
+                            "spec": spec,
+                            "prompt": text,
+                            "session": session.unwrap_or_default(),
+                        }),
+                    ).await?);
+                }
+                Some(crate::JobCmd::Remove { id }) => {
+                    print_json(&delete(&base, &tok, &format!("/v1/jobs/{id}")).await?)
+                }
+                Some(crate::JobCmd::Run { id }) => {
+                    print_json(&post(&base, &tok, &format!("/v1/jobs/{id}/run"), json!({})).await?)
+                }
+                Some(crate::JobCmd::Enable { id }) => {
+                    print_json(&patch(&base, &tok, &format!("/v1/jobs/{id}"), json!({"enabled": true})).await?)
+                }
+                Some(crate::JobCmd::Disable { id }) => {
+                    print_json(&patch(&base, &tok, &format!("/v1/jobs/{id}"), json!({"enabled": false})).await?)
                 }
             }
         }

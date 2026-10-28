@@ -43,6 +43,9 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/notes", get(notes_list))
         .route("/v1/notes-search", get(notes_search))
         .route("/v1/notes/{*name}", get(note_read).put(note_write).delete(note_delete))
+        .route("/v1/jobs", get(jobs_list).post(job_add))
+        .route("/v1/jobs/{id}", delete(job_remove).patch(job_patch))
+        .route("/v1/jobs/{id}/run", post(job_run))
         .route("/v1/evolve", get(evolve_status))
         .route("/v1/evolve/reflect", post(evolve_reflect))
         .route("/v1/evolve/forget", post(evolve_forget))
@@ -494,6 +497,73 @@ async fn note_delete(
         .map_err(|e| (StatusCode::NOT_FOUND, e))?;
     app.emit("", EvKind::Touched);
     Ok(Json(json!({"deleted": name})))
+}
+
+/// `GET /v1/jobs` — list scheduled jobs.
+async fn jobs_list(State(app): State<Arc<App>>) -> Json<Value> {
+    Json(json!({"jobs": app.jobs.lock().unwrap().clone()}))
+}
+
+#[derive(Deserialize)]
+struct JobBody {
+    name: Option<String>,
+    /// "every 30m" | "at 09:00" (local time)
+    spec: Option<String>,
+    prompt: Option<String>,
+    session: Option<String>,
+}
+
+/// `POST /v1/jobs` — register a scheduled job.
+async fn job_add(
+    State(app): State<Arc<App>>,
+    Json(b): Json<JobBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let spec = b.spec.ok_or((StatusCode::BAD_REQUEST, "spec required".into()))?;
+    let prompt = b.prompt.ok_or((StatusCode::BAD_REQUEST, "prompt required".into()))?;
+    let job = crate::jobs::add(
+        &app,
+        b.name.as_deref().unwrap_or(""),
+        &spec,
+        &prompt,
+        b.session.as_deref().unwrap_or(""),
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    app.emit("", EvKind::Touched);
+    Ok(Json(json!(job)))
+}
+
+/// `DELETE /v1/jobs/{id}` — remove a job (id, unique prefix, or name).
+async fn job_remove(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    crate::jobs::remove(&app, &id).map_err(|e| (StatusCode::NOT_FOUND, e))?;
+    app.emit("", EvKind::Touched);
+    Ok(Json(json!({"deleted": id})))
+}
+
+/// `PATCH /v1/jobs/{id}` — `{enabled: bool}` toggles a job.
+async fn job_patch(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(b): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let enabled = b["enabled"]
+        .as_bool()
+        .ok_or((StatusCode::BAD_REQUEST, "enabled: bool required".into()))?;
+    crate::jobs::set_enabled(&app, &id, enabled).map_err(|e| (StatusCode::NOT_FOUND, e))?;
+    app.emit("", EvKind::Touched);
+    Ok(Json(json!({"id": id, "enabled": enabled})))
+}
+
+/// `POST /v1/jobs/{id}/run` — fire a job immediately regardless of schedule.
+async fn job_run(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let status = crate::jobs::run_now(&app, &id).map_err(|e| (StatusCode::NOT_FOUND, e))?;
+    app.emit("", EvKind::Touched);
+    Ok(Json(json!({"id": id, "status": status})))
 }
 
 /// `DELETE /v1/mcp/{name}` — remove a server from the config entirely

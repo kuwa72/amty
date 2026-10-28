@@ -78,6 +78,8 @@ pub struct App {
     pub auth: Mutex<HashMap<String, AuthRun>>,
     /// self-evolution metrics (persisted to <data_dir>/evolve.json)
     pub stats: Mutex<crate::evolve::Stats>,
+    /// scheduled jobs, persisted to <data_dir>/jobs.json
+    pub jobs: Mutex<Vec<crate::jobs::Job>>,
     /// binary to respawn once all runs are idle (self-update)
     pub restart_pending: Mutex<Option<std::path::PathBuf>>,
     /// last successfully rebuilt artifact, for `self_update restart`
@@ -127,6 +129,7 @@ impl App {
             runs: Mutex::new(HashMap::new()),
             auth: Mutex::new(HashMap::new()),
             stats: Mutex::new(crate::evolve::Stats::load()),
+            jobs: Mutex::new(crate::jobs::load(&crate::config::data_dir())),
             restart_pending: Mutex::new(None),
             built_binary: Mutex::new(None),
             token,
@@ -163,6 +166,17 @@ impl App {
         tokio::spawn(async move {
             mcp.ensure_connected().await;
             let _ = ev.send(AppEvent { session: String::new(), kind: EvKind::Touched });
+        });
+
+        // job scheduler: tick immediately so jobs overdue while the app was
+        // down fire once, then every 30 s
+        let jobs_app = app.clone();
+        tokio::spawn(async move {
+            crate::jobs::tick(&jobs_app);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                crate::jobs::tick(&jobs_app);
+            }
         });
 
         Ok(app)
