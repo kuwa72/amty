@@ -129,6 +129,7 @@ fn utc_offset_at(t: u64) -> i64 {
     }
     #[cfg(windows)]
     {
+        use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
         use windows_sys::Win32::System::Time::*;
         // FILETIME = 100ns ticks since 1601-01-01 UTC.
         let ft = ((t + 11_644_473_600) * 10_000_000) as u64;
