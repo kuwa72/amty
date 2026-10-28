@@ -13,6 +13,7 @@ mod config;
 mod evolve;
 mod gui;
 mod i18n;
+mod jobs;
 mod mcp;
 mod mcp_serve;
 mod notes;
@@ -132,6 +133,12 @@ pub enum Cmd {
         #[command(subcommand)]
         sub: Option<NoteCmd>,
     },
+    /// Manage scheduled jobs (prompts that fire on a timer).
+    /// Bare `amty jobs` lists all jobs.
+    Jobs {
+        #[command(subcommand)]
+        sub: Option<JobCmd>,
+    },
     /// Show self-evolution state (memory, stats, pending restart) or manage it.
     Evolve {
         #[command(subcommand)]
@@ -195,6 +202,36 @@ pub enum NoteCmd {
     },
     /// Print the notes directory path.
     Dir,
+}
+
+#[derive(Subcommand)]
+pub enum JobCmd {
+    /// Register a scheduled job. Exactly one of --every / --at is required.
+    Add {
+        /// Job name (defaults to the prompt's first characters).
+        #[arg(long)]
+        name: Option<String>,
+        /// Fire on an interval: `30s` `15m` `6h` `1d` (combining works: `1h30m`).
+        #[arg(long)]
+        every: Option<String>,
+        /// Fire daily at local HH:MM.
+        #[arg(long)]
+        at: Option<String>,
+        /// Reuse an existing session; default is a fresh `[job]` session per fire.
+        #[arg(long)]
+        session: Option<String>,
+        /// The prompt to send when the job fires.
+        prompt: Vec<String>,
+    },
+    /// Delete a job (id, unique prefix, or name).
+    #[command(alias = "rm")]
+    Remove { id: String },
+    /// Fire a job immediately regardless of schedule.
+    Run { id: String },
+    /// Enable a disabled job.
+    Enable { id: String },
+    /// Disable a job without deleting it.
+    Disable { id: String },
 }
 
 #[derive(Subcommand)]

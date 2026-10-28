@@ -124,6 +124,38 @@ fn tool_defs() -> Vec<Value> {
             "limit": {"type": "integer", "description": "max hits (default 50)"}}, "required": ["query"]}),
     ),
     (
+        "amty_list_jobs",
+        "List scheduled jobs (id, name, spec, enabled, next run, last status).",
+        json!({"type": "object", "properties": {}}),
+    ),
+    (
+        "amty_add_job",
+        "Schedule a prompt for amty to run on a timer. spec: 'every 30m|6h|1d' or 'at HH:MM' (local time). Empty session = fresh [job] session each fire.",
+        json!({"type": "object", "properties": {
+            "name": {"type": "string"}, "spec": {"type": "string"},
+            "prompt": {"type": "string"}, "session": {"type": "string"}},
+            "required": ["spec", "prompt"]}),
+    ),
+    (
+        "amty_delete_job",
+        "Delete a scheduled job (id, unique prefix, or name).",
+        json!({"type": "object", "properties": {
+            "id": {"type": "string"}}, "required": ["id"]}),
+    ),
+    (
+        "amty_run_job",
+        "Fire a scheduled job immediately regardless of its schedule.",
+        json!({"type": "object", "properties": {
+            "id": {"type": "string"}}, "required": ["id"]}),
+    ),
+    (
+        "amty_set_job",
+        "Enable or disable a scheduled job.",
+        json!({"type": "object", "properties": {
+            "id": {"type": "string"}, "enabled": {"type": "boolean"}},
+            "required": ["id", "enabled"]}),
+    ),
+    (
         "amty_evolve",
         "Self-evolution control. action=status (default) returns toggles/memory/stats; reflect forces a memory-distillation pass on a session; forget <command> erases a learned auto-approval.",
         json!({"type": "object", "properties": {
@@ -273,6 +305,35 @@ async fn call_tool(name: &str, args: &Value) -> Result<Value> {
             let q = crate::cli::url_encode(args["query"].as_str().unwrap_or(""));
             let limit = args["limit"].as_u64().unwrap_or(50);
             crate::cli::get(&base, &tok, &format!("/v1/notes-search?q={q}&limit={limit}")).await
+        }
+        "amty_list_jobs" => crate::cli::get(&base, &tok, "/v1/jobs").await,
+        "amty_add_job" => {
+            crate::cli::post(
+                &base, &tok, "/v1/jobs",
+                json!({
+                    "name": args["name"].as_str().unwrap_or(""),
+                    "spec": args["spec"].as_str().unwrap_or(""),
+                    "prompt": args["prompt"].as_str().unwrap_or(""),
+                    "session": args["session"].as_str().unwrap_or(""),
+                }),
+            )
+            .await
+        }
+        "amty_delete_job" => {
+            let id = crate::cli::url_encode(args["id"].as_str().unwrap_or(""));
+            crate::cli::delete(&base, &tok, &format!("/v1/jobs/{id}")).await
+        }
+        "amty_run_job" => {
+            let id = crate::cli::url_encode(args["id"].as_str().unwrap_or(""));
+            crate::cli::post(&base, &tok, &format!("/v1/jobs/{id}/run"), json!({})).await
+        }
+        "amty_set_job" => {
+            let id = crate::cli::url_encode(args["id"].as_str().unwrap_or(""));
+            crate::cli::patch(
+                &base, &tok, &format!("/v1/jobs/{id}"),
+                json!({"enabled": args["enabled"].as_bool().unwrap_or(true)}),
+            )
+            .await
         }
         "amty_evolve" => {
             match args["action"].as_str().unwrap_or("status") {

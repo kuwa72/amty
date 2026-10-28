@@ -18,7 +18,7 @@ pub enum Risk {
 pub fn risk_of(name: &str) -> Risk {
     match name {
         "fs_read" | "fs_list" | "config_get" | "mcp" | "web_search" | "web_fetch"
-        | "self_update" | "note_list" | "note_read" | "note_search" => Risk::Safe,
+        | "self_update" | "note_list" | "note_read" | "note_search" | "job_list" => Risk::Safe,
         "shell" => Risk::Exec,
         _ => {
             if name.starts_with("mcp__") {
@@ -168,6 +168,42 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
             ),
         },
         ToolSpec {
+            name: "job_list".into(),
+            description: "List scheduled jobs (id, name, spec, enabled, next run, last status).".into(),
+            schema: schema(json!({}), &[]),
+        },
+        ToolSpec {
+            name: "job_add".into(),
+            description: "Schedule a prompt to run on a timer — use this to schedule yourself (e.g. 'check X every hour'). spec: 'every 30m|6h|1d' or 'at HH:MM' (local time). Empty session = a fresh [job] session each fire.".into(),
+            schema: schema(
+                json!({
+                    "name": {"type": "string", "description": "job name (defaults to prompt prefix)"},
+                    "spec": {"type": "string", "description": "'every 30m' or 'at 09:00'"},
+                    "prompt": {"type": "string", "description": "the message amty sends itself when the job fires"},
+                    "session": {"type": "string", "description": "reuse this session id instead of a fresh one"}
+                }),
+                &["spec", "prompt"],
+            ),
+        },
+        ToolSpec {
+            name: "job_remove".into(),
+            description: "Delete a scheduled job (id, unique prefix, or name).".into(),
+            schema: schema(json!({"id": {"type": "string"}}), &["id"]),
+        },
+        ToolSpec {
+            name: "job_run".into(),
+            description: "Fire a scheduled job immediately, regardless of its schedule.".into(),
+            schema: schema(json!({"id": {"type": "string"}}), &["id"]),
+        },
+        ToolSpec {
+            name: "job_set".into(),
+            description: "Enable or disable a scheduled job without deleting it.".into(),
+            schema: schema(
+                json!({"id": {"type": "string"}, "enabled": {"type": "boolean"}}),
+                &["id", "enabled"],
+            ),
+        },
+        ToolSpec {
             name: "mcp".into(),
             description: "Manage MCP servers. actions: list | tools | enable <name> | disable <name> | reconnect <name> | remove <name>.".into(),
             schema: schema(
@@ -237,6 +273,9 @@ pub fn summarize(name: &str, input: &Value) -> String {
             let key = n.strip_prefix("note_").unwrap_or(n);
             format!("{n}: {}", input["name"].as_str().or(input["query"].as_str()).unwrap_or(key))
         }
+        n if n.starts_with("job_") => {
+            format!("{n}: {}", input["name"].as_str().or(input["id"].as_str()).or(input["spec"].as_str()).unwrap_or(""))
+        }
         _ => {
             let s = input.to_string();
             format!("{name}: {}", &s[..s.len().min(300)])
@@ -287,6 +326,9 @@ fn allowlisted(cfg: &Config, name: &str, input: &Value) -> bool {
         // note writes/deletes only ever touch the notes dir — an app-owned
         // sandbox — so there's no path for a user allowlist to match against.
         "note_write" | "note_delete" => true,
+        // job calls only register/remove/fire prompts; the prompts' own tool
+        // calls still go through normal approval when they run.
+        "job_add" | "job_remove" | "job_run" | "job_set" => true,
         _ => false,
     }
 }
@@ -608,6 +650,55 @@ pub async fn execute(app: &std::sync::Arc<App>, name: &str, input: &Value) -> Re
                         .join("\n"))
                 }
             }
+        }
+        "job_list" => {
+            let jobs = app.jobs.lock().map_err(|e| e.to_string())?;
+            if jobs.is_empty() {
+                return Ok("(no jobs)".into());
+            }
+            Ok(jobs
+                .iter()
+                .map(|j| {
+                    format!(
+                        "{}\t{}\t{}\tnext={}\tlast={}\t{}",
+                        j.id,
+                        j.name,
+                        j.spec,
+                        crate::session::fmt_stamp(j.next_run),
+                        if j.last_status.is_empty() { "-" } else { &j.last_status },
+                        if j.enabled { "on" } else { "off" },
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+        "job_add" => {
+            let spec = input["spec"].as_str().ok_or("spec required")?;
+            let prompt = input["prompt"].as_str().ok_or("prompt required")?;
+            let job = crate::jobs::add(
+                app,
+                input["name"].as_str().unwrap_or(""),
+                spec,
+                prompt,
+                input["session"].as_str().unwrap_or(""),
+            )?;
+            Ok(format!("job {} '{}' scheduled: {} (next {})", job.id, job.name, job.spec, crate::session::fmt_stamp(job.next_run)))
+        }
+        "job_remove" => {
+            let id = input["id"].as_str().ok_or("id required")?;
+            crate::jobs::remove(app, id)?;
+            Ok(format!("removed job '{id}'"))
+        }
+        "job_run" => {
+            let id = input["id"].as_str().ok_or("id required")?;
+            let st = crate::jobs::run_now(app, id)?;
+            Ok(format!("job '{id}': {st}"))
+        }
+        "job_set" => {
+            let id = input["id"].as_str().ok_or("id required")?;
+            let on = input["enabled"].as_bool().ok_or("enabled: bool required")?;
+            crate::jobs::set_enabled(app, id, on)?;
+            Ok(format!("job '{id}' {}", if on { "enabled" } else { "disabled" }))
         }
         _ => Err(format!("unknown builtin tool '{name}'")),
     }
