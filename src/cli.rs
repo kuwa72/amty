@@ -536,6 +536,9 @@ pub async fn run(cmd: crate::Cmd) -> Result<()> {
                 Some(crate::EvolveCmd::Forget { command }) => {
                     print_json(&post(&base, &tok, "/v1/evolve/forget", json!({"command": command})).await?)
                 }
+                Some(crate::EvolveCmd::Cancel) => {
+                    print_json(&post(&base, &tok, "/v1/evolve/cancel", json!({})).await?)
+                }
                 None => print_json(&get(&base, &tok, "/v1/evolve").await?),
             }
         }

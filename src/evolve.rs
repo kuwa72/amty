@@ -200,6 +200,17 @@ pub fn request_restart(app: &Arc<App>, target: PathBuf) {
     maybe_restart(app);
 }
 
+/// Drop a scheduled swap/restart before it fires. Returns the artifact that
+/// was cancelled (None when nothing was pending).
+pub fn cancel_restart(app: &App) -> Option<PathBuf> {
+    let pending = app.restart_pending.lock().unwrap().take();
+    if pending.is_some() {
+        log_line("restart cancelled");
+        app.emit("", EvKind::Touched);
+    }
+    pending
+}
+
 /// If a restart is pending and nothing is running, hand off to a detached
 /// helper process that replaces the exe and relaunches it, then exit.
 /// Returns true when the handoff happened (i.e. never — it exits the process).

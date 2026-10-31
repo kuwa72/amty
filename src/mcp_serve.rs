@@ -157,9 +157,9 @@ fn tool_defs() -> Vec<Value> {
     ),
     (
         "amty_evolve",
-        "Self-evolution control. action=status (default) returns toggles/memory/stats; reflect forces a memory-distillation pass on a session; forget <command> erases a learned auto-approval.",
+        "Self-evolution control. action=status (default) returns toggles/memory/stats; reflect forces a memory-distillation pass on a session; forget <command> erases a learned auto-approval; cancel drops a scheduled self-swap/restart before it fires.",
         json!({"type": "object", "properties": {
-            "action": {"type": "string", "description": "status | reflect | forget"},
+            "action": {"type": "string", "description": "status | reflect | forget | cancel"},
             "session": {"type": "string", "description": "reflect: session id/prefix"},
             "command": {"type": "string", "description": "forget: exact command to unlearn"}}}),
     ),
@@ -345,6 +345,7 @@ async fn call_tool(name: &str, args: &Value) -> Result<Value> {
                     crate::cli::post(&base, &tok, "/v1/evolve/forget",
                         json!({"command": args["command"].as_str().unwrap_or("")})).await
                 }
+                "cancel" => crate::cli::post(&base, &tok, "/v1/evolve/cancel", json!({})).await,
                 _ => crate::cli::get(&base, &tok, "/v1/evolve").await,
             }
         }

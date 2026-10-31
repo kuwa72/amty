@@ -227,7 +227,7 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "self_update".into(),
-            description: "Self-evolution control. actions: status (memory/stats/build state) | reflect (force a memory-distillation pass on a session) | rebuild (cargo build amty from its own source tree, detached; on success the new binary is installed over the running exe and the app restarts when idle — a detached helper process does the swap, so it works even though a running exe can't be overwritten) | install (take an ALREADY BUILT binary — `path` — after checking it runs, and make it the next version; use this when rebuild can't work, e.g. a cross-built Windows exe on a machine without cargo) | restart (schedule that restart manually) | forget (erase a learned auto-approval; pass the exact command in `command`). Rebuild needs the checkout this binary was built from; install only needs the artifact.".into(),
+            description: "Self-evolution control. actions: status (memory/stats/build state) | reflect (force a memory-distillation pass on a session) | rebuild (cargo build amty from its own source tree, detached; on success the new binary is installed over the running exe and the app restarts when idle — a detached helper process does the swap, so it works even though a running exe can't be overwritten) | install (take an ALREADY BUILT binary — `path` — after checking it runs, and make it the next version; use this when rebuild can't work, e.g. a cross-built Windows exe on a machine without cargo) | restart (schedule that restart manually) | cancel (drop a scheduled swap/restart before it fires) | forget (erase a learned auto-approval; pass the exact command in `command`). Rebuild needs the checkout this binary was built from; install only needs the artifact.".into(),
             schema: schema(
                 json!({
                     "action": {"type": "string"},
@@ -288,10 +288,10 @@ pub fn needs_approval(cfg: &Config, name: &str, input: &Value) -> bool {
     // `mcp` is Safe only for read actions; mutations count as Write.
     let mutating_mcp = name == "mcp"
         && !matches!(input["action"].as_str().unwrap_or("list"), "list" | "tools");
-    // `self_update` read actions (status, reflect) are safe; rebuild/install/
-    // restart count as Exec — they spawn a build or replace the running exe.
+    // `self_update` read actions (status, reflect, cancel) are safe; rebuild/
+    // install/restart count as Exec — they spawn a build or replace the exe.
     let mutating_su = name == "self_update"
-        && !matches!(input["action"].as_str().unwrap_or("status"), "status" | "reflect");
+        && !matches!(input["action"].as_str().unwrap_or("status"), "status" | "reflect" | "cancel");
     let risk = if mutating_mcp {
         Risk::Write
     } else if mutating_su {
@@ -556,6 +556,10 @@ pub async fn execute(app: &std::sync::Arc<App>, name: &str, input: &Value) -> Re
                     crate::evolve::request_restart(app, target.clone());
                     Ok(format!("restart scheduled into {} — fires when all runs are idle (including this one when it ends)", target.display()))
                 }
+                "cancel" => Ok(match crate::evolve::cancel_restart(app) {
+                    Some(p) => format!("cancelled the pending swap to {}", p.display()),
+                    None => "no restart pending".into(),
+                }),
                 "forget" => {
                     let cmd = input["command"].as_str().ok_or("command required")?;
                     Ok(if crate::evolve::forget_command(app, cmd) {
@@ -564,7 +568,7 @@ pub async fn execute(app: &std::sync::Arc<App>, name: &str, input: &Value) -> Re
                         format!("not learned: {cmd}")
                     })
                 }
-                _ => Err(format!("unknown action '{action}' (status|reflect|rebuild|install|restart|forget)")),
+                _ => Err(format!("unknown action '{action}' (status|reflect|rebuild|install|restart|cancel|forget)")),
             }
         }
         "mcp_install" => {
@@ -1669,6 +1673,7 @@ mod tests {
         let ask = cfg(ApprovalMode::Ask);
         assert!(!needs_approval(&ask, "self_update", &json!({"action": "status"})));
         assert!(!needs_approval(&ask, "self_update", &json!({"action": "reflect"})));
+        assert!(!needs_approval(&ask, "self_update", &json!({"action": "cancel"})));
         assert!(needs_approval(&ask, "self_update", &json!({"action": "rebuild"})));
         assert!(needs_approval(&ask, "self_update", &json!({"action": "restart"})));
         // install replaces the running exe — never silently allowed

@@ -136,6 +136,7 @@ static JA: &[(&str, &str)] = &[
     ("name required", "名前が必要です"),
     ("edit", "編集"),
     ("cancel", "キャンセル"),
+    ("pending swap:", "置き換え待ち:"),
     ("(unsaved)", "(未保存)"),
     ("reveal", "場所を開く"),
     // jobs
