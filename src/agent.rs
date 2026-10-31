@@ -125,8 +125,8 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
         let max_tokens = prov_conf.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
         let prov = provider::build(&prov_conf);
-        // shrink the session with an LLM summary if it's near the context
-        // window; re-fetch afterwards since messages may have been replaced
+        // shrink the prompt with an LLM summary if it's near the context
+        // window; the session log itself is never trimmed
         crate::compact::maybe_compact(app, sid, prov.as_ref(), &prov_conf, &model, &format!("{system}{system_tail}"), &specs, max_tokens, &cancelled).await;
         let session = app.sessions.get(sid).ok_or_else(|| anyhow!("session gone"))?;
 
@@ -135,7 +135,7 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
             max_tokens,
             system: Some(system),
             system_tail: (!system_tail.is_empty()).then_some(system_tail),
-            messages: session.messages,
+            messages: session.request_messages(),
             tools: specs,
         };
 

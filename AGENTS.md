@@ -12,7 +12,10 @@ App core (src/app.rs)           -- config, sessions, approvals, event broadcast
   |- agent loop (src/agent.rs)  -- provider stream -> tool calls -> results -> repeat;
   |                             auto-compacts via src/compact.rs when the
   |                             estimated prompt nears the context window
-  |                             (LLM summary replaces old messages, tail kept);
+  |                             (LLM summary stands in for the older span in
+  |                             provider requests only — `Session::compact`,
+  |                             so the log/GUI keep every message and stay
+  |                             scrollable);
   |                             abnormal exits persist a `[amty: run ended —
   |                             <reason>]` user msg so the log records why
   |- providers (src/provider.rs)-- Anthropic native + OpenAI-compatible (hand-rolled SSE)
@@ -100,10 +103,13 @@ cargo build --release
 ./target/debug/amty auth gdrive [--status]   # run a catalog entry's OAuth flow
 ./target/debug/amty evolve            # self-evolution state (memory/stats/restart)
 ./target/debug/amty evolve <session>  # force a reflection pass on a session
+./target/debug/amty evolve cancel     # drop a scheduled self-swap/restart
 
 # Windows native binary (cross-compiled from WSL; needs mingw-w64 incl. windres):
 ./scripts/build-windows.sh          # build + deploy to %USERPROFILE%\.local\bin\amty.exe
                                     # (refuses while amty.exe runs; --force kills it first)
+./scripts/build-windows.sh --watch  # rebuild + redeploy on every src/build.rs/Cargo.toml/
+                                    # assets change (kills + relaunches amty.exe if it ran)
 # equivalent by hand:
 cargo build --release --target x86_64-pc-windows-gnu
 # -> target/x86_64-pc-windows-gnu/release/amty.exe  (~24 MB, static, no DLLs)
@@ -154,7 +160,7 @@ amty continuously improves itself; toggles live under `evolve.*` config keys
   Unlearn via `POST /v1/evolve/forget`, `self_update forget <command>`, or
   `amty evolve forget <cmd>`.
 - **Self-rebuild** (`evolve.self_modify`): the `self_update` tool —
-  `status | reflect [session] | rebuild | install <path> | restart | forget`.
+  `status | reflect [session] | rebuild | install <path> | restart | cancel | forget`.
   `rebuild` runs `cargo build` detached in `CARGO_MANIFEST_DIR` (profile matches
   the running exe: target/debug → debug, else release) logging to
   `self-update.log`, since a cold build can exceed the 300 s tool cap. If the
@@ -179,7 +185,11 @@ amty continuously improves itself; toggles live under `evolve.*` config keys
   `self_update` agent tool — drive it by asking the agent (`amty send "call
   self_update rebuild"` or the GUI). There is no CLI subcommand or API
   endpoint that builds (`amty evolve` and `GET /v1/evolve` are read-only; the
-  `amty_evolve` MCP facade exposes status|reflect|forget only). rebuild/
+  `amty_evolve` MCP facade exposes status|reflect|forget|cancel only). A
+  scheduled swap can be dropped before it fires (`evolve::cancel_restart`):
+  `POST /v1/evolve/cancel`, `amty evolve cancel`, `self_update cancel` (Safe,
+  no approval), or the cancel button the evolve tab shows while a swap is
+  pending. rebuild/
   install/restart count as `Risk::Exec` → they prompt for approval in `ask`
   mode. `self_update restart` with no freshly `built_binary` only re-launches
   the same exe (install == target → swap helper skips the copy); replacing the
@@ -196,7 +206,7 @@ amty continuously improves itself; toggles live under `evolve.*` config keys
   failure), and respawns it. Same code path on all platforms.
 - **Stats**: per-tool calls/errors/denied + approved-command counts persist
   to `evolve.json`; exposed via `self_update status`, `GET /v1/evolve`,
-  `amty evolve`, the `amty_evolve` MCP facade tool (status|reflect|forget),
+  `amty evolve`, the `amty_evolve` MCP facade tool (status|reflect|forget|cancel),
   and fed into the reflection prompt. The Settings GUI has an "evolve" tab
   with the five toggles plus a read-only MEMORY.md viewer.
 - **Verified on Windows**: `self_update restart` from an agent session drove

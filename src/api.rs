@@ -49,6 +49,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/evolve", get(evolve_status))
         .route("/v1/evolve/reflect", post(evolve_reflect))
         .route("/v1/evolve/forget", post(evolve_forget))
+        .route("/v1/evolve/cancel", post(evolve_cancel))
         .layer(middleware::from_fn_with_state(app.clone(), auth))
         .with_state(app)
 }
@@ -407,6 +408,13 @@ async fn evolve_forget(
     Json(b): Json<ForgetBody>,
 ) -> Json<Value> {
     Json(json!({"removed": crate::evolve::forget_command(&app, &b.command)}))
+}
+
+/// `POST /v1/evolve/cancel` — drop a scheduled swap/restart before it fires.
+async fn evolve_cancel(State(app): State<Arc<App>>) -> Json<Value> {
+    Json(json!({
+        "cancelled": crate::evolve::cancel_restart(&app).map(|p| p.display().to_string())
+    }))
 }
 
 async fn skill_remove(

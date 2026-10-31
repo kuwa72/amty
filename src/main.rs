@@ -240,6 +240,8 @@ pub enum EvolveCmd {
     Reflect { session: Option<String> },
     /// Erase a learned auto-approval (the exact command line).
     Forget { command: String },
+    /// Drop a scheduled self-swap/restart before it fires.
+    Cancel,
 }
 
 /// Linux/WSL display fixups: point XDG_RUNTIME_DIR at WSLg's socket dir when

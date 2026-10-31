@@ -3111,6 +3111,14 @@ fn settings_window(ctx: &egui::Context, lang: &str, open: &mut bool, buf: &mut S
             ui.checkbox(&mut buf.cfg.evolve.self_modify, t("self_update tool (rebuild + restart)"));
             ui.checkbox(&mut buf.cfg.evolve.auto_restart, t("auto-restart when idle after rebuild"));
             ui.checkbox(&mut buf.cfg.evolve.learn_approvals, t("auto-allow repeatedly approved commands"));
+            if let Some(p) = app.restart_pending.lock().unwrap().clone() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} {}", t("pending swap:"), p.display()));
+                    if ui.small_button(t("cancel")).clicked() {
+                        crate::evolve::cancel_restart(app);
+                    }
+                });
+            }
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label(t("memory:"));
