@@ -16,6 +16,16 @@ pub struct SessionFile {
     pub ts: u64,
 }
 
+/// Auto-compaction state: `summary` stands in for `messages[..from]` in
+/// provider requests. The messages themselves stay in the log, so the GUI,
+/// search and the jsonl file keep the whole conversation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Compaction {
+    pub summary: String,
+    /// Index into `Session::messages` where the verbatim tail starts.
+    pub from: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -42,6 +52,9 @@ pub struct Session {
     /// a draft survives session switches and app restarts.
     #[serde(default)]
     pub draft: String,
+    /// Compaction applied to provider requests (see `Compaction`).
+    #[serde(default)]
+    pub compact: Option<Compaction>,
 }
 
 impl Session {
@@ -59,7 +72,30 @@ impl Session {
             usage: crate::types::Usage::default(),
             files: vec![],
             draft: String::new(),
+            compact: None,
         }
+    }
+
+    /// Index into `messages` where the provider's verbatim tail starts; 0 when
+    /// nothing was compacted, or when a rewind cut the log below the boundary.
+    pub fn compact_from(&self) -> usize {
+        match &self.compact {
+            Some(c) if c.from <= self.messages.len() => c.from,
+            _ => 0,
+        }
+    }
+
+    /// What the provider sees: the compaction summary (if any) followed by the
+    /// verbatim tail. `messages` itself is never trimmed.
+    pub fn request_messages(&self) -> Vec<ChatMessage> {
+        let from = self.compact_from();
+        let Some(c) = self.compact.as_ref().filter(|_| from > 0) else {
+            return self.messages.clone();
+        };
+        let mut out = Vec::with_capacity(self.messages.len() - from + 1);
+        out.push(ChatMessage::user(c.summary.clone()));
+        out.extend_from_slice(&self.messages[from..]);
+        out
     }
 }
 
@@ -351,12 +387,12 @@ impl SessionStore {
         }
     }
 
-    /// Replace the whole message list in place — used by auto-compaction,
-    /// which swaps the older span for a single summary message.
-    pub fn replace_messages(&self, id: &str, messages: Vec<ChatMessage>) -> bool {
+    /// Record the summary that stands in for `messages[..from]` in provider
+    /// requests — used by auto-compaction. The messages stay in the log.
+    pub fn set_compaction(&self, id: &str, summary: String, from: usize) -> bool {
         let mut map = self.map.write().unwrap();
         if let Some(s) = map.get_mut(id) {
-            s.messages = messages;
+            s.compact = Some(Compaction { summary, from });
             s.updated = now_secs();
             s.seq = self.next_seq();
             self.persist(s);
@@ -406,6 +442,10 @@ impl SessionStore {
         let mut map = self.map.write().unwrap();
         if let Some(s) = map.get_mut(id) {
             s.messages.truncate(keep);
+            // a rewind past the summary boundary invalidates it
+            if s.compact.as_ref().is_some_and(|c| c.from > keep) {
+                s.compact = None;
+            }
             s.updated = now_secs();
             s.seq = self.next_seq();
             self.persist(s);
@@ -419,12 +459,14 @@ impl SessionStore {
     /// inheriting its provider/model overrides. Returns the new session id.
     pub fn fork(&self, id: &str, keep: usize) -> Option<String> {
         let src = self.get(id)?;
+        let keep = keep.min(src.messages.len());
         let new_id = self.create(src.provider.clone(), src.model.clone());
         {
             let mut map = self.map.write().unwrap();
             if let Some(s) = map.get_mut(&new_id) {
                 s.title = format!("{} (fork)", src.title);
-                s.messages = src.messages[..keep.min(src.messages.len())].to_vec();
+                s.messages = src.messages[..keep].to_vec();
+                s.compact = src.compact.clone().filter(|c| c.from <= keep);
                 s.updated = now_secs();
                 s.seq = self.next_seq();
                 self.persist(s);
@@ -562,6 +604,9 @@ struct MetaOnly {
     /// Unsent composer text (see `Session::draft`).
     #[serde(default)]
     draft: String,
+    /// Compaction state (see `Session::compact`).
+    #[serde(default)]
+    compact: Option<Compaction>,
 }
 
 impl From<&Session> for MetaOnly {
@@ -577,6 +622,7 @@ impl From<&Session> for MetaOnly {
             usage: s.usage,
             files: s.files.clone(),
             draft: s.draft.clone(),
+            compact: s.compact.clone(),
         }
     }
 }
@@ -740,6 +786,33 @@ mod tests {
         let store2 = SessionStore::load(dir.clone());
         assert_eq!(store2.get(&fork).unwrap().messages.len(), 2);
         assert_eq!(store2.get(&id).unwrap().messages.len(), 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn compaction_shrinks_requests_but_keeps_the_log() {
+        let (store, dir) = temp_store();
+        let id = store.create(None, None);
+        for t in ["one", "two", "three"] {
+            store.push_message(&id, ChatMessage::user(t));
+        }
+        assert!(store.set_compaction(&id, "summary".into(), 2));
+        let s = store.get(&id).unwrap();
+        assert_eq!(s.messages.len(), 3); // the log keeps everything
+        let view = s.request_messages();
+        assert_eq!(view.len(), 2);
+        assert_eq!(view[0].text_content(), "summary");
+        assert_eq!(view[1].text_content(), "three");
+        // survives a restart
+        drop(store);
+        let store2 = SessionStore::load(dir.clone());
+        assert_eq!(store2.get(&id).unwrap().request_messages()[0].text_content(), "summary");
+        // rewinding past the boundary drops the summary, not the messages
+        assert!(store2.truncate(&id, 1));
+        let s = store2.get(&id).unwrap();
+        assert!(s.compact.is_none());
+        assert_eq!(s.request_messages().len(), 1);
+        assert_eq!(s.request_messages()[0].text_content(), "one");
         std::fs::remove_dir_all(dir).ok();
     }
 

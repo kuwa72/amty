@@ -12,7 +12,10 @@ App core (src/app.rs)           -- config, sessions, approvals, event broadcast
   |- agent loop (src/agent.rs)  -- provider stream -> tool calls -> results -> repeat;
   |                             auto-compacts via src/compact.rs when the
   |                             estimated prompt nears the context window
-  |                             (LLM summary replaces old messages, tail kept);
+  |                             (LLM summary stands in for the older span in
+  |                             provider requests only — `Session::compact`,
+  |                             so the log/GUI keep every message and stay
+  |                             scrollable);
   |                             abnormal exits persist a `[amty: run ended —
   |                             <reason>]` user msg so the log records why
   |- providers (src/provider.rs)-- Anthropic native + OpenAI-compatible (hand-rolled SSE)

@@ -1,6 +1,8 @@
 //! Auto-compaction: when the estimated prompt approaches the model's context
 //! window, the older span of the session is summarized by the provider and
-//! replaced in-place, keeping a recent tail of messages verbatim.
+//! recorded as `Session::compact`, keeping a recent tail of messages verbatim.
+//! Only the provider request is compacted — the stored log keeps every message
+//! so the GUI and search can still scroll back past a compaction.
 //!
 //! Trigger: estimated input tokens > (context_window - max_tokens) * 0.9.
 //! The tail keeps at most ~25% of the input budget so the summary + tail fit
@@ -83,6 +85,13 @@ fn find_split(messages: &[ChatMessage], keep: u64) -> usize {
         .unwrap_or(messages.len())
 }
 
+/// Where the new verbatim tail starts in `messages`, given the current
+/// boundary `base` (0 = never compacted) and a `split` into the request view.
+/// Once compacted, view[0] is the summary, so view[split] is one slot earlier.
+fn tail_start(base: usize, split: usize) -> usize {
+    if base == 0 { split } else { base + split - 1 }
+}
+
 /// Flatten messages into a text transcript for the summarizer. Long tool
 /// inputs/results are clipped — the summary needs their gist, not bytes.
 pub(crate) fn transcript(messages: &[ChatMessage]) -> String {
@@ -162,27 +171,28 @@ pub async fn maybe_compact(
         .await;
     }
     let input_cap = crate::provider::context_window(conf, model).saturating_sub(max_tokens as u64);
-    if estimate(&session.messages, system, tools) <= input_cap * 9 / 10 {
+    // estimate what the provider will actually get, so a previous summary counts
+    let view = session.request_messages();
+    if estimate(&view, system, tools) <= input_cap * 9 / 10 {
         return;
     }
 
-    let split = find_split(&session.messages, input_cap / 4);
-    if split == 0 || split >= session.messages.len() {
+    let split = find_split(&view, input_cap / 4);
+    if split == 0 || split >= view.len() {
         return; // nothing safe to drop — let the provider report the overflow
     }
 
     let dropped = split;
-    let head: Vec<ChatMessage> = session.messages[..split].to_vec();
-    let summary = summarize(prov, model, &head, &cancelled).await.unwrap_or_default();
+    let summary = summarize(prov, model, &view[..split], &cancelled).await.unwrap_or_default();
     let note = if summary.trim().is_empty() {
         format!("[amty: earlier conversation compacted — {dropped} messages omitted]")
     } else {
         format!("[amty: conversation so far, compacted]\n{}", summary.trim())
     };
-    let mut msgs = Vec::with_capacity(session.messages.len() - split + 1);
-    msgs.push(ChatMessage::user(note));
-    msgs.extend_from_slice(&session.messages[split..]);
-    if app.sessions.replace_messages(sid, msgs) {
+    // Once compacted, `view` is [summary] + messages[base..], so view[split]
+    // sits one slot earlier in `messages` than it does on a fresh log.
+    let base = session.compact_from();
+    if app.sessions.set_compaction(sid, note, tail_start(base, split)) {
         app.emit(sid, EvKind::Compacted { dropped });
         app.emit(sid, EvKind::Touched);
     }
@@ -243,6 +253,12 @@ mod tests {
         ];
         let split = find_split(&msgs, 1);
         assert_eq!(split, 0); // falls back to the only user-text message
+    }
+
+    #[test]
+    fn tail_start_accounts_for_existing_summary() {
+        assert_eq!(tail_start(0, 3), 3);
+        assert_eq!(tail_start(10, 3), 12); // view[0] is the summary, not a message
     }
 
     #[test]
