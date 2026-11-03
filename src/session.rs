@@ -491,18 +491,29 @@ impl SessionStore {
     /// Returns false when the run already journaled this path (the first
     /// capture is the one to keep) or the session is gone.
     pub fn journal_write(&self, id: &str, run: usize, path: &str) -> bool {
+        // absolute, so a restart with a different cwd can't point the revert
+        // at another file
+        let abs = std::path::Path::new(path);
+        let abs = std::fs::canonicalize(abs).unwrap_or_else(|_| {
+            abs.parent()
+                .and_then(|d| std::fs::canonicalize(d).ok())
+                .zip(abs.file_name())
+                .map(|(d, n)| d.join(n))
+                .unwrap_or_else(|| abs.to_path_buf())
+        });
         // read the file outside the store lock: 1 MiB on a slow disk would
         // otherwise stall every other session
-        let meta = std::fs::metadata(path).ok();
-        let too_big = meta.as_ref().is_some_and(|m| m.len() > MAX_REVERT_BYTES);
-        let prev = if too_big { None } else { std::fs::read_to_string(path).ok() };
+        let meta = std::fs::metadata(&abs);
+        let too_big = meta.as_ref().is_ok_and(|m| m.len() > MAX_REVERT_BYTES);
+        let prev = if too_big { None } else { std::fs::read_to_string(&abs).ok() };
+        // missing is restorable as "delete it"; anything else we could not
+        // read (binary, permissions) is listed but left alone
+        let missing = meta.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
         let entry = RevertEntry {
-            path: path.into(),
+            path: abs.to_string_lossy().into_owned(),
             run,
             ts: now_secs(),
-            // a file that does not exist is restorable as "delete it"; one we
-            // could not read is listed but left alone
-            ok: !too_big && (prev.is_some() || meta.is_none()),
+            ok: !too_big && (prev.is_some() || missing),
             prev,
         };
         let mut map = self.map.write().unwrap();
@@ -521,6 +532,29 @@ impl SessionStore {
         true
     }
 
+    /// The run's write succeeded: the file is now the run's own output, so
+    /// only a change made *after* this moment should block the revert.
+    pub fn journal_touch(&self, id: &str, run: usize, path: &str) {
+        let abs = std::path::Path::new(path);
+        let abs = std::fs::canonicalize(abs).unwrap_or_else(|_| abs.to_path_buf());
+        let mut map = self.map.write().unwrap();
+        let Some(s) = map.get_mut(id) else { return };
+        let touched = match s
+            .revert
+            .iter_mut()
+            .find(|e| e.run == run && e.path == abs.to_string_lossy())
+        {
+            Some(e) => {
+                e.ts = now_secs();
+                true
+            }
+            None => false,
+        };
+        if touched {
+            self.persist(s);
+        }
+    }
+
     /// Forget a journaled write that never happened (the tool failed).
     pub fn journal_drop(&self, id: &str, run: usize, path: &str) {
         let mut map = self.map.write().unwrap();
@@ -537,17 +571,14 @@ impl SessionStore {
         let pending: Vec<(String, u64, Option<String>, bool)> = {
             let map = self.map.read().unwrap();
             let s = map.get(id).ok_or("no such session")?;
-            let mut v: Vec<(String, u64, Option<String>, bool)> = s
-                .revert
+            s.revert
                 .iter()
                 .filter(|e| e.run == run)
                 .map(|e| (e.path.clone(), e.ts, e.prev.clone(), e.ok))
-                .collect();
-            // newest first, so the run's earliest journaled state lands last
-            v.reverse();
-            v
+                .collect()
         };
         let mut out = Reverted::default();
+        let mut done: Vec<String> = vec![];
         for (path, ts, prev, ok) in &pending {
             let touched_after = std::fs::metadata(path)
                 .and_then(|m| m.modified())
@@ -560,15 +591,22 @@ impl SessionStore {
             }
             match prev {
                 Some(content) => std::fs::write(path, content).map_err(|e| format!("{path}: {e}"))?,
-                None => {
-                    let _ = std::fs::remove_file(path);
-                }
+                None => match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => {
+                        out.skipped += 1;
+                        continue;
+                    }
+                },
             }
             out.restored += 1;
+            done.push(path.clone());
         }
         let mut map = self.map.write().unwrap();
         if let Some(s) = map.get_mut(id) {
-            s.revert.retain(|e| e.run != run);
+            // skipped entries stay, so the button survives a retry
+            s.revert.retain(|e| !(e.run == run && done.contains(&e.path)));
             self.persist(s);
         }
         Ok(out)
@@ -853,6 +891,28 @@ mod tests {
 
         let out = store.revert_run(&id, 1).unwrap();
         assert_eq!((out.restored, out.skipped), (0, 2));
+        // skipped entries stay so the button can retry
+        assert_eq!(store.get(&id).unwrap().revert.len(), 2);
+    }
+
+    #[test]
+    fn the_runs_own_later_write_does_not_block_the_revert() {
+        let (store, dir) = temp_store();
+        let id = store.create(None, None);
+        store.push_message(&id, ChatMessage::user("hi"));
+        store.push_message(&id, ChatMessage { role: Role::Assistant, blocks: vec![] });
+        let p = dir.join("twice-more.txt");
+        std::fs::write(&p, "one\n").unwrap();
+        store.journal_write(&id, 1, p.to_str().unwrap());
+        std::fs::write(&p, "two\n").unwrap();
+        // the capture is older than the run's own write: without the touch
+        // this would look like someone else's edit
+        store.map.write().unwrap().get_mut(&id).unwrap().revert[0].ts -= 1;
+        store.journal_touch(&id, 1, p.to_str().unwrap());
+
+        let out = store.revert_run(&id, 1).unwrap();
+        assert_eq!((out.restored, out.skipped), (1, 0));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "one\n");
     }
 
     #[test]

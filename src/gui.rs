@@ -1605,7 +1605,9 @@ impl eframe::App for GuiApp {
                                 if let Some(r) = run_of(i) {
                                     let journaled =
                                         s.revert.iter().filter(|e| e.run == r).count();
+                                    // never while a run is writing
                                     if journaled > 0
+                                        && !running_now
                                         && shown.insert(r)
                                         && ui
                                             .small_button(format!(
@@ -1635,6 +1637,7 @@ impl eframe::App for GuiApp {
                                 out.skipped,
                                 self.tr("skipped")
                             );
+                            self.view_dirty = true;
                             self.refresh_view();
                             self.toast(m);
                         }

@@ -77,7 +77,6 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
     // the run a revert covers: this user message (tool calls may sit in
     // prose messages too, so keying on the assistant message would miss them)
     let run_msg = app.sessions.message_count(sid).saturating_sub(1);
-
     // ensure MCP servers are up (cheap after first connect)
     app.mcp.ensure_connected().await;
 
@@ -308,6 +307,11 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
             crate::evolve::record_tool(app, &name, out.is_ok());
             match out {
                 Ok(text) => {
+                    if journaled {
+                        if let Some(path) = input["path"].as_str() {
+                            app.sessions.journal_touch(sid, run_msg, path);
+                        }
+                    }
                     if record_created(app, sid, &name, &input, before) > 0 {
                         app.emit(sid, EvKind::Touched);
                     }
