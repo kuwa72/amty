@@ -29,6 +29,7 @@ static JA: &[(&str, &str)] = &[
     ("rewound", "巻き戻しました"),
     ("revert files", "ファイルを元に戻す"),
     ("reverted files:", "元に戻したファイル:"),
+    ("skipped", "スキップ"),
     ("forked", "分岐しました"),
     ("context compacted", "コンテキストを圧縮しました"),
     ("self-evolved", "自己進化"),

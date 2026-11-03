@@ -74,6 +74,9 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
 
     app.sessions.push_message(sid, ChatMessage::user_blocks(blocks));
     app.emit(sid, EvKind::Touched);
+    // the run a revert covers: this user message (tool calls may sit in
+    // prose messages too, so keying on the assistant message would miss them)
+    let run_msg = app.sessions.message_count(sid).saturating_sub(1);
 
     // ensure MCP servers are up (cheap after first connect)
     app.mcp.ensure_connected().await;
@@ -220,8 +223,7 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
             app.sessions.push_message(sid, ChatMessage { role: Role::Assistant, blocks });
             app.emit(sid, EvKind::Touched);
         }
-        // index of that message: the revert journal keys on it
-        let turn_msg = app.sessions.message_count(sid).saturating_sub(1);
+
         if tool_uses.is_empty() {
             app.emit(sid, EvKind::Done);
             return Ok(());
@@ -280,12 +282,12 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
             }
 
             // journal the file before an approved write, so the run can be
-            // reverted from the GUI (first write in a run wins)
-            if matches!(name.as_str(), "fs_write" | "fs_edit") {
-                if let Some(path) = input["path"].as_str() {
-                    app.sessions.journal_write(sid, turn_msg, path);
-                }
-            }
+            // reverted from the GUI (first write in a run wins). A failed
+            // call changes nothing, so the entry is dropped again below.
+            let journaled = matches!(name.as_str(), "fs_write" | "fs_edit")
+                && input["path"]
+                    .as_str()
+                    .is_some_and(|p| app.sessions.journal_write(sid, run_msg, p));
 
             // a `shell` call can create files anywhere under its workdir, so
             // snapshot the tree first; the post-call diff is what it created
@@ -326,6 +328,11 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
                 }
                 Err(e) => {
                     app.emit(sid, EvKind::ToolEnd { name: name.clone(), ok: false, preview: preview(&e) });
+                    if journaled {
+                        if let Some(path) = input["path"].as_str() {
+                            app.sessions.journal_drop(sid, run_msg, path);
+                        }
+                    }
                     if app.cfg.read().unwrap().te.loopguard {
                         *failures.entry(tools::guard_key(&name, &input)).or_insert(0) += 1;
                     }
