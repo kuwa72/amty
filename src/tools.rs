@@ -255,72 +255,10 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
     ]
 }
 
-/// Previous content for an approval diff. Skipped for files too large to
-/// carry in a prompt (and for anything that isn't readable UTF-8).
-fn prev_content(path: &str) -> Option<String> {
-    const MAX: u64 = 256 * 1024;
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > MAX {
-        return None;
-    }
-    std::fs::read_to_string(path).ok()
-}
-
-/// Short identity of a call, without any diff payload: the loop guard keys
-/// on this so a changed edit still counts as the same failing call.
-pub fn guard_key(name: &str, input: &Value) -> String {
-    if matches!(name, "fs_write" | "fs_edit") {
-        format!("{name}: {}", input["path"].as_str().unwrap_or(""))
-    } else {
-        summarize(name, input)
-    }
-}
-
-/// Summary for approval prompts; file writes carry a diff after the first
-/// line so the user can see the change before allowing it.
+/// Short human-readable summary for approval prompts.
 pub fn summarize(name: &str, input: &Value) -> String {
     match name {
         "shell" => format!("shell: {}", input["command"].as_str().unwrap_or("")),
-        "fs_write" | "fs_edit" if !input["path"].as_str().unwrap_or("").is_empty() => {
-            let path = input["path"].as_str().unwrap_or("");
-            let old = prev_content(path);
-            let new = if name == "fs_write" {
-                // `old == None` is either a new file or one too large/binary
-                // to diff; only the former is honestly "all added lines"
-                (old.is_some() || !Path::new(path).exists())
-                    .then(|| input["content"].as_str().unwrap_or("").to_string())
-            } else {
-                let from = input["old"].as_str().unwrap_or("");
-                let to = input["new"].as_str().unwrap_or("");
-                let all = input["replace_all"].as_bool().unwrap_or(false);
-                old.as_ref().and_then(|t| {
-                    // the tool itself will reject these, so show no diff
-                    let n = t.matches(from).count();
-                    if from.is_empty() || n == 0 || (n > 1 && !all) {
-                        return None;
-                    }
-                    Some(if all { t.replace(from, to) } else { t.replacen(from, to, 1) })
-                })
-            };
-            match new {
-                Some(n) => {
-                    let diff = crate::diff::unified(path, old.as_deref(), &n);
-                    if !diff.is_empty() {
-                        format!("{name}: {path}\n{diff}")
-                    } else if old.as_deref().is_some_and(|o| {
-                        o != n.as_str() && o.trim_end_matches('\n') == n.trim_end_matches('\n')
-                    }) {
-                        // `lines()` ignores a trailing newline: the one change
-                        // a line diff cannot show, so say it outright
-                        format!("{name}: {path}\n(only the trailing newline differs)")
-                    } else {
-                        format!("{name}: {path}")
-                    }
-                }
-                None => format!("{name}: {path}"),
-            }
-        }
-        // missing path: the call itself fails, nothing to diff
         "fs_write" | "fs_edit" => format!("{name}: {}", input["path"].as_str().unwrap_or("")),
         "fs_read" | "fs_list" => format!("{name}: {}", input["path"].as_str().unwrap_or("")),
         "web_search" => format!("web_search: {}", input["query"].as_str().unwrap_or("")),
@@ -1721,76 +1659,6 @@ mod tests {
         assert!(summarize("shell", &json!({"command": "make"})).contains("make"));
         assert!(summarize("fs_write", &json!({"path": "/a"})).contains("/a"));
         assert!(summarize("web_search", &json!({"query": "q"})).contains("q"));
-    }
-
-    #[test]
-    fn summarize_fs_edit_carries_the_diff() {
-        let p = std::env::temp_dir().join(format!("amty-diff-{}.txt", uuid::Uuid::new_v4()));
-        std::fs::write(&p, "keep\nold line\n").unwrap();
-        let s = summarize(
-            "fs_edit",
-            &json!({"path": p.to_str().unwrap(), "old": "old line", "new": "new line"}),
-        );
-        let _ = std::fs::remove_file(&p);
-        assert!(s.contains("-old line"), "{s}");
-        assert!(s.contains("+new line"), "{s}");
-        // the loop guard keys on the short form, never on the diff
-        let k = guard_key(
-            "fs_edit",
-            &json!({"path": p.to_str().unwrap(), "old": "old line", "new": "new line"}),
-        );
-        assert_eq!(k, format!("fs_edit: {}", p.to_str().unwrap()));
-    }
-
-    #[test]
-    fn summarize_fs_write_created_overwrite_and_undiffable() {
-        let dir = std::env::temp_dir().join(format!("amty-diff-w-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("n.txt");
-        let s = summarize("fs_write", &json!({"path": p.to_str().unwrap(), "content": "a\nb\n"}));
-        assert!(s.contains("@@ -0,0") && s.contains("+a"), "{s}");
-
-        std::fs::write(&p, "a\nb\n").unwrap();
-        let s = summarize("fs_write", &json!({"path": p.to_str().unwrap(), "content": "a\nB\n"}));
-        assert!(s.contains("-b") && s.contains("+B"), "{s}");
-
-        // existing but too large to diff: must not read as a new file
-        let big = dir.join("big.txt");
-        std::fs::write(&big, "x".repeat(300 * 1024)).unwrap();
-        let s = summarize("fs_write", &json!({"path": big.to_str().unwrap(), "content": "y"}));
-        assert_eq!(s, format!("fs_write: {}", big.to_str().unwrap()));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn summarize_fs_edit_skips_a_diff_the_tool_would_reject() {
-        let p = std::env::temp_dir().join(format!("amty-diff-m-{}.txt", uuid::Uuid::new_v4()));
-        std::fs::write(&p, "x x\n").unwrap();
-        let s = summarize(
-            "fs_edit",
-            &json!({"path": p.to_str().unwrap(), "old": "x", "new": "y"}),
-        );
-        let _ = std::fs::remove_file(&p);
-        assert_eq!(s, format!("fs_edit: {}", p.to_str().unwrap()));
-    }
-
-    #[test]
-    fn summarize_reports_a_trailing_newline_change() {
-        let p = std::env::temp_dir().join(format!("amty-diff-n-{}.txt", uuid::Uuid::new_v4()));
-        std::fs::write(&p, "a\n").unwrap();
-        let s = summarize("fs_write", &json!({"path": p.to_str().unwrap(), "content": "a"}));
-        assert!(s.contains("trailing newline"), "{s}");
-
-        // same bytes, and an edit whose `old` is absent: nothing to say
-        let s = summarize("fs_write", &json!({"path": p.to_str().unwrap(), "content": "a\n"}));
-        assert_eq!(s, format!("fs_write: {}", p.to_str().unwrap()));
-        let s = summarize(
-            "fs_edit",
-            &json!({"path": p.to_str().unwrap(), "old": "absent", "new": "x"}),
-        );
-        let _ = std::fs::remove_file(&p);
-        assert_eq!(s, format!("fs_edit: {}", p.to_str().unwrap()));
     }
 
     #[test]
