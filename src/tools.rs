@@ -305,10 +305,14 @@ pub fn summarize(name: &str, input: &Value) -> String {
             match new {
                 Some(n) => {
                     let diff = crate::diff::unified(path, old.as_deref(), &n);
-                    if diff.is_empty() {
-                        format!("{name}: {path}")
-                    } else {
+                    if !diff.is_empty() {
                         format!("{name}: {path}\n{diff}")
+                    } else if old.as_deref() != Some(n.as_str()) {
+                        // `lines()` ignores a trailing newline, so this is the
+                        // only change the diff cannot show — still say so
+                        format!("{name}: {path}\n(no line changes — only the trailing newline differs)")
+                    } else {
+                        format!("{name}: {path}")
                     }
                 }
                 None => format!("{name}: {path}"),
@@ -1765,6 +1769,15 @@ mod tests {
         );
         let _ = std::fs::remove_file(&p);
         assert_eq!(s, format!("fs_edit: {}", p.to_str().unwrap()));
+    }
+
+    #[test]
+    fn summarize_reports_a_trailing_newline_change() {
+        let p = std::env::temp_dir().join(format!("amty-diff-n-{}.txt", std::process::id()));
+        std::fs::write(&p, "a\n").unwrap();
+        let s = summarize("fs_write", &json!({"path": p.to_str().unwrap(), "content": "a"}));
+        let _ = std::fs::remove_file(&p);
+        assert!(s.contains("trailing newline"), "{s}");
     }
 
     #[test]
