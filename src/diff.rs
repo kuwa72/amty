@@ -8,9 +8,9 @@ const MAX_LINES: usize = 200;
 const CTX: usize = 3;
 
 /// Unified diff of `old` (`None` = the file does not exist) against `new`.
-/// One hunk: everything between the common prefix and suffix. That is a
-/// truthful diff (never a superset of the change), just not the minimal one
-/// for several scattered edits — `shortcut: single hunk, upgrade to an LCS
+/// One hunk covering everything between the common prefix and suffix: a valid
+/// diff, but not a minimal one — unchanged lines between two scattered edits
+/// show up as removed and re-added. `shortcut: single hunk, upgrade to an LCS
 /// diff if scattered edits start to matter`.
 pub fn unified(path: &str, old: Option<&str>, new: &str) -> String {
     let old: Vec<&str> = old.map(|s| s.lines().collect()).unwrap_or_default();
@@ -57,10 +57,11 @@ pub fn unified(path: &str, old: Option<&str>, new: &str) -> String {
         out.push(format!(" {l}"));
     }
 
+    const MARKER: &str = "… (truncated)";
     let mut text = String::new();
     for (i, line) in out.iter().enumerate() {
-        if i == MAX_LINES || text.len() + line.len() + 1 > MAX_BYTES {
-            text.push_str("… (truncated)");
+        if i == MAX_LINES || text.len() + line.len() + 1 + MARKER.len() > MAX_BYTES {
+            text.push_str(MARKER);
             break;
         }
         text.push_str(line);
@@ -86,12 +87,11 @@ mod tests {
     fn overwrite_shows_removed_and_added_with_context() {
         let old = "a\nb\nc\nd\ne\nf\ng\nh\ni\n";
         let new = "a\nb\nc\nd\nE\nf\ng\nh\ni\n";
-        let d = unified("/x", Some(old), new);
-        assert!(d.contains("-e"), "{d}");
-        assert!(d.contains("+E"), "{d}");
-        // 3 lines of context around the change, not the whole file
-        assert!(d.contains(" c"), "{d}");
-        assert!(!d.contains(" a"), "{d}");
+        // exactly 3 lines of context on both sides
+        assert_eq!(
+            unified("/x", Some(old), new),
+            "--- /x\n+++ /x\n@@ -2,7 +2,7 @@\n b\n c\n d\n-e\n+E\n f\n g\n h\n"
+        );
     }
 
     #[test]
@@ -104,7 +104,15 @@ mod tests {
         let old: String = (0..2000).map(|i| format!("old {i}\n")).collect();
         let new: String = (0..2000).map(|i| format!("new {i}\n")).collect();
         let d = unified("/x", Some(&old), &new);
-        assert!(d.len() < 9000, "{} bytes", d.len());
-        assert!(d.contains("truncated"), "{d}");
+        let lines: Vec<&str> = d.lines().collect();
+        assert_eq!(lines.len(), 201, "200 lines + marker");
+        assert_eq!(*lines.last().unwrap(), "… (truncated)");
+    }
+
+    #[test]
+    fn a_single_huge_line_is_cut_by_bytes() {
+        let d = unified("/x", None, &"y".repeat(20_000));
+        assert!(d.len() <= 8192, "{} bytes", d.len());
+        assert!(d.ends_with("… (truncated)"), "{}", d.len());
     }
 }

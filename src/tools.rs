@@ -281,7 +281,7 @@ pub fn guard_key(name: &str, input: &Value) -> String {
 pub fn summarize(name: &str, input: &Value) -> String {
     match name {
         "shell" => format!("shell: {}", input["command"].as_str().unwrap_or("")),
-        "fs_write" | "fs_edit" => {
+        "fs_write" | "fs_edit" if !input["path"].as_str().unwrap_or("").is_empty() => {
             let path = input["path"].as_str().unwrap_or("");
             let old = prev_content(path);
             let new = if name == "fs_write" {
@@ -307,10 +307,13 @@ pub fn summarize(name: &str, input: &Value) -> String {
                     let diff = crate::diff::unified(path, old.as_deref(), &n);
                     if !diff.is_empty() {
                         format!("{name}: {path}\n{diff}")
-                    } else if old.as_deref() != Some(n.as_str()) {
-                        // `lines()` ignores a trailing newline, so this is the
-                        // only change the diff cannot show — still say so
-                        format!("{name}: {path}\n(no line changes — only the trailing newline differs)")
+                    } else if old
+                        .as_deref()
+                        .is_some_and(|o| o.trim_end_matches('\n') == n.trim_end_matches('\n'))
+                    {
+                        // `lines()` ignores a trailing newline: the one change
+                        // a line diff cannot show, so say it outright
+                        format!("{name}: {path}\n(only the trailing newline differs)")
                     } else {
                         format!("{name}: {path}")
                     }
@@ -318,6 +321,8 @@ pub fn summarize(name: &str, input: &Value) -> String {
                 None => format!("{name}: {path}"),
             }
         }
+        // missing path: the call itself fails, nothing to diff
+        "fs_write" | "fs_edit" => format!("{name}: {}", input["path"].as_str().unwrap_or("")),
         "fs_read" | "fs_list" => format!("{name}: {}", input["path"].as_str().unwrap_or("")),
         "web_search" => format!("web_search: {}", input["query"].as_str().unwrap_or("")),
         "web_fetch" => format!("web_fetch: {}", input["url"].as_str().unwrap_or("")),
@@ -1721,7 +1726,7 @@ mod tests {
 
     #[test]
     fn summarize_fs_edit_carries_the_diff() {
-        let p = std::env::temp_dir().join(format!("amty-diff-{}.txt", std::process::id()));
+        let p = std::env::temp_dir().join(format!("amty-diff-{}.txt", uuid::Uuid::new_v4()));
         std::fs::write(&p, "keep\nold line\n").unwrap();
         let s = summarize(
             "fs_edit",
@@ -1740,7 +1745,7 @@ mod tests {
 
     #[test]
     fn summarize_fs_write_created_overwrite_and_undiffable() {
-        let dir = std::env::temp_dir().join(format!("amty-diff-w-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("amty-diff-w-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("n.txt");
         let s = summarize("fs_write", &json!({"path": p.to_str().unwrap(), "content": "a\nb\n"}));
@@ -1761,7 +1766,7 @@ mod tests {
 
     #[test]
     fn summarize_fs_edit_skips_a_diff_the_tool_would_reject() {
-        let p = std::env::temp_dir().join(format!("amty-diff-m-{}.txt", std::process::id()));
+        let p = std::env::temp_dir().join(format!("amty-diff-m-{}.txt", uuid::Uuid::new_v4()));
         std::fs::write(&p, "x x\n").unwrap();
         let s = summarize(
             "fs_edit",
@@ -1773,7 +1778,7 @@ mod tests {
 
     #[test]
     fn summarize_reports_a_trailing_newline_change() {
-        let p = std::env::temp_dir().join(format!("amty-diff-n-{}.txt", std::process::id()));
+        let p = std::env::temp_dir().join(format!("amty-diff-n-{}.txt", uuid::Uuid::new_v4()));
         std::fs::write(&p, "a\n").unwrap();
         let s = summarize("fs_write", &json!({"path": p.to_str().unwrap(), "content": "a"}));
         let _ = std::fs::remove_file(&p);
