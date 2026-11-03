@@ -1243,15 +1243,21 @@ impl eframe::App for GuiApp {
                         }
                     });
                     // fs_write/fs_edit details carry a diff after the first
-                    // line: show it scrollable so allow/deny is an informed click
-                    match p.detail.split_once('\n') {
+                    // line: show it scrollable so allow/deny is an informed
+                    // click. Other tools (multi-line shell commands) keep the
+                    // plain label below.
+                    let diff = (p.tool == "fs_write" || p.tool == "fs_edit")
+                        .then(|| p.detail.split_once('\n'))
+                        .flatten()
+                        .filter(|(_, d)| d.starts_with("--- "));
+                    match diff {
                         Some((head, diff)) => {
                             ui.add(egui::Label::new(egui::RichText::new(head).monospace().small()).wrap());
                             egui::ScrollArea::vertical()
                                 .max_height(180.0)
                                 .id_salt(("approval_diff", &p.id))
                                 .show(ui, |ui| {
-                                    for line in diff.lines() {
+                                    for line in diff.lines().take(200) {
                                         let color = if line.starts_with("@@") {
                                             egui::Color32::from_rgb(130, 170, 220)
                                         } else if line.starts_with('+') {

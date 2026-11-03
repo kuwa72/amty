@@ -266,6 +266,16 @@ fn prev_content(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+/// Short identity of a call, without any diff payload: the loop guard keys
+/// on this so a changed edit still counts as the same failing call.
+pub fn guard_key(name: &str, input: &Value) -> String {
+    if matches!(name, "fs_write" | "fs_edit") {
+        format!("{name}: {}", input["path"].as_str().unwrap_or(""))
+    } else {
+        summarize(name, input)
+    }
+}
+
 /// Short human-readable summary for approval prompts.
 pub fn summarize(name: &str, input: &Value) -> String {
     match name {
@@ -1710,6 +1720,12 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         assert!(s.contains("-old line"), "{s}");
         assert!(s.contains("+new line"), "{s}");
+        // the loop guard keys on the short form, never on the diff
+        let k = guard_key(
+            "fs_edit",
+            &json!({"path": p.to_str().unwrap(), "old": "old line", "new": "new line"}),
+        );
+        assert_eq!(k, format!("fs_edit: {}", p.to_str().unwrap()));
     }
 
     #[test]
