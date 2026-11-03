@@ -1242,14 +1242,45 @@ impl eframe::App for GuiApp {
                             resolved.push((p.id.clone(), false));
                         }
                     });
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(p.detail.chars().take(600).collect::<String>())
-                                .monospace()
-                                .small(),
-                        )
-                        .wrap(),
-                    );
+                    // fs_write/fs_edit details carry a diff after the first
+                    // line: show it scrollable so allow/deny is an informed click
+                    match p.detail.split_once('\n') {
+                        Some((head, diff)) => {
+                            ui.add(egui::Label::new(egui::RichText::new(head).monospace().small()).wrap());
+                            egui::ScrollArea::vertical()
+                                .max_height(180.0)
+                                .id_salt(("approval_diff", &p.id))
+                                .show(ui, |ui| {
+                                    for line in diff.lines() {
+                                        let color = if line.starts_with("@@") {
+                                            egui::Color32::from_rgb(130, 170, 220)
+                                        } else if line.starts_with('+') {
+                                            egui::Color32::from_rgb(120, 200, 120)
+                                        } else if line.starts_with('-') {
+                                            egui::Color32::from_rgb(230, 120, 120)
+                                        } else {
+                                            ui.visuals().weak_text_color()
+                                        };
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(line).monospace().small().color(color),
+                                            )
+                                            .wrap(),
+                                        );
+                                    }
+                                });
+                        }
+                        None => {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(p.detail.chars().take(600).collect::<String>())
+                                        .monospace()
+                                        .small(),
+                                )
+                                .wrap(),
+                            );
+                        }
+                    }
                 });
             }
             for (id, allow) in resolved {

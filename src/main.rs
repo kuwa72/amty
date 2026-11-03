@@ -10,6 +10,7 @@ mod catalog;
 mod cli;
 mod compact;
 mod config;
+mod diff;
 mod evolve;
 mod gui;
 mod i18n;

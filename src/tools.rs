@@ -255,11 +255,49 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
     ]
 }
 
+/// Previous content for an approval diff. Skipped for files too large to
+/// carry in a prompt (and for anything that isn't readable UTF-8).
+fn prev_content(path: &str) -> Option<String> {
+    const MAX: u64 = 256 * 1024;
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
 /// Short human-readable summary for approval prompts.
 pub fn summarize(name: &str, input: &Value) -> String {
     match name {
         "shell" => format!("shell: {}", input["command"].as_str().unwrap_or("")),
-        "fs_write" | "fs_edit" => format!("{name}: {}", input["path"].as_str().unwrap_or("")),
+        "fs_write" | "fs_edit" => {
+            let path = input["path"].as_str().unwrap_or("");
+            let old = prev_content(path);
+            let new = if name == "fs_write" {
+                Some(input["content"].as_str().unwrap_or("").to_string())
+            } else {
+                let from = input["old"].as_str().unwrap_or("");
+                let to = input["new"].as_str().unwrap_or("");
+                old.as_ref().map(|t| {
+                    if input["replace_all"].as_bool().unwrap_or(false) {
+                        t.replace(from, to)
+                    } else {
+                        t.replacen(from, to, 1)
+                    }
+                })
+            };
+            match new {
+                Some(n) => {
+                    let diff = crate::diff::unified(path, old.as_deref(), &n);
+                    if diff.is_empty() {
+                        format!("{name}: {path}")
+                    } else {
+                        format!("{name}: {path}\n{diff}")
+                    }
+                }
+                None => format!("{name}: {path}"),
+            }
+        }
         "fs_read" | "fs_list" => format!("{name}: {}", input["path"].as_str().unwrap_or("")),
         "web_search" => format!("web_search: {}", input["query"].as_str().unwrap_or("")),
         "web_fetch" => format!("web_fetch: {}", input["url"].as_str().unwrap_or("")),
@@ -1659,6 +1697,19 @@ mod tests {
         assert!(summarize("shell", &json!({"command": "make"})).contains("make"));
         assert!(summarize("fs_write", &json!({"path": "/a"})).contains("/a"));
         assert!(summarize("web_search", &json!({"query": "q"})).contains("q"));
+    }
+
+    #[test]
+    fn summarize_fs_edit_carries_the_diff() {
+        let p = std::env::temp_dir().join(format!("amty-diff-{}.txt", std::process::id()));
+        std::fs::write(&p, "keep\nold line\n").unwrap();
+        let s = summarize(
+            "fs_edit",
+            &json!({"path": p.to_str().unwrap(), "old": "old line", "new": "new line"}),
+        );
+        let _ = std::fs::remove_file(&p);
+        assert!(s.contains("-old line"), "{s}");
+        assert!(s.contains("+new line"), "{s}");
     }
 
     #[test]
