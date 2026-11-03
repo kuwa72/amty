@@ -1545,6 +1545,8 @@ impl eframe::App for GuiApp {
                 let mut action = None;
                 let running_now = *self.running.get(&self.current).unwrap_or(&false);
                 let mut row_rects = std::mem::take(&mut self.row_rects);
+                // (from, to) message range of a run whose files to restore
+                let mut revert: Option<(usize, usize)> = None;
                 if let Some(s) = self.view.clone() {
                     let mut i = 0;
                     while i < s.messages.len() {
@@ -1554,7 +1556,22 @@ impl eframe::App for GuiApp {
                             let live = running_now && i + n == s.messages.len();
                             egui::Frame::new()
                                 .inner_margin(egui::Margin { left: 0, right: 12, top: 0, bottom: 0 })
-                                .show(ui, |ui| render_tool_run(ui, &s.messages, i, n, &lang, live));
+                                .show(ui, |ui| {
+                                    render_tool_run(ui, &s.messages, i, n, &lang, live);
+                                    let journaled =
+                                        s.revert.iter().filter(|e| e.msg >= i && e.msg < i + n).count();
+                                    if journaled > 0
+                                        && !live
+                                        && ui
+                                            .small_button(format!(
+                                                "↩ {} ({journaled})",
+                                                self.tr("revert files")
+                                            ))
+                                            .clicked()
+                                    {
+                                        revert = Some((i, i + n));
+                                    }
+                                });
                             i += n;
                         } else {
                             // keep glyphs clear of the right edge / scroll bar
@@ -1574,6 +1591,16 @@ impl eframe::App for GuiApp {
                     ui.weak(self.tr("send a message to start"));
                 }
                 self.row_rects = row_rects;
+                if let Some((from, to)) = revert {
+                    match self.app.sessions.revert_range(&self.current, from, to) {
+                        Ok(n) => {
+                            let m = format!("{} {n}", self.tr("reverted files:"));
+                            self.refresh_view();
+                            self.toast(m);
+                        }
+                        Err(e) => self.toast(e),
+                    }
+                }
                 if let Some(t) = self.live_text.get(&self.current) {
                     if !t.is_empty() {
                         ui.colored_label(ui.visuals().weak_text_color(), self.tr("assistant"));

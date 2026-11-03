@@ -220,6 +220,8 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
             app.sessions.push_message(sid, ChatMessage { role: Role::Assistant, blocks });
             app.emit(sid, EvKind::Touched);
         }
+        // index of that message: the revert journal keys on it
+        let turn_msg = app.sessions.message_count(sid).saturating_sub(1);
         if tool_uses.is_empty() {
             app.emit(sid, EvKind::Done);
             return Ok(());
@@ -275,6 +277,14 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
                 });
                 app.emit(sid, EvKind::ToolEnd { name, ok: false, preview: "denied".into() });
                 continue;
+            }
+
+            // journal the file before an approved write, so the run can be
+            // reverted from the GUI (first write in a run wins)
+            if matches!(name.as_str(), "fs_write" | "fs_edit") {
+                if let Some(path) = input["path"].as_str() {
+                    app.sessions.journal_write(sid, turn_msg, path);
+                }
             }
 
             // a `shell` call can create files anywhere under its workdir, so
