@@ -69,8 +69,8 @@ pub struct RevertEntry {
     /// Index of the user message that started the run — the unit a revert
     /// covers, so a run whose tool calls sit in prose messages still maps.
     pub run: usize,
-    /// Unix secs when the content was captured; a newer mtime means someone
-    /// else touched the file afterwards.
+    /// Nanoseconds since the epoch when the content was captured (updated on
+    /// each successful write); a newer mtime means someone else touched it.
     #[serde(default)]
     pub ts: u64,
     /// Content before the write; `None` with `ok` means the file is new.
@@ -99,6 +99,30 @@ const MAX_REVERT_BYTES: u64 = 1024 * 1024;
 const MAX_REVERT_TOTAL: usize = 2 * 1024 * 1024;
 /// Cap on entry count: created files and unreadable ones cost no bytes.
 const MAX_REVERT_ENTRIES: usize = 200;
+
+/// The one spelling of a path the journal uses. Relative tool paths are
+/// normal for `fs_write`, so every lookup goes through this.
+fn canon(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    std::fs::canonicalize(p)
+        .unwrap_or_else(|_| {
+            p.parent()
+                .and_then(|d| std::fs::canonicalize(d).ok())
+                .zip(p.file_name())
+                .map(|(d, n)| d.join(n))
+                .unwrap_or_else(|| p.to_path_buf())
+        })
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Nanoseconds since the epoch: file mtimes need finer than a second.
+fn now_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
 
 impl Session {
     fn new(provider: Option<String>, model: Option<String>, seq: u64) -> Self {
@@ -493,14 +517,7 @@ impl SessionStore {
     pub fn journal_write(&self, id: &str, run: usize, path: &str) -> bool {
         // absolute, so a restart with a different cwd can't point the revert
         // at another file
-        let abs = std::path::Path::new(path);
-        let abs = std::fs::canonicalize(abs).unwrap_or_else(|_| {
-            abs.parent()
-                .and_then(|d| std::fs::canonicalize(d).ok())
-                .zip(abs.file_name())
-                .map(|(d, n)| d.join(n))
-                .unwrap_or_else(|| abs.to_path_buf())
-        });
+        let abs = std::path::PathBuf::from(canon(path));
         // read the file outside the store lock: 1 MiB on a slow disk would
         // otherwise stall every other session
         let meta = std::fs::metadata(&abs);
@@ -512,13 +529,13 @@ impl SessionStore {
         let entry = RevertEntry {
             path: abs.to_string_lossy().into_owned(),
             run,
-            ts: now_secs(),
+            ts: now_nanos(),
             ok: !too_big && (prev.is_some() || missing),
             prev,
         };
         let mut map = self.map.write().unwrap();
         let Some(s) = map.get_mut(id) else { return false };
-        if s.revert.iter().any(|e| e.run == run && e.path == path) {
+        if s.revert.iter().any(|e| e.run == run && e.path == entry.path) {
             return false;
         }
         s.revert.push(entry);
@@ -535,17 +552,12 @@ impl SessionStore {
     /// The run's write succeeded: the file is now the run's own output, so
     /// only a change made *after* this moment should block the revert.
     pub fn journal_touch(&self, id: &str, run: usize, path: &str) {
-        let abs = std::path::Path::new(path);
-        let abs = std::fs::canonicalize(abs).unwrap_or_else(|_| abs.to_path_buf());
+        let abs = canon(path);
         let mut map = self.map.write().unwrap();
         let Some(s) = map.get_mut(id) else { return };
-        let touched = match s
-            .revert
-            .iter_mut()
-            .find(|e| e.run == run && e.path == abs.to_string_lossy())
-        {
+        let touched = match s.revert.iter_mut().find(|e| e.run == run && e.path == abs) {
             Some(e) => {
-                e.ts = now_secs();
+                e.ts = now_nanos();
                 true
             }
             None => false,
@@ -557,10 +569,11 @@ impl SessionStore {
 
     /// Forget a journaled write that never happened (the tool failed).
     pub fn journal_drop(&self, id: &str, run: usize, path: &str) {
+        let abs = canon(path);
         let mut map = self.map.write().unwrap();
         let Some(s) = map.get_mut(id) else { return };
         let before = s.revert.len();
-        s.revert.retain(|e| !(e.run == run && e.path == path));
+        s.revert.retain(|e| !(e.run == run && e.path == abs));
         if s.revert.len() != before {
             self.persist(s);
         }
@@ -584,13 +597,20 @@ impl SessionStore {
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .is_some_and(|t| t.as_secs() > *ts);
+                .is_some_and(|t| t.as_nanos() as u64 > *ts);
             if !ok || touched_after {
                 out.skipped += 1;
                 continue;
             }
+            // one bad file must not abort the rest of the run's revert
             match prev {
-                Some(content) => std::fs::write(path, content).map_err(|e| format!("{path}: {e}"))?,
+                Some(content) => match std::fs::write(path, content) {
+                    Ok(()) => {}
+                    Err(_) => {
+                        out.skipped += 1;
+                        continue;
+                    }
+                },
                 None => match std::fs::remove_file(path) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -831,8 +851,10 @@ mod tests {
         std::fs::write(&edited, "before\n").unwrap();
         store.journal_write(&id, 1, edited.to_str().unwrap());
         std::fs::write(&edited, "after\n").unwrap();
+        store.journal_touch(&id, 1, edited.to_str().unwrap());
         store.journal_write(&id, 1, created.to_str().unwrap());
         std::fs::write(&created, "made\n").unwrap();
+        store.journal_touch(&id, 1, created.to_str().unwrap());
 
         let out = store.revert_run(&id, 1).unwrap();
         assert_eq!((out.restored, out.skipped), (2, 0));
@@ -867,8 +889,10 @@ mod tests {
         std::fs::write(&p, "one\n").unwrap();
         store.journal_write(&id, 1, p.to_str().unwrap());
         std::fs::write(&p, "two\n").unwrap();
+        store.journal_touch(&id, 1, p.to_str().unwrap());
         store.journal_write(&id, 1, p.to_str().unwrap());
         std::fs::write(&p, "three\n").unwrap();
+        store.journal_touch(&id, 1, p.to_str().unwrap());
 
         store.revert_run(&id, 1).unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "one\n");
@@ -896,6 +920,41 @@ mod tests {
     }
 
     #[test]
+    fn two_spellings_of_one_path_share_one_entry() {
+        let (store, dir) = temp_store();
+        let id = store.create(None, None);
+        store.push_message(&id, ChatMessage::user("hi"));
+        let p = dir.join("spelled.txt");
+        std::fs::write(&p, "v1\n").unwrap();
+        assert!(store.journal_write(&id, 1, p.to_str().unwrap()));
+        std::fs::write(&p, "v2\n").unwrap();
+        // relative/dotted spellings are normal for tool paths
+        let dotted = dir.join(".").join("spelled.txt");
+        assert!(!store.journal_write(&id, 1, dotted.to_str().unwrap()));
+        store.journal_touch(&id, 1, dotted.to_str().unwrap());
+        assert_eq!(store.get(&id).unwrap().revert.len(), 1);
+        assert_eq!(store.revert_run(&id, 1).unwrap().restored, 1);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "v1\n");
+    }
+
+    #[test]
+    fn a_file_created_then_written_again_is_still_deleted() {
+        let (store, dir) = temp_store();
+        let id = store.create(None, None);
+        store.push_message(&id, ChatMessage::user("hi"));
+        let p = dir.join("created-twice.txt");
+        assert!(store.journal_write(&id, 1, p.to_str().unwrap()));
+        std::fs::write(&p, "a\n").unwrap();
+        store.journal_touch(&id, 1, p.to_str().unwrap());
+        assert!(!store.journal_write(&id, 1, p.to_str().unwrap()));
+        std::fs::write(&p, "b\n").unwrap();
+        store.journal_touch(&id, 1, p.to_str().unwrap());
+
+        assert_eq!(store.revert_run(&id, 1).unwrap().restored, 1);
+        assert!(!p.exists());
+    }
+
+    #[test]
     fn the_runs_own_later_write_does_not_block_the_revert() {
         let (store, dir) = temp_store();
         let id = store.create(None, None);
@@ -907,7 +966,7 @@ mod tests {
         std::fs::write(&p, "two\n").unwrap();
         // the capture is older than the run's own write: without the touch
         // this would look like someone else's edit
-        store.map.write().unwrap().get_mut(&id).unwrap().revert[0].ts -= 1;
+        store.map.write().unwrap().get_mut(&id).unwrap().revert[0].ts -= 1_000_000_000;
         store.journal_touch(&id, 1, p.to_str().unwrap());
 
         let out = store.revert_run(&id, 1).unwrap();
@@ -928,7 +987,7 @@ mod tests {
         std::fs::write(&p, "user\n").unwrap();
         {
             let mut map = store.map.write().unwrap();
-            map.get_mut(&id).unwrap().revert[0].ts -= 1;
+            map.get_mut(&id).unwrap().revert[0].ts -= 1_000_000_000;
         }
 
         let out = store.revert_run(&id, 1).unwrap();

@@ -1570,7 +1570,7 @@ impl eframe::App for GuiApp {
                                     render_tool_run(ui, &s.messages, i, n, &lang, live);
                                     if let Some(r) = run {
                                         if journaled > 0
-                                            && !live
+                                            && !running_now
                                             && shown.insert(r)
                                             && ui
                                                 .small_button(format!(
