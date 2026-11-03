@@ -296,7 +296,7 @@ pub fn summarize(name: &str, input: &Value) -> String {
                 old.as_ref().and_then(|t| {
                     // the tool itself will reject these, so show no diff
                     let n = t.matches(from).count();
-                    if from.is_empty() || (n > 1 && !all) {
+                    if from.is_empty() || n == 0 || (n > 1 && !all) {
                         return None;
                     }
                     Some(if all { t.replace(from, to) } else { t.replacen(from, to, 1) })
@@ -307,10 +307,9 @@ pub fn summarize(name: &str, input: &Value) -> String {
                     let diff = crate::diff::unified(path, old.as_deref(), &n);
                     if !diff.is_empty() {
                         format!("{name}: {path}\n{diff}")
-                    } else if old
-                        .as_deref()
-                        .is_some_and(|o| o.trim_end_matches('\n') == n.trim_end_matches('\n'))
-                    {
+                    } else if old.as_deref().is_some_and(|o| {
+                        o != n.as_str() && o.trim_end_matches('\n') == n.trim_end_matches('\n')
+                    }) {
                         // `lines()` ignores a trailing newline: the one change
                         // a line diff cannot show, so say it outright
                         format!("{name}: {path}\n(only the trailing newline differs)")
@@ -1781,8 +1780,17 @@ mod tests {
         let p = std::env::temp_dir().join(format!("amty-diff-n-{}.txt", uuid::Uuid::new_v4()));
         std::fs::write(&p, "a\n").unwrap();
         let s = summarize("fs_write", &json!({"path": p.to_str().unwrap(), "content": "a"}));
-        let _ = std::fs::remove_file(&p);
         assert!(s.contains("trailing newline"), "{s}");
+
+        // same bytes, and an edit whose `old` is absent: nothing to say
+        let s = summarize("fs_write", &json!({"path": p.to_str().unwrap(), "content": "a\n"}));
+        assert_eq!(s, format!("fs_write: {}", p.to_str().unwrap()));
+        let s = summarize(
+            "fs_edit",
+            &json!({"path": p.to_str().unwrap(), "old": "absent", "new": "x"}),
+        );
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(s, format!("fs_edit: {}", p.to_str().unwrap()));
     }
 
     #[test]

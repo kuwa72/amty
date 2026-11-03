@@ -47,11 +47,33 @@ pub fn unified(path: &str, old: Option<&str>, new: &str) -> String {
     for l in &old[start..pre] {
         out.push(format!(" {l}"));
     }
-    for l in &old[pre..old.len() - suf] {
-        out.push(format!("-{l}"));
-    }
-    for l in &new[pre..new.len() - suf] {
-        out.push(format!("+{l}"));
+    let removed = &old[pre..old.len() - suf];
+    let added = &new[pre..new.len() - suf];
+    let tail_ctx = new_end - (new.len() - suf);
+    let room = MAX_LINES.saturating_sub(out.len() + tail_ctx);
+    if removed.len() + added.len() <= room {
+        for l in removed {
+            out.push(format!("-{l}"));
+        }
+        for l in added {
+            out.push(format!("+{l}"));
+        }
+    } else {
+        // split the budget: a rewrite must not show only its removals
+        // (2 lines go to the two count markers)
+        let each = room.saturating_sub(2) / 2;
+        for l in &removed[..each.min(removed.len())] {
+            out.push(format!("-{l}"));
+        }
+        if removed.len() > each {
+            out.push(format!("… ({} more lines removed)", removed.len() - each));
+        }
+        for l in &added[..each.min(added.len())] {
+            out.push(format!("+{l}"));
+        }
+        if added.len() > each {
+            out.push(format!("… ({} more lines added)", added.len() - each));
+        }
     }
     for l in &new[new.len() - suf..new_end] {
         out.push(format!(" {l}"));
@@ -100,18 +122,21 @@ mod tests {
     }
 
     #[test]
-    fn huge_change_is_truncated() {
+    fn huge_change_shows_both_sides() {
         let old: String = (0..2000).map(|i| format!("old {i}\n")).collect();
         let new: String = (0..2000).map(|i| format!("new {i}\n")).collect();
         let d = unified("/x", Some(&old), &new);
-        let lines: Vec<&str> = d.lines().collect();
-        assert_eq!(lines.len(), 201, "200 lines + marker");
-        assert_eq!(*lines.last().unwrap(), "… (truncated)");
+        // a capped rewrite must not look like a deletion-only diff
+        assert!(d.contains("-old 0"), "{d}");
+        assert!(d.contains("+new 0"), "{d}");
+        assert!(d.contains("more lines removed") && d.contains("more lines added"), "{d}");
+        assert!(d.lines().count() <= 202, "{} lines", d.lines().count());
     }
 
     #[test]
     fn a_single_huge_line_is_cut_by_bytes() {
         let d = unified("/x", None, &"y".repeat(20_000));
+        assert!(d.starts_with("--- /x\n+++ /x\n"), "headers kept");
         assert!(d.len() <= 8192, "{} bytes", d.len());
         assert!(d.ends_with("… (truncated)"), "{}", d.len());
     }
