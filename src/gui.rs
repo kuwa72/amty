@@ -1242,14 +1242,52 @@ impl eframe::App for GuiApp {
                             resolved.push((p.id.clone(), false));
                         }
                     });
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(p.detail.chars().take(600).collect::<String>())
-                                .monospace()
-                                .small(),
-                        )
-                        .wrap(),
-                    );
+                    // fs_write/fs_edit details carry a diff after the first
+                    // line: show it scrollable so allow/deny is an informed
+                    // click. Other tools (multi-line shell commands) keep the
+                    // plain label below.
+                    let diff = (p.tool == "fs_write" || p.tool == "fs_edit")
+                        .then(|| p.detail.split_once('\n'))
+                        .flatten()
+                        .filter(|(_, d)| d.starts_with("--- "));
+                    match diff {
+                        Some((head, diff)) => {
+                            ui.add(egui::Label::new(egui::RichText::new(head).monospace().small()).wrap());
+                            egui::ScrollArea::vertical()
+                                .max_height(180.0)
+                                .id_salt(("approval_diff", &p.id))
+                                .show(ui, |ui| {
+                                    // 201 = the builder's 200 lines + its marker
+                                    for line in diff.lines().take(201) {
+                                        let color = if line.starts_with("--- ") || line.starts_with("+++ ") || line.starts_with("@@") {
+                                            egui::Color32::from_rgb(130, 170, 220)
+                                        } else if line.starts_with('+') {
+                                            egui::Color32::from_rgb(120, 200, 120)
+                                        } else if line.starts_with('-') {
+                                            egui::Color32::from_rgb(230, 120, 120)
+                                        } else {
+                                            ui.visuals().weak_text_color()
+                                        };
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(line).monospace().small().color(color),
+                                            )
+                                            .wrap(),
+                                        );
+                                    }
+                                });
+                        }
+                        None => {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(p.detail.chars().take(600).collect::<String>())
+                                        .monospace()
+                                        .small(),
+                                )
+                                .wrap(),
+                            );
+                        }
+                    }
                 });
             }
             for (id, allow) in resolved {

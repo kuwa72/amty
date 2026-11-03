@@ -236,7 +236,6 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
                 break;
             }
             let Block::ToolUse { id, name, input } = b.clone() else { continue };
-            let detail = tools::summarize(&name, &input);
 
             // Read-only calls are stable within a session (a file does not
             // change behind our back mid-loop), so a repeated identical call
@@ -249,7 +248,7 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
                 .as_ref()
                 .and_then(|k| app.tool_cache.lock().unwrap().get(k).cloned())
             {
-                app.emit(sid, EvKind::ToolStart { name: name.clone(), detail: detail.clone() });
+                app.emit(sid, EvKind::ToolStart { name: name.clone(), detail: tools::guard_key(&name, &input) });
                 app.emit(sid, EvKind::ToolEnd {
                     name: name.clone(),
                     ok: !is_error,
@@ -263,9 +262,9 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
                 continue;
             }
 
-            app.emit(sid, EvKind::ToolStart { name: name.clone(), detail: detail.clone() });
+            app.emit(sid, EvKind::ToolStart { name: name.clone(), detail: tools::guard_key(&name, &input) });
 
-            if let Err(e) = approval_gate(app, sid, &name, &input, &detail, cancelled).await {
+            if let Err(e) = approval_gate(app, sid, &name, &input, cancelled).await {
                 if e == "denied by user" {
                     crate::evolve::record_denied(app, &name);
                 }
@@ -318,7 +317,7 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
                 Err(e) => {
                     app.emit(sid, EvKind::ToolEnd { name: name.clone(), ok: false, preview: preview(&e) });
                     if app.cfg.read().unwrap().te.loopguard {
-                        *failures.entry(detail.clone()).or_insert(0) += 1;
+                        *failures.entry(tools::guard_key(&name, &input)).or_insert(0) += 1;
                     }
                     // do not memoize failures: the retry may legitimately work
                     // (a transient timeout, a file that now exists)
@@ -549,7 +548,6 @@ async fn approval_gate(
     sid: &str,
     name: &str,
     input: &serde_json::Value,
-    detail: &str,
     cancelled: impl Fn() -> bool,
 ) -> Result<(), String> {
     let needs = {
@@ -563,7 +561,10 @@ async fn approval_gate(
     if !needs || crate::evolve::auto_approved(app, name, input) {
         return Ok(());
     }
-    let (id, rx) = app.approvals.request(sid, name, detail);
+    // built here, not per call: the diff costs a file read and only the
+    // prompt needs it
+    let detail = tools::summarize(name, input);
+    let (id, rx) = app.approvals.request(sid, name, &detail);
     app.emit(sid, EvKind::ApprovalNeeded { approval_id: id.clone(), tool: name.into(), detail: detail.into() });
     let mut rx = rx;
     let allowed = loop {
