@@ -351,6 +351,9 @@ pub struct GuiApp {
     /// last error per session, shown in the header until cleared
     last_error: HashMap<String, String>,
     pending: Vec<PendingView>,
+    /// window focus from the last frame: notifications only go out while the
+    /// user is looking elsewhere
+    window_focused: bool,
     /// cached view of the current session (refreshed on Touched)
     view: Option<Session>,
     view_dirty: bool,
@@ -432,6 +435,7 @@ impl GuiApp {
             running: HashMap::new(),
             last_error: HashMap::new(),
             pending: vec![],
+            window_focused: true,
             view: None,
             view_dirty: true,
             toast: None,
@@ -494,6 +498,7 @@ impl GuiApp {
                 self.live_tool.remove(&ev.session);
             }
             EvKind::ApprovalNeeded { approval_id, tool, detail } => {
+                self.notify_if_away("approval needed", &tool);
                 self.pending.push(PendingView { id: approval_id, tool, detail });
             }
             EvKind::ApprovalResolved { approval_id, .. } => {
@@ -503,6 +508,7 @@ impl GuiApp {
                 self.running.insert(ev.session.clone(), running);
             }
             EvKind::Error { message } => {
+                self.notify_if_away("run failed", &message);
                 self.last_error.insert(ev.session.clone(), message);
                 self.live_text.remove(&ev.session);
                 self.live_tool.remove(&ev.session);
@@ -524,6 +530,7 @@ impl GuiApp {
                 // store now has everything streamed so far
                 self.live_text.remove(&ev.session);
                 if matches!(ev.kind, EvKind::Done) {
+                    self.notify_if_away("run finished", "");
                     self.live_tool.remove(&ev.session);
                 }
                 // Touched with no session = global change (config/mcp/notes)
@@ -553,6 +560,14 @@ impl GuiApp {
             }
             self.view_dirty = false;
             self.remember_last_session();
+        }
+    }
+
+    /// Desktop notification, but only when it would not be redundant.
+    fn notify_if_away(&self, title: &'static str, body: &str) {
+        let enabled = self.app.cfg.read().unwrap().notify.enabled;
+        if crate::notify::should_notify(enabled, self.window_focused) {
+            crate::notify::send(&format!("amty — {}", self.tr(title)), body);
         }
     }
 
@@ -662,6 +677,7 @@ impl GuiApp {
 
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.window_focused = ui.ctx().input(|i| i.focused);
         let ctx = ui.ctx().clone();
         #[cfg(target_os = "windows")]
         rescue_offscreen_window(&ctx);

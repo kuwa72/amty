@@ -18,6 +18,7 @@ mod jobs;
 mod mcp;
 mod mcp_serve;
 mod notes;
+mod notify;
 mod oauth;
 mod provider;
 mod session;

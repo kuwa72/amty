@@ -148,6 +148,21 @@ fn default_true() -> bool {
     true
 }
 
+/// Desktop notifications (`notify.*` keys), on by default.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotifyConf {
+    /// Notify when a run ends or an approval waits while the window is in
+    /// the background.
+    pub enabled: bool,
+}
+
+impl Default for NotifyConf {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// Compatible with Claude Desktop's `mcpServers` entries (stdio transport).
 /// Hosted/streamable-HTTP servers set `url` (and optionally OAuth fields)
 /// and leave `command` empty.
@@ -278,6 +293,8 @@ pub struct Config {
     pub notes: NotesConf,
     /// TokenEconomizer: repo facts, tool pruning, loop guard.
     pub te: TeConf,
+    /// Desktop notifications.
+    pub notify: NotifyConf,
 }
 
 impl Default for Config {
@@ -341,6 +358,7 @@ impl Default for Config {
             evolve: EvolveConf::default(),
             notes: NotesConf::default(),
             te: TeConf::default(),
+            notify: NotifyConf::default(),
         }
     }
 }
@@ -641,6 +659,14 @@ impl Config {
                 *f = v;
                 Ok(format!("{key} = {v}"))
             }
+            _ if key.starts_with("notify.") => {
+                let field = &key["notify.".len()..];
+                if field != "enabled" {
+                    bail!("unknown notify field '{field}'");
+                }
+                self.notify.enabled = matches!(value, "true" | "1" | "on" | "yes");
+                Ok(format!("{key} = {}", self.notify.enabled))
+            }
             _ if key.starts_with("te.") || key.starts_with("+te.") => {
                 let append = key.starts_with('+');
                 let field = key.trim_start_matches('+').trim_start_matches("te.");
@@ -790,6 +816,7 @@ impl Config {
                 };
                 Ok(v.to_string())
             }
+            "notify" | "notify.enabled" => Ok(self.notify.enabled.to_string()),
             "te" => Ok(format!(
                 "enabled={} prune={} loopguard={} repo={} keep=[{}]",
                 self.te.enabled,
@@ -912,6 +939,15 @@ mod tests {
         // and it survives a toml round-trip
         let back: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
         assert!(!back.evolve.reflect);
+    }
+
+    #[test]
+    fn apply_set_notify() {
+        let mut cfg = Config::default();
+        assert!(cfg.notify.enabled);
+        cfg.apply_set("notify.enabled", "false").unwrap();
+        assert!(!cfg.notify.enabled);
+        assert_eq!(cfg.get("notify.enabled").unwrap(), "false");
     }
 
     #[test]
