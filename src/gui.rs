@@ -1258,7 +1258,7 @@ impl eframe::App for GuiApp {
                                 .id_salt(("approval_diff", &p.id))
                                 .show(ui, |ui| {
                                     for line in diff.lines().take(200) {
-                                        let color = if line.starts_with("@@") {
+                                        let color = if line.starts_with("--- ") || line.starts_with("+++ ") || line.starts_with("@@") {
                                             egui::Color32::from_rgb(130, 170, 220)
                                         } else if line.starts_with('+') {
                                             egui::Color32::from_rgb(120, 200, 120)

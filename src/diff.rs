@@ -60,7 +60,7 @@ pub fn unified(path: &str, old: Option<&str>, new: &str) -> String {
     let mut text = String::new();
     for (i, line) in out.iter().enumerate() {
         if i == MAX_LINES || text.len() + line.len() + 1 > MAX_BYTES {
-            text.push_str("\n… (truncated)");
+            text.push_str("… (truncated)");
             break;
         }
         text.push_str(line);

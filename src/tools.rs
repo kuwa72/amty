@@ -276,7 +276,8 @@ pub fn guard_key(name: &str, input: &Value) -> String {
     }
 }
 
-/// Short human-readable summary for approval prompts.
+/// Summary for approval prompts; file writes carry a diff after the first
+/// line so the user can see the change before allowing it.
 pub fn summarize(name: &str, input: &Value) -> String {
     match name {
         "shell" => format!("shell: {}", input["command"].as_str().unwrap_or("")),
@@ -284,16 +285,21 @@ pub fn summarize(name: &str, input: &Value) -> String {
             let path = input["path"].as_str().unwrap_or("");
             let old = prev_content(path);
             let new = if name == "fs_write" {
-                Some(input["content"].as_str().unwrap_or("").to_string())
+                // `old == None` is either a new file or one too large/binary
+                // to diff; only the former is honestly "all added lines"
+                (old.is_some() || !Path::new(path).exists())
+                    .then(|| input["content"].as_str().unwrap_or("").to_string())
             } else {
                 let from = input["old"].as_str().unwrap_or("");
                 let to = input["new"].as_str().unwrap_or("");
-                old.as_ref().map(|t| {
-                    if input["replace_all"].as_bool().unwrap_or(false) {
-                        t.replace(from, to)
-                    } else {
-                        t.replacen(from, to, 1)
+                let all = input["replace_all"].as_bool().unwrap_or(false);
+                old.as_ref().and_then(|t| {
+                    // the tool itself will reject these, so show no diff
+                    let n = t.matches(from).count();
+                    if from.is_empty() || (n > 1 && !all) {
+                        return None;
                     }
+                    Some(if all { t.replace(from, to) } else { t.replacen(from, to, 1) })
                 })
             };
             match new {
@@ -1726,6 +1732,39 @@ mod tests {
             &json!({"path": p.to_str().unwrap(), "old": "old line", "new": "new line"}),
         );
         assert_eq!(k, format!("fs_edit: {}", p.to_str().unwrap()));
+    }
+
+    #[test]
+    fn summarize_fs_write_created_overwrite_and_undiffable() {
+        let dir = std::env::temp_dir().join(format!("amty-diff-w-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("n.txt");
+        let s = summarize("fs_write", &json!({"path": p.to_str().unwrap(), "content": "a\nb\n"}));
+        assert!(s.contains("@@ -0,0") && s.contains("+a"), "{s}");
+
+        std::fs::write(&p, "a\nb\n").unwrap();
+        let s = summarize("fs_write", &json!({"path": p.to_str().unwrap(), "content": "a\nB\n"}));
+        assert!(s.contains("-b") && s.contains("+B"), "{s}");
+
+        // existing but too large to diff: must not read as a new file
+        let big = dir.join("big.txt");
+        std::fs::write(&big, "x".repeat(300 * 1024)).unwrap();
+        let s = summarize("fs_write", &json!({"path": big.to_str().unwrap(), "content": "y"}));
+        assert_eq!(s, format!("fs_write: {}", big.to_str().unwrap()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn summarize_fs_edit_skips_a_diff_the_tool_would_reject() {
+        let p = std::env::temp_dir().join(format!("amty-diff-m-{}.txt", std::process::id()));
+        std::fs::write(&p, "x x\n").unwrap();
+        let s = summarize(
+            "fs_edit",
+            &json!({"path": p.to_str().unwrap(), "old": "x", "new": "y"}),
+        );
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(s, format!("fs_edit: {}", p.to_str().unwrap()));
     }
 
     #[test]
