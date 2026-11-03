@@ -25,20 +25,20 @@ pub fn should_notify(enabled: bool, focused: bool) -> bool {
     enabled && !focused
 }
 
-/// argv of the notifier, or `None` when the platform has no known one.
-pub fn argv_for(os: Os, title: &str, body: &str) -> Option<Vec<String>> {
+/// argv of the notifier for `os`.
+pub fn argv_for(os: Os, title: &str, body: &str) -> Vec<String> {
     match os {
-        Os::Linux => Some(vec![
+        Os::Linux => vec![
             "notify-send".into(),
             "-a".into(),
             "amty".into(),
             title.into(),
             body.into(),
-        ]),
+        ],
         Os::Mac => {
             // AppleScript strings need their own quoting
             let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-            Some(vec![
+            vec![
                 "osascript".into(),
                 "-e".into(),
                 format!(
@@ -46,9 +46,9 @@ pub fn argv_for(os: Os, title: &str, body: &str) -> Option<Vec<String>> {
                     esc(body),
                     esc(title)
                 ),
-            ])
+            ]
         }
-        Os::Windows => Some(vec![
+        Os::Windows => vec![
             "powershell".into(),
             "-NoProfile".into(),
             "-Command".into(),
@@ -63,7 +63,7 @@ pub fn argv_for(os: Os, title: &str, body: &str) -> Option<Vec<String>> {
                 title = ps_escape(title),
                 body = ps_escape(body),
             ),
-        ]),
+        ],
     }
 }
 
@@ -74,12 +74,18 @@ fn ps_escape(s: &str) -> String {
 
 /// Fire and forget: a missing notifier or a failure never blocks the run.
 pub fn send(title: &str, body: &str) {
-    let Some(argv) = argv_for(current(), title, body) else { return };
-    let _ = std::process::Command::new(&argv[0])
+    let argv = argv_for(current(), title, body);
+    let child = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
+    // reap it: a GUI that lives for days would otherwise collect zombies
+    if let Ok(mut child) = child {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 #[cfg(test)]
@@ -95,20 +101,20 @@ mod tests {
 
     #[test]
     fn linux_uses_notify_send() {
-        let a = argv_for(Os::Linux, "amty", "done").unwrap();
+        let a = argv_for(Os::Linux, "amty", "done");
         assert_eq!(a, ["notify-send", "-a", "amty", "amty", "done"]);
     }
 
     #[test]
     fn mac_uses_osascript_and_escapes_quotes() {
-        let a = argv_for(Os::Mac, "amty", "said \"hi\"").unwrap();
+        let a = argv_for(Os::Mac, "amty", "said \"hi\"");
         assert_eq!(a[0], "osascript");
         assert!(a[2].contains("display notification \"said \\\"hi\\\"\""), "{:?}", a);
     }
 
     #[test]
     fn windows_uses_a_powershell_toast_and_escapes_quotes() {
-        let a = argv_for(Os::Windows, "amty", "it's done").unwrap();
+        let a = argv_for(Os::Windows, "amty", "it's done");
         assert_eq!(a[0], "powershell");
         assert!(a[3].contains("ToastNotificationManager"), "{:?}", a);
         assert!(a[3].contains("it''s done"), "{:?}", a);

@@ -508,7 +508,9 @@ impl GuiApp {
                 self.running.insert(ev.session.clone(), running);
             }
             EvKind::Error { message } => {
-                self.notify_if_away("run failed", &message);
+                // a stop is not a failure
+                let title = if message == "cancelled" { "run cancelled" } else { "run failed" };
+                self.notify_if_away(title, &message);
                 self.last_error.insert(ev.session.clone(), message);
                 self.live_text.remove(&ev.session);
                 self.live_tool.remove(&ev.session);
@@ -678,6 +680,9 @@ impl GuiApp {
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.window_focused = ui.ctx().input(|i| i.focused);
+        // keep draining the event bus while the window is in the background:
+        // a run started by a job, the CLI or MCP must still notify
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
         let ctx = ui.ctx().clone();
         #[cfg(target_os = "windows")]
         rescue_offscreen_window(&ctx);
