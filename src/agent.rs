@@ -4,7 +4,7 @@ use crate::provider;
 use crate::tools;
 use crate::types::*;
 use anyhow::{anyhow, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -79,6 +79,10 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
     app.mcp.ensure_connected().await;
 
     let mut turn = 0usize;
+    // TokenEconomizer loop guard: the same failing call, counted by its
+    // human-readable detail (identical calls give identical details).
+    let mut failures: HashMap<String, u32> = HashMap::new();
+    let mut nudged: HashSet<String> = HashSet::new();
     let stop_msg = loop {
         // re-read each turn: toggling bypass mid-run lifts/reinstates the cap
         let limit = turn_limit(app.cfg.read().unwrap().approval == ApprovalMode::Auto);
@@ -106,10 +110,11 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
             // skills index + memory are volatile (re-scanned each turn): send
             // them as a tail so the static system_prompt stays cache-stable
             let tail = format!(
-                "{}{}{}",
+                "{}{}{}{}",
                 crate::config::skills_prompt(),
                 crate::evolve::memory_prompt(),
                 crate::notes::prompt(&cfg),
+                crate::te::prompt(&cfg, &crate::te::current(&cfg, app.te_dir.lock().unwrap().clone())),
             );
             (name, conf, model, cfg.system_prompt.clone(), tail, cfg.evolve.self_modify)
         };
@@ -122,6 +127,15 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
             specs.retain(|s| s.name != "self_update");
         }
         specs.extend(app.mcp.specs());
+        // TokenEconomizer tool pruning: never-called MCP tools stop riding
+        // every request (te.keep / `amty te untool` brings one back)
+        let pruned = crate::te::pruned(&app.cfg.read().unwrap(), &app.stats.lock().unwrap());
+        if !pruned.is_empty() {
+            specs.retain(|s| !pruned.contains(&s.name));
+        }
+        if turn == 1 {
+            crate::evolve::record_offered(app, &specs);
+        }
         let max_tokens = prov_conf.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
         let prov = provider::build(&prov_conf);
@@ -267,7 +281,11 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
             // a `shell` call can create files anywhere under its workdir, so
             // snapshot the tree first; the post-call diff is what it created
             let before = if name == "shell" {
-                shell_workdir(&input).map(|wd| { let s = snapshot_tree(&wd); (wd, s) })
+                shell_workdir(&input).map(|wd| {
+                    *app.te_dir.lock().unwrap() = Some(wd.clone());
+                    let s = snapshot_tree(&wd);
+                    (wd, s)
+                })
             } else {
                 None
             };
@@ -299,6 +317,9 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
                 }
                 Err(e) => {
                     app.emit(sid, EvKind::ToolEnd { name: name.clone(), ok: false, preview: preview(&e) });
+                    if app.cfg.read().unwrap().te.loopguard {
+                        *failures.entry(detail.clone()).or_insert(0) += 1;
+                    }
                     // do not memoize failures: the retry may legitimately work
                     // (a transient timeout, a file that now exists)
                     results.push(Block::ToolResult { tool_use_id: id, content: e, is_error: true });
@@ -322,6 +343,26 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
         }
         app.sessions.push_message(sid, ChatMessage::tool_results(results));
         app.emit(sid, EvKind::Touched);
+        // loop guard: retrying a call that already failed the same way is the
+        // cheapest waste to cut — nudge once, stop on the fourth failure
+        if app.cfg.read().unwrap().te.loopguard {
+            if let Some((detail, n)) = failures.iter().map(|(k, n)| (k.clone(), *n)).max_by_key(|(_, n)| *n) {
+                match crate::te::repeat_action(n) {
+                    Some(crate::te::Repeat::Stop) => {
+                        break format!("loop guard: '{detail}' failed {n}× unchanged")
+                    }
+                    Some(crate::te::Repeat::Nudge) if nudged.insert(detail.clone()) => {
+                        app.sessions.push_message(sid, ChatMessage::user(format!(
+                            "[amty: TokenEconomizer] '{detail}' has now failed twice unchanged. \
+                             Do not retry it as-is — change the mechanism (different command, flag \
+                             or path), get the fact you are missing, or say what blocks it."
+                        )));
+                        app.emit(sid, EvKind::Touched);
+                    }
+                    _ => {}
+                }
+            }
+        }
         if interrupted {
             mark_end(app, sid, "cancelled");
             app.emit(sid, EvKind::Error { message: "cancelled".into() });

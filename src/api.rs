@@ -50,6 +50,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/evolve/reflect", post(evolve_reflect))
         .route("/v1/evolve/forget", post(evolve_forget))
         .route("/v1/evolve/cancel", post(evolve_cancel))
+        .route("/v1/te", get(te_status))
+        .route("/v1/te/untool", post(te_untool))
         .layer(middleware::from_fn_with_state(app.clone(), auth))
         .with_state(app)
 }
@@ -415,6 +417,26 @@ async fn evolve_cancel(State(app): State<Arc<App>>) -> Json<Value> {
     Json(json!({
         "cancelled": crate::evolve::cancel_restart(&app).map(|p| p.display().to_string())
     }))
+}
+
+/// `GET /v1/te` — TokenEconomizer state: toggles, repo facts, tool table.
+async fn te_status(State(app): State<Arc<App>>) -> Json<Value> {
+    Json(crate::te::status_json(&app))
+}
+
+#[derive(Deserialize)]
+struct UntoolBody {
+    name: String,
+}
+
+/// `POST /v1/te/untool` — bring a pruned tool back into the request.
+async fn te_untool(
+    State(app): State<Arc<App>>,
+    Json(b): Json<UntoolBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    crate::te::untool(&app, &b.name)
+        .map(|msg| Json(json!({"ok": msg})))
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))
 }
 
 async fn skill_remove(

@@ -34,6 +34,18 @@ App core (src/app.rs)           -- config, sessions, approvals, event broadcast
   |                               minus .md. note_* tools / /v1/notes API /
   |                               `amty notes` CLI / amty_*_notes MCP tools /
   |                               GUI right panel + floating editor window
+  |- token economizer (src/te.rs) -- three per-turn cost levers (port of
+  |                               microsoft/TokenEconomizer): micro-skills
+  |                               (repo facts in the notes store as
+  |                               `tokeneconomizer/<slug>`, injected into the
+  |                               system tail at support >= 3), tool pruning
+  |                               (MCP tools offered 20x with zero calls are
+  |                               dropped from the request; `amty te untool`
+  |                               or `te.keep` restores one), loop guard (the
+  |                               same call failing twice gets one nudge, a
+  |                               fourth failure stops the turn). Repo key:
+  |                               `te.repo`, else the last shell workdir,
+  |                               else cwd (nearest `.git` ancestor).
   |- OAuth client (src/oauth.rs) -- auth-code + PKCE + localhost:8571 callback,
   |                               RFC 9728/8414 discovery, dynamic client
   |                               registration, tokens in $XDG_DATA_HOME/amty/oauth/
@@ -104,6 +116,8 @@ cargo build --release
 ./target/debug/amty evolve            # self-evolution state (memory/stats/restart)
 ./target/debug/amty evolve <session>  # force a reflection pass on a session
 ./target/debug/amty evolve cancel     # drop a scheduled self-swap/restart
+./target/debug/amty te                # token economizer state (repo facts, pruned tools)
+./target/debug/amty te untool mcp__srv__tool   # bring a pruned tool back (te.keep)
 
 # Windows native binary (cross-compiled from WSL; needs mingw-w64 incl. windres):
 ./scripts/build-windows.sh          # build + deploy to %USERPROFILE%\.local\bin\amty.exe
@@ -148,7 +162,10 @@ amty continuously improves itself; toggles live under `evolve.*` config keys
   — shared with auto-compaction) reads the transcript tail + current MEMORY.md +
   tool stats and emits fenced blocks: ` ```memory ` (full MEMORY.md rewrite,
   atomic via tmp+rename), ` ```skill <name> ` (complete SKILL.md into the skills
-  dir, ≤3/pass, `evolve.skills` gate), ` ```config ` (whitelisted keys only:
+  dir, ≤3/pass, `evolve.skills` gate), ` ```fact ` (one repo fact per line —
+  merged into the notes store as `tokeneconomizer/<slug>`, an existing fact
+  repeated verbatim gains a support point, a new one starts at 0), ` ```config `
+  (whitelisted keys only:
   `+allow_commands`, `+allow_paths`, `max_tokens`, `search.*` — never provider/
   model/system_prompt). Results surface as `EvKind::Evolved` → GUI toast.
   Cost control: ≤20 reflections/rolling day (`reflection_times`) + a 10 min
@@ -220,6 +237,29 @@ amty continuously improves itself; toggles live under `evolve.*` config keys
   itself and install a prebuilt artifact, but cannot self-*rebuild*;
   `./scripts/build-windows.sh` remains the build-and-deploy script for that
   machine (it still requires amty to be stopped, `--force` to kill it).
+
+## TokenEconomizer (src/te.rs)
+
+Cost is paid every turn (system prompt + tool schemas + history), so three
+levers, all on by default and individually toggleable:
+
+- `te.enabled` — repo facts from `notes/tokeneconomizer/<slug>.md`
+  (`- support: N | fact` lines; `retired`/0 is not injected) are appended to
+  the system tail. Facts arrive from the reflection pass (```fact blocks) or
+  `note_write`; only `support >= 3` is trusted, so a one-off guess never
+  becomes standing advice.
+- `te.prune` — MCP tools with `offered >= 20` and `calls == 0` in
+  `evolve::Stats` are left out of the request. Builtins are never pruned;
+  `te.keep` (or `amty te untool <name>`, which also zeroes `offered`) brings
+  one back. `offered` is counted once per run.
+- `te.loopguard` — the same call (by `tools::summarize` detail) failing twice
+  gets one injected nudge, a fourth identical failure ends the run with
+  `loop guard: … failed N× unchanged`.
+
+Repo key = `te.repo` → last `shell` workdir seen by the process (`App::te_dir`)
+→ process cwd, then the nearest `.git` ancestor. On the Windows build, WSL UNC
+workdirs are rejected upstream (`shell_workdir`), so it usually falls back to
+cwd — pin `te.repo` there when it matters. State: `GET /v1/te`, `amty te`.
 
 ## Known limits / TODO
 

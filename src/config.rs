@@ -223,6 +223,28 @@ impl Default for EvolveConf {
     }
 }
 
+/// TokenEconomizer toggles (`te.*` keys), all default on.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TeConf {
+    /// Inject repo facts learned in earlier sessions into the system tail.
+    pub enabled: bool,
+    /// Leave never-called MCP tools out of the request.
+    pub prune: bool,
+    /// Nudge (then stop) a turn that repeats the same failing call.
+    pub loopguard: bool,
+    /// Tool names that are never pruned; `amty te untool` appends here.
+    pub keep: Vec<String>,
+    /// Repo path facts are keyed by (default: last shell workdir, else cwd).
+    pub repo: Option<String>,
+}
+
+impl Default for TeConf {
+    fn default() -> Self {
+        Self { enabled: true, prune: true, loopguard: true, keep: vec![], repo: None }
+    }
+}
+
 pub const DEFAULT_SYSTEM: &str = "You are amty, a lightweight desktop AI agent. \
 You can read/write files, run shell commands, and change this app's own settings \
 through the provided tools. Use web_search to look up current information and \
@@ -254,6 +276,8 @@ pub struct Config {
     pub evolve: EvolveConf,
     /// Markdown notes store (agent knowledge base / Obsidian-compatible).
     pub notes: NotesConf,
+    /// TokenEconomizer: repo facts, tool pruning, loop guard.
+    pub te: TeConf,
 }
 
 impl Default for Config {
@@ -316,6 +340,7 @@ impl Default for Config {
             last_session: None,
             evolve: EvolveConf::default(),
             notes: NotesConf::default(),
+            te: TeConf::default(),
         }
     }
 }
@@ -497,7 +522,8 @@ impl Config {
     ///       provider.<name>.{model,api_key_env,api_key,base_url,context_window} |
     ///       mcp.<name>.enabled |
     ///       search.{backend,api_key,api_key_env,base_url,max_results,fetch_max_chars} |
-    ///       evolve.{reflect,skills,self_modify,auto_restart,learn_approvals}
+    ///       evolve.{reflect,skills,self_modify,auto_restart,learn_approvals} |
+    ///       te.{enabled,prune,loopguard,repo} | te.keep | +te.keep
     pub fn apply_set(&mut self, key: &str, value: &str) -> Result<String> {
         match key {
             "provider" => {
@@ -615,6 +641,42 @@ impl Config {
                 *f = v;
                 Ok(format!("{key} = {v}"))
             }
+            _ if key.starts_with("te.") || key.starts_with("+te.") => {
+                let append = key.starts_with('+');
+                let field = key.trim_start_matches('+').trim_start_matches("te.");
+                match field {
+                    "repo" => {
+                        self.te.repo = (!value.trim().is_empty()).then(|| value.trim().to_string());
+                        Ok(format!("te.repo = {}", self.te.repo.clone().unwrap_or_default()))
+                    }
+                    "keep" => {
+                        let items: Vec<String> = value
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if append {
+                            self.te.keep.extend(items);
+                        } else {
+                            self.te.keep = items;
+                        }
+                        self.te.keep.sort();
+                        self.te.keep.dedup();
+                        Ok(format!("te.keep = [{}]", self.te.keep.join(", ")))
+                    }
+                    f => {
+                        let v = matches!(value, "true" | "1" | "on" | "yes");
+                        let slot = match f {
+                            "enabled" => &mut self.te.enabled,
+                            "prune" => &mut self.te.prune,
+                            "loopguard" => &mut self.te.loopguard,
+                            _ => bail!("unknown te field '{f}'"),
+                        };
+                        *slot = v;
+                        Ok(format!("{key} = {v}"))
+                    }
+                }
+            }
             _ if key.starts_with("mcp.") => {
                 let parts: Vec<&str> = key.splitn(3, '.').collect();
                 if parts.len() == 3 && parts[2] == "enabled" {
@@ -687,6 +749,14 @@ impl Config {
             }
             return Ok(format!("{key} cleared"));
         }
+        if let Some(field) = key.strip_prefix("te.") {
+            match field {
+                "repo" => self.te.repo = None,
+                "keep" => self.te.keep.clear(),
+                _ => bail!("te field '{field}' is not removable"),
+            }
+            return Ok(format!("{key} cleared"));
+        }
         bail!("unknown key '{key}'")
     }
 
@@ -719,6 +789,25 @@ impl Config {
                     _ => bail!("unknown evolve field"),
                 };
                 Ok(v.to_string())
+            }
+            "te" => Ok(format!(
+                "enabled={} prune={} loopguard={} repo={} keep=[{}]",
+                self.te.enabled,
+                self.te.prune,
+                self.te.loopguard,
+                self.te.repo.clone().unwrap_or_default(),
+                self.te.keep.join(", "),
+            )),
+            _ if key.starts_with("te.") => {
+                let v = match &key["te.".len()..] {
+                    "enabled" => self.te.enabled.to_string(),
+                    "prune" => self.te.prune.to_string(),
+                    "loopguard" => self.te.loopguard.to_string(),
+                    "repo" => self.te.repo.clone().unwrap_or_default(),
+                    "keep" => self.te.keep.join(", "),
+                    _ => bail!("unknown te field"),
+                };
+                Ok(v)
             }
             _ if key.starts_with("search.") => {
                 let s = &self.search;
@@ -823,6 +912,23 @@ mod tests {
         // and it survives a toml round-trip
         let back: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
         assert!(!back.evolve.reflect);
+    }
+
+    #[test]
+    fn apply_set_te_keys() {
+        let mut cfg = Config::default();
+        cfg.apply_set("te.prune", "false").unwrap();
+        cfg.apply_set("te.repo", "/tmp/repo").unwrap();
+        cfg.apply_set("+te.keep", "mcp__a__b").unwrap();
+        cfg.apply_set("+te.keep", "mcp__a__b,mcp__c__d").unwrap();
+        assert!(!cfg.te.prune && cfg.te.enabled);
+        assert_eq!(cfg.te.keep, vec!["mcp__a__b".to_string(), "mcp__c__d".to_string()]);
+        assert_eq!(cfg.get("te.repo").unwrap(), "/tmp/repo");
+        assert!(cfg.apply_set("te.bogus", "true").is_err());
+        cfg.apply_unset("te.repo").unwrap();
+        assert!(cfg.te.repo.is_none());
+        let back: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert!(!back.te.prune);
     }
 
     #[test]
