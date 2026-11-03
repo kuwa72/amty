@@ -55,6 +55,73 @@ pub struct Session {
     /// Compaction applied to provider requests (see `Compaction`).
     #[serde(default)]
     pub compact: Option<Compaction>,
+    /// File contents captured before `fs_write` / `fs_edit`, so a run's
+    /// writes can be reverted (see `RevertEntry`).
+    #[serde(default)]
+    pub revert: Vec<RevertEntry>,
+}
+
+/// One file's state before a tool call wrote it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RevertEntry {
+    /// Absolute path the call wrote.
+    pub path: String,
+    /// Index of the user message that started the run — the unit a revert
+    /// covers, so a run whose tool calls sit in prose messages still maps.
+    pub run: usize,
+    /// Nanoseconds since the epoch when the content was captured (updated on
+    /// each successful write); a newer mtime means someone else touched it.
+    #[serde(default)]
+    pub ts: u64,
+    /// Content before the write; `None` with `ok` means the file is new.
+    pub prev: Option<String>,
+    /// false = too large or not UTF-8: listed, but not restorable.
+    #[serde(default = "default_true")]
+    pub ok: bool,
+}
+
+/// Result of `revert_run`.
+#[derive(Default)]
+pub struct Reverted {
+    /// Paths restored or deleted.
+    pub restored: usize,
+    /// Entries left alone: not restorable, or changed since the run.
+    pub skipped: usize,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Cap on one journaled file; bigger files are journaled as not revertible.
+const MAX_REVERT_BYTES: u64 = 1024 * 1024;
+/// Cap on the whole journal (sum of `prev`), oldest entries dropped first.
+const MAX_REVERT_TOTAL: usize = 2 * 1024 * 1024;
+/// Cap on entry count: created files and unreadable ones cost no bytes.
+const MAX_REVERT_ENTRIES: usize = 200;
+
+/// The one spelling of a path the journal uses. Relative tool paths are
+/// normal for `fs_write`, so every lookup goes through this.
+fn canon(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    std::fs::canonicalize(p)
+        .unwrap_or_else(|_| {
+            p.parent()
+                .and_then(|d| std::fs::canonicalize(d).ok())
+                .zip(p.file_name())
+                .map(|(d, n)| d.join(n))
+                .unwrap_or_else(|| p.to_path_buf())
+        })
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Nanoseconds since the epoch: file mtimes need finer than a second.
+fn now_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 impl Session {
@@ -73,6 +140,7 @@ impl Session {
             files: vec![],
             draft: String::new(),
             compact: None,
+            revert: vec![],
         }
     }
 
@@ -345,6 +413,11 @@ impl SessionStore {
         }
     }
 
+    /// Number of messages in the session (0 when it is gone).
+    pub fn message_count(&self, id: &str) -> usize {
+        self.map.read().unwrap().get(id).map_or(0, |s| s.messages.len())
+    }
+
     /// Composer draft for a session (unsent input text).
     pub fn draft(&self, id: &str) -> Option<String> {
         self.map.read().unwrap().get(id).map(|s| s.draft.clone())
@@ -437,11 +510,135 @@ impl SessionStore {
         true
     }
 
+    /// Remember `path`'s content before a tool call in run `run` writes it.
+    /// The first write in a run wins: that is the state to go back to.
+    /// Returns false when the run already journaled this path (the first
+    /// capture is the one to keep) or the session is gone.
+    pub fn journal_write(&self, id: &str, run: usize, path: &str) -> bool {
+        // absolute, so a restart with a different cwd can't point the revert
+        // at another file
+        let abs = std::path::PathBuf::from(canon(path));
+        // read the file outside the store lock: 1 MiB on a slow disk would
+        // otherwise stall every other session
+        let meta = std::fs::metadata(&abs);
+        let too_big = meta.as_ref().is_ok_and(|m| m.len() > MAX_REVERT_BYTES);
+        let prev = if too_big { None } else { std::fs::read_to_string(&abs).ok() };
+        // missing is restorable as "delete it"; anything else we could not
+        // read (binary, permissions) is listed but left alone
+        let missing = meta.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+        let entry = RevertEntry {
+            path: abs.to_string_lossy().into_owned(),
+            run,
+            ts: now_nanos(),
+            ok: !too_big && (prev.is_some() || missing),
+            prev,
+        };
+        let mut map = self.map.write().unwrap();
+        let Some(s) = map.get_mut(id) else { return false };
+        if s.revert.iter().any(|e| e.run == run && e.path == entry.path) {
+            return false;
+        }
+        s.revert.push(entry);
+        while s.revert.len() > MAX_REVERT_ENTRIES
+            || s.revert.iter().filter_map(|e| e.prev.as_ref().map(String::len)).sum::<usize>()
+                > MAX_REVERT_TOTAL
+        {
+            s.revert.remove(0);
+        }
+        self.persist(s);
+        true
+    }
+
+    /// The run's write succeeded: the file is now the run's own output, so
+    /// only a change made *after* this moment should block the revert.
+    pub fn journal_touch(&self, id: &str, run: usize, path: &str) {
+        let abs = canon(path);
+        let mut map = self.map.write().unwrap();
+        let Some(s) = map.get_mut(id) else { return };
+        let touched = match s.revert.iter_mut().find(|e| e.run == run && e.path == abs) {
+            Some(e) => {
+                e.ts = now_nanos();
+                true
+            }
+            None => false,
+        };
+        if touched {
+            self.persist(s);
+        }
+    }
+
+    /// Forget a journaled write that never happened (the tool failed).
+    pub fn journal_drop(&self, id: &str, run: usize, path: &str) {
+        let abs = canon(path);
+        let mut map = self.map.write().unwrap();
+        let Some(s) = map.get_mut(id) else { return };
+        let before = s.revert.len();
+        s.revert.retain(|e| !(e.run == run && e.path == abs));
+        if s.revert.len() != before {
+            self.persist(s);
+        }
+    }
+
+    /// Restore every journaled write of run `run`.
+    pub fn revert_run(&self, id: &str, run: usize) -> Result<Reverted, String> {
+        let pending: Vec<(String, u64, Option<String>, bool)> = {
+            let map = self.map.read().unwrap();
+            let s = map.get(id).ok_or("no such session")?;
+            s.revert
+                .iter()
+                .filter(|e| e.run == run)
+                .map(|e| (e.path.clone(), e.ts, e.prev.clone(), e.ok))
+                .collect()
+        };
+        let mut out = Reverted::default();
+        let mut done: Vec<String> = vec![];
+        for (path, ts, prev, ok) in &pending {
+            let touched_after = std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_some_and(|t| t.as_nanos() as u64 > *ts);
+            if !ok || touched_after {
+                out.skipped += 1;
+                continue;
+            }
+            // one bad file must not abort the rest of the run's revert
+            match prev {
+                Some(content) => match std::fs::write(path, content) {
+                    Ok(()) => {}
+                    Err(_) => {
+                        out.skipped += 1;
+                        continue;
+                    }
+                },
+                None => match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => {
+                        out.skipped += 1;
+                        continue;
+                    }
+                },
+            }
+            out.restored += 1;
+            done.push(path.clone());
+        }
+        let mut map = self.map.write().unwrap();
+        if let Some(s) = map.get_mut(id) {
+            // skipped entries stay, so the button survives a retry
+            s.revert.retain(|e| !(e.run == run && done.contains(&e.path)));
+            self.persist(s);
+        }
+        Ok(out)
+    }
+
     /// Rewind: keep only the first `keep` messages of the session.
     pub fn truncate(&self, id: &str, keep: usize) -> bool {
         let mut map = self.map.write().unwrap();
         if let Some(s) = map.get_mut(id) {
             s.messages.truncate(keep);
+            // journal entries point at runs that no longer exist
+            s.revert.retain(|e| e.run < keep);
             // a rewind past the summary boundary invalidates it
             if s.compact.as_ref().is_some_and(|c| c.from > keep) {
                 s.compact = None;
@@ -607,6 +804,9 @@ struct MetaOnly {
     /// Compaction state (see `Session::compact`).
     #[serde(default)]
     compact: Option<Compaction>,
+    /// Pre-write file contents (see `Session::revert`).
+    #[serde(default)]
+    revert: Vec<RevertEntry>,
 }
 
 impl From<&Session> for MetaOnly {
@@ -623,6 +823,7 @@ impl From<&Session> for MetaOnly {
             files: s.files.clone(),
             draft: s.draft.clone(),
             compact: s.compact.clone(),
+            revert: s.revert.clone(),
         }
     }
 }
@@ -636,6 +837,206 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("amty-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         (SessionStore::load(dir.clone()), dir)
+    }
+
+    #[test]
+    fn revert_restores_edited_and_deletes_created() {
+        let (store, dir) = temp_store();
+        let id = store.create(None, None);
+        store.push_message(&id, ChatMessage::user("hi"));
+        store.push_message(&id, ChatMessage { role: Role::Assistant, blocks: vec![] });
+
+        let edited = dir.join("edited.txt");
+        let created = dir.join("created.txt");
+        std::fs::write(&edited, "before\n").unwrap();
+        store.journal_write(&id, 1, edited.to_str().unwrap());
+        std::fs::write(&edited, "after\n").unwrap();
+        store.journal_touch(&id, 1, edited.to_str().unwrap());
+        store.journal_write(&id, 1, created.to_str().unwrap());
+        std::fs::write(&created, "made\n").unwrap();
+        store.journal_touch(&id, 1, created.to_str().unwrap());
+
+        let out = store.revert_run(&id, 1).unwrap();
+        assert_eq!((out.restored, out.skipped), (2, 0));
+        assert_eq!(std::fs::read_to_string(&edited).unwrap(), "before\n");
+        assert!(!created.exists());
+        assert!(store.get(&id).unwrap().revert.is_empty());
+    }
+
+    #[test]
+    fn revert_journal_survives_reload_and_rewind() {
+        let (store, dir) = temp_store();
+        let id = store.create(None, None);
+        store.push_message(&id, ChatMessage::user("hi"));
+        store.push_message(&id, ChatMessage { role: Role::Assistant, blocks: vec![] });
+        let p = dir.join("kept.txt");
+        std::fs::write(&p, "v1\n").unwrap();
+        store.journal_write(&id, 1, p.to_str().unwrap());
+
+        let reloaded = SessionStore::load(dir.clone());
+        assert_eq!(reloaded.get(&id).unwrap().revert.len(), 1);
+        assert!(reloaded.truncate(&id, 1));
+        assert!(reloaded.get(&id).unwrap().revert.is_empty());
+    }
+
+    #[test]
+    fn revert_keeps_the_earliest_state_of_a_run() {
+        let (store, dir) = temp_store();
+        let id = store.create(None, None);
+        store.push_message(&id, ChatMessage::user("hi"));
+        store.push_message(&id, ChatMessage { role: Role::Assistant, blocks: vec![] });
+        let p = dir.join("twice.txt");
+        std::fs::write(&p, "one\n").unwrap();
+        store.journal_write(&id, 1, p.to_str().unwrap());
+        std::fs::write(&p, "two\n").unwrap();
+        store.journal_touch(&id, 1, p.to_str().unwrap());
+        store.journal_write(&id, 1, p.to_str().unwrap());
+        std::fs::write(&p, "three\n").unwrap();
+        store.journal_touch(&id, 1, p.to_str().unwrap());
+
+        store.revert_run(&id, 1).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "one\n");
+    }
+
+    #[test]
+    fn oversized_and_non_utf8_files_are_listed_but_not_reverted() {
+        let (store, dir) = temp_store();
+        let id = store.create(None, None);
+        store.push_message(&id, ChatMessage::user("hi"));
+        store.push_message(&id, ChatMessage { role: Role::Assistant, blocks: vec![] });
+        let big = dir.join("big.txt");
+        let binary = dir.join("bin.dat");
+        std::fs::write(&big, "x".repeat(1024 * 1024 + 1)).unwrap();
+        std::fs::write(&binary, [0xff, 0xfe, 0x00]).unwrap();
+        store.journal_write(&id, 1, big.to_str().unwrap());
+        store.journal_write(&id, 1, binary.to_str().unwrap());
+        assert_eq!(store.get(&id).unwrap().revert.len(), 2);
+        assert!(store.get(&id).unwrap().revert.iter().all(|e| !e.ok));
+
+        let out = store.revert_run(&id, 1).unwrap();
+        assert_eq!((out.restored, out.skipped), (0, 2));
+        // skipped entries stay so the button can retry
+        assert_eq!(store.get(&id).unwrap().revert.len(), 2);
+    }
+
+    #[test]
+    fn two_spellings_of_one_path_share_one_entry() {
+        let (store, dir) = temp_store();
+        let id = store.create(None, None);
+        store.push_message(&id, ChatMessage::user("hi"));
+        let p = dir.join("spelled.txt");
+        std::fs::write(&p, "v1\n").unwrap();
+        assert!(store.journal_write(&id, 1, p.to_str().unwrap()));
+        std::fs::write(&p, "v2\n").unwrap();
+        // relative/dotted spellings are normal for tool paths
+        let dotted = dir.join(".").join("spelled.txt");
+        assert!(!store.journal_write(&id, 1, dotted.to_str().unwrap()));
+        store.journal_touch(&id, 1, dotted.to_str().unwrap());
+        assert_eq!(store.get(&id).unwrap().revert.len(), 1);
+        assert_eq!(store.revert_run(&id, 1).unwrap().restored, 1);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "v1\n");
+    }
+
+    #[test]
+    fn a_file_created_then_written_again_is_still_deleted() {
+        let (store, dir) = temp_store();
+        let id = store.create(None, None);
+        store.push_message(&id, ChatMessage::user("hi"));
+        let p = dir.join("created-twice.txt");
+        assert!(store.journal_write(&id, 1, p.to_str().unwrap()));
+        std::fs::write(&p, "a\n").unwrap();
+        store.journal_touch(&id, 1, p.to_str().unwrap());
+        assert!(!store.journal_write(&id, 1, p.to_str().unwrap()));
+        std::fs::write(&p, "b\n").unwrap();
+        store.journal_touch(&id, 1, p.to_str().unwrap());
+
+        assert_eq!(store.revert_run(&id, 1).unwrap().restored, 1);
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn the_runs_own_later_write_does_not_block_the_revert() {
+        let (store, dir) = temp_store();
+        let id = store.create(None, None);
+        store.push_message(&id, ChatMessage::user("hi"));
+        store.push_message(&id, ChatMessage { role: Role::Assistant, blocks: vec![] });
+        let p = dir.join("twice-more.txt");
+        std::fs::write(&p, "one\n").unwrap();
+        store.journal_write(&id, 1, p.to_str().unwrap());
+        std::fs::write(&p, "two\n").unwrap();
+        // the capture is older than the run's own write: without the touch
+        // this would look like someone else's edit
+        store.map.write().unwrap().get_mut(&id).unwrap().revert[0].ts -= 1_000_000_000;
+        store.journal_touch(&id, 1, p.to_str().unwrap());
+
+        let out = store.revert_run(&id, 1).unwrap();
+        assert_eq!((out.restored, out.skipped), (1, 0));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "one\n");
+    }
+
+    #[test]
+    fn a_file_changed_after_the_run_is_not_reverted() {
+        let (store, dir) = temp_store();
+        let id = store.create(None, None);
+        store.push_message(&id, ChatMessage::user("hi"));
+        store.push_message(&id, ChatMessage { role: Role::Assistant, blocks: vec![] });
+        let p = dir.join("later.txt");
+        std::fs::write(&p, "run\n").unwrap();
+        store.journal_write(&id, 1, p.to_str().unwrap());
+        // pretend the run's write happened, then someone edited a second later
+        std::fs::write(&p, "user\n").unwrap();
+        {
+            let mut map = store.map.write().unwrap();
+            map.get_mut(&id).unwrap().revert[0].ts -= 1_000_000_000;
+        }
+
+        let out = store.revert_run(&id, 1).unwrap();
+        assert_eq!((out.restored, out.skipped), (0, 1));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "user\n");
+    }
+
+    #[test]
+    fn a_failed_write_can_be_dropped_from_the_journal() {
+        let (store, dir) = temp_store();
+        let id = store.create(None, None);
+        store.push_message(&id, ChatMessage::user("hi"));
+        store.push_message(&id, ChatMessage { role: Role::Assistant, blocks: vec![] });
+        let p = dir.join("nope.txt");
+        std::fs::write(&p, "same\n").unwrap();
+        store.journal_write(&id, 1, p.to_str().unwrap());
+        store.journal_drop(&id, 1, p.to_str().unwrap());
+        assert!(store.get(&id).unwrap().revert.is_empty());
+    }
+
+    #[test]
+    fn revert_journal_is_capped() {
+        let (store, dir) = temp_store();
+        let id = store.create(None, None);
+        store.push_message(&id, ChatMessage::user("hi"));
+        for i in 0..5 {
+            store.push_message(&id, ChatMessage { role: Role::Assistant, blocks: vec![] });
+            let p = dir.join(format!("f{i}.txt"));
+            std::fs::write(&p, "y".repeat(700 * 1024)).unwrap();
+            store.journal_write(&id, i + 1, p.to_str().unwrap());
+        }
+        let journal = store.get(&id).unwrap().revert;
+        let bytes: usize = journal.iter().filter_map(|e| e.prev.as_ref().map(|p| p.len())).sum();
+        assert!(bytes <= 2 * 1024 * 1024, "{bytes} bytes journaled");
+        // the oldest entries are the ones dropped
+        assert!(journal.len() < 5, "{} entries", journal.len());
+        assert!(journal.iter().all(|e| e.run > 1), "oldest kept: {:?}", journal.iter().map(|e| e.run).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn revert_journal_caps_entry_count() {
+        let (store, dir) = temp_store();
+        let id = store.create(None, None);
+        store.push_message(&id, ChatMessage::user("hi"));
+        for i in 0..(MAX_REVERT_ENTRIES + 10) {
+            let p = dir.join(format!("c{i}.txt"));
+            store.journal_write(&id, 1, p.to_str().unwrap());
+        }
+        assert_eq!(store.get(&id).unwrap().revert.len(), MAX_REVERT_ENTRIES);
     }
 
     #[test]

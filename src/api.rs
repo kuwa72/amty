@@ -157,7 +157,13 @@ async fn new_session(State(app): State<Arc<App>>, body: Option<Json<NewSession>>
 async fn get_session(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, String)> {
     let sid = app.sessions.resolve(&id).ok_or((StatusCode::NOT_FOUND, "no such session".into()))?;
     let s = app.sessions.get(&sid).ok_or((StatusCode::NOT_FOUND, "gone".into()))?;
-    Ok(Json(json!(s)))
+    // the revert journal holds pre-write file contents (up to 2 MiB): a
+    // session dump is not the place to duplicate them
+    let mut v = json!(s);
+    if let Some(o) = v.as_object_mut() {
+        o.remove("revert");
+    }
+    Ok(Json(v))
 }
 
 /// `GET /v1/sessions/{id}/files` — paths created by tool calls during the
