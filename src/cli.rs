@@ -542,6 +542,15 @@ pub async fn run(cmd: crate::Cmd) -> Result<()> {
                 None => print_json(&get(&base, &tok, "/v1/evolve").await?),
             }
         }
+        Te { sub } => {
+            let (base, tok) = runtime_info()?;
+            match sub {
+                Some(crate::TeCmd::Untool { name }) => {
+                    print_json(&post(&base, &tok, "/v1/te/untool", json!({"name": name})).await?)
+                }
+                None => print_json(&get(&base, &tok, "/v1/te").await?),
+            }
+        }
         Auth { id, status } => {
             let (base, tok) = runtime_info()?;
             if status {

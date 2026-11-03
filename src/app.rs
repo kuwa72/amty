@@ -84,6 +84,9 @@ pub struct App {
     pub restart_pending: Mutex<Option<std::path::PathBuf>>,
     /// last successfully rebuilt artifact, for `self_update restart`
     pub built_binary: Mutex<Option<std::path::PathBuf>>,
+    /// Directory of the last `shell` call — keys TokenEconomizer repo facts
+    /// (`te::current`) when `te.repo` is unset.
+    pub te_dir: Mutex<Option<std::path::PathBuf>>,
     pub token: String,
     pub started: u64,
     pub rt: tokio::runtime::Handle,
@@ -132,6 +135,7 @@ impl App {
             jobs: Mutex::new(crate::jobs::load(&crate::config::data_dir())),
             restart_pending: Mutex::new(None),
             built_binary: Mutex::new(None),
+            te_dir: Mutex::new(None),
             token,
             started: crate::session::now_secs(),
             rt: tokio::runtime::Handle::current(),

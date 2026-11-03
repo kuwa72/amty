@@ -38,6 +38,9 @@ pub struct ToolStat {
     pub calls: u64,
     pub errors: u64,
     pub denied: u64,
+    /// Times the tool rode a request (MCP tools only) — the denominator for
+    /// `te::pruned`: offered a lot and never called means dead weight.
+    pub offered: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -94,7 +97,7 @@ fn log_line(msg: &str) {
     }
 }
 
-fn save_stats(app: &App) {
+pub fn save_stats(app: &App) {
     app.stats.lock().unwrap().save();
 }
 
@@ -116,6 +119,21 @@ pub fn record_denied(app: &App, name: &str) {
     st.tools.entry(name.to_string()).or_default().denied += 1;
     drop(st);
     save_stats(app);
+}
+
+/// One "offer" per MCP tool in this run's request — `te::pruned` drops a tool
+/// that has been offered many times and never called.
+pub fn record_offered(app: &App, specs: &[crate::types::ToolSpec]) {
+    let mut st = app.stats.lock().unwrap();
+    let mut any = false;
+    for s in specs.iter().filter(|s| s.name.starts_with("mcp__")) {
+        st.tools.entry(s.name.clone()).or_default().offered += 1;
+        any = true;
+    }
+    drop(st);
+    if any {
+        save_stats(app);
+    }
 }
 
 /// How many identical approvals before a command is auto-allowed.
@@ -604,9 +622,14 @@ recurring pitfalls and their fixes, project-specific commands that worked, lesso
 - Emit a skill only for clearly reusable know-how (a procedure, a workaround, a tool recipe) — \
 at most a couple, each a complete SKILL.md whose first non-heading line is a one-line description.\n\
 - Config suggestions are limited to the whitelisted keys shown below.\n\n\
+- Repository facts (```fact): at most 3 short lines, only for something that cost a wrong turn \
+and will apply again in the same repository — the exact build/test command, a flag that does not \
+work here, a required env var, a directory to avoid. Repeat an existing fact VERBATIM to confirm \
+it (that raises its support); never restate it in different words. No task-specific trivia.\n\n\
 Output ONLY fenced blocks in these forms — or the single word NONE when nothing is worth keeping:\n\n\
 ```memory\n<complete new contents of MEMORY.md>\n```\n\n\
 ```skill <kebab-case-name>\n<complete SKILL.md>\n```\n\n\
+```fact\n<one line, no leading dash>\n```\n\n\
 ```config\n<key> = <value>\n```";
 
 /// Config keys the reflector may change. Deliberately a safe subset: nothing
@@ -742,6 +765,13 @@ async fn reflect(app: &Arc<App>, sid: &str) -> Result<String, String> {
     };
 
     let memory = std::fs::read_to_string(config::memory_path()).unwrap_or_default();
+    // TokenEconomizer: facts already learned for the repo amty last worked in
+    let (repo_root, facts) = {
+        let cfg = app.cfg.read().unwrap();
+        let root = crate::te::repo_root(&crate::te::current(&cfg, app.te_dir.lock().unwrap().clone()));
+        let facts = crate::te::note_body(&cfg, &root);
+        (root, facts)
+    };
     let stats = {
         let st = app.stats.lock().unwrap().clone();
         let tools: Vec<String> = st
@@ -763,9 +793,12 @@ async fn reflect(app: &Arc<App>, sid: &str) -> Result<String, String> {
     let prompt = format!(
         "SESSION TRANSCRIPT (tail):\n{tail}\n\n\
          CURRENT MEMORY.md:\n{}\n\n\
+         REPOSITORY FACTS for {} (support = confirmations; 0 = not injected yet):\n{}\n\n\
          STATS:\n{stats}\n\n\
          Writable config keys: {}",
         if memory.trim().is_empty() { "(empty)" } else { memory.trim() },
+        repo_root.display(),
+        if facts.trim().is_empty() { "(none yet)" } else { facts.trim() },
         REFLECT_CONFIG_KEYS.join(", "),
     );
 
@@ -836,6 +869,29 @@ fn apply_reflection(app: &Arc<App>, out: &str) -> String {
                 let _ = std::fs::create_dir_all(&dir);
                 if std::fs::write(dir.join("SKILL.md"), &body).is_ok() {
                     did.push(format!("skill:{name}"));
+                }
+            }
+            "fact" => {
+                let (dir, name) = {
+                    let cfg = app.cfg.read().unwrap();
+                    if !cfg.te.enabled {
+                        continue;
+                    }
+                    let root = crate::te::repo_root(&crate::te::current(&cfg, app.te_dir.lock().unwrap().clone()));
+                    (crate::notes::dir(&cfg), crate::te::note_name(&root))
+                };
+                let facts: Vec<String> = body
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(String::from)
+                    .collect();
+                let mut note = crate::notes::read(&dir, &name).unwrap_or_default();
+                for f in &facts {
+                    note = crate::te::merge_fact(&note, f);
+                }
+                if !facts.is_empty() && crate::notes::write(&dir, &name, &note).is_ok() {
+                    did.push(format!("fact:{}", facts.len()));
                 }
             }
             "config" => {

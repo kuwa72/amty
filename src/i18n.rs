@@ -137,6 +137,9 @@ static JA: &[(&str, &str)] = &[
     ("edit", "編集"),
     ("cancel", "キャンセル"),
     ("pending swap:", "置き換え待ち:"),
+    ("tokeneconomizer: inject facts learned in this repo", "TokenEconomizer: このリポジトリで学習した事実を注入"),
+    ("tokeneconomizer: drop MCP tools that are never called", "TokenEconomizer: 一度も呼ばれないMCPツールを送らない"),
+    ("tokeneconomizer: nudge a turn stuck in a failing loop", "TokenEconomizer: 失敗ループに一度だけ介入"),
     ("(unsaved)", "(未保存)"),
     ("reveal", "場所を開く"),
     // jobs

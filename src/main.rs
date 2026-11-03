@@ -20,6 +20,7 @@ mod notes;
 mod oauth;
 mod provider;
 mod session;
+mod te;
 mod tools;
 mod types;
 
@@ -144,6 +145,12 @@ pub enum Cmd {
         #[command(subcommand)]
         sub: Option<EvolveCmd>,
     },
+    /// TokenEconomizer: repo facts, tool pruning and loop-guard state.
+    /// Bare `amty te` prints it; `amty te untool <name>` brings a tool back.
+    Te {
+        #[command(subcommand)]
+        sub: Option<TeCmd>,
+    },
     /// Expose the running instance as an MCP server (stdio) for external agents.
     McpServe,
     /// Import mcpServers from claude_desktop_config.json into config.toml.
@@ -242,6 +249,12 @@ pub enum EvolveCmd {
     Forget { command: String },
     /// Drop a scheduled self-swap/restart before it fires.
     Cancel,
+}
+
+#[derive(Subcommand)]
+pub enum TeCmd {
+    /// Bring a pruned tool back into the request (adds it to `te.keep`).
+    Untool { name: String },
 }
 
 /// Linux/WSL display fixups: point XDG_RUNTIME_DIR at WSLg's socket dir when
