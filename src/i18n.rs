@@ -27,6 +27,8 @@ static JA: &[(&str, &str)] = &[
     ("rewind to here", "ここまで巻き戻す"),
     ("fork from here", "ここから分岐"),
     ("rewound", "巻き戻しました"),
+    ("palette", "コマンドパレット"),
+    ("type to filter", "入力で絞り込み"),
     ("forked", "分岐しました"),
     ("context compacted", "コンテキストを圧縮しました"),
     ("self-evolved", "自己進化"),

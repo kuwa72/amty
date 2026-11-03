@@ -19,6 +19,7 @@ mod mcp;
 mod mcp_serve;
 mod notes;
 mod oauth;
+mod palette;
 mod provider;
 mod session;
 mod te;

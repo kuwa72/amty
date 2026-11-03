@@ -351,6 +351,8 @@ pub struct GuiApp {
     /// last error per session, shown in the header until cleared
     last_error: HashMap<String, String>,
     pending: Vec<PendingView>,
+    /// Ctrl/Cmd+K palette; items are collected once on open
+    palette: Option<Palette>,
     /// cached view of the current session (refreshed on Touched)
     view: Option<Session>,
     view_dirty: bool,
@@ -387,6 +389,17 @@ pub struct GuiApp {
     notes_filter: String,
     /// floating view/edit window for the selected note
     note_win: Option<NoteWin>,
+}
+
+/// Ctrl/Cmd+K palette state. `items` is collected once on open, so typing
+/// never re-scans sessions, notes or skills.
+struct Palette {
+    query: String,
+    /// selected row within the ranked list
+    sel: usize,
+    items: Vec<crate::palette::Item>,
+    /// focus the text field on the first frame
+    focus: bool,
 }
 
 /// State of the floating note window. `is_new` keeps the name field editable
@@ -432,6 +445,7 @@ impl GuiApp {
             running: HashMap::new(),
             last_error: HashMap::new(),
             pending: vec![],
+            palette: None,
             view: None,
             view_dirty: true,
             toast: None,
@@ -531,6 +545,149 @@ impl GuiApp {
                     self.notes_dirty = true;
                 }
                 self.view_dirty = true;
+            }
+        }
+    }
+
+    fn toggle_palette(&mut self) {
+        if self.palette.is_some() {
+            self.palette = None;
+            return;
+        }
+        let mut items: Vec<crate::palette::Item> = Vec::new();
+        for s in self.app.sessions.list() {
+            items.push(crate::palette::Item {
+                label: s.title,
+                kind: crate::palette::Kind::Session,
+                target: s.id,
+            });
+        }
+        let notes_dir = crate::notes::dir(&self.app.cfg.read().unwrap());
+        for n in crate::notes::list(&notes_dir) {
+            items.push(crate::palette::Item {
+                label: n.name.clone(),
+                kind: crate::palette::Kind::Note,
+                target: n.name,
+            });
+        }
+        for sk in crate::config::skills() {
+            items.push(crate::palette::Item {
+                label: sk.name,
+                kind: crate::palette::Kind::Skill,
+                target: sk.path.display().to_string(),
+            });
+        }
+        for (name, _) in crate::palette::COMMANDS {
+            items.push(crate::palette::Item {
+                label: format!("amty {name}"),
+                kind: crate::palette::Kind::Command,
+                target: (*name).to_string(),
+            });
+        }
+        self.palette = Some(Palette { query: String::new(), sel: 0, items, focus: true });
+    }
+
+    fn render_palette(&mut self, ctx: &egui::Context) {
+        let Some(p) = self.palette.as_mut() else { return };
+        let lang = self.app.cfg.read().unwrap().lang.clone();
+        let t = |k: &'static str| crate::i18n::t(&lang, k);
+        let mut chosen: Option<usize> = None;
+        let mut close = false;
+        egui::Window::new(t("palette"))
+            .id(egui::Id::new("amty_palette"))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 90.0))
+            .show(ctx, |ui| {
+                ui.set_width(520.0);
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut p.query)
+                        .hint_text(t("type to filter"))
+                        .desired_width(f32::INFINITY),
+                );
+                if p.focus {
+                    resp.request_focus();
+                    p.focus = false;
+                }
+                let ranked = crate::palette::rank(&p.query, &p.items);
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                    p.sel = p.sel.saturating_add(1);
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                    p.sel = p.sel.saturating_sub(1);
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    close = true;
+                }
+                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                p.sel = p.sel.min(ranked.len().saturating_sub(1));
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    for (row, idx) in ranked.iter().take(12).enumerate() {
+                        let it = &p.items[*idx];
+                        let kind = match it.kind {
+                            crate::palette::Kind::Session => "session",
+                            crate::palette::Kind::Note => "note",
+                            crate::palette::Kind::Skill => "skill",
+                            crate::palette::Kind::Command => "command",
+                        };
+                        if ui
+                            .selectable_label(row == p.sel, format!("{}   ({kind})", it.label))
+                            .clicked()
+                        {
+                            chosen = Some(*idx);
+                        }
+                    }
+                });
+                if enter {
+                    chosen = ranked.get(p.sel).copied();
+                }
+            });
+        if close {
+            self.palette = None;
+            return;
+        }
+        if let Some(idx) = chosen {
+            self.run_palette_item(idx);
+        }
+    }
+
+    /// Act on a palette selection; the palette closes either way.
+    fn run_palette_item(&mut self, idx: usize) {
+        let Some(p) = self.palette.take() else { return };
+        let Some(it) = p.items.get(idx).cloned() else { return };
+        match it.kind {
+            crate::palette::Kind::Session => {
+                self.current = it.target;
+                self.view_dirty = true;
+                self.refresh_view();
+            }
+            crate::palette::Kind::Note => {
+                let dir = crate::notes::dir(&self.app.cfg.read().unwrap());
+                match crate::notes::read(&dir, &it.target) {
+                    Ok(text) => {
+                        self.note_win = Some(NoteWin {
+                            name: it.target,
+                            orig: text.clone(),
+                            text,
+                            editing: false,
+                            is_new: false,
+                        });
+                    }
+                    Err(e) => self.toast(format!("{} {e}", self.tr("error:"))),
+                }
+            }
+            crate::palette::Kind::Skill => open_path(&it.target),
+            crate::palette::Kind::Command => {
+                let Ok(exe) = std::env::current_exe() else { return };
+                match std::process::Command::new(exe).arg(&it.target).output() {
+                    Ok(o) => {
+                        let out = String::from_utf8_lossy(&o.stdout);
+                        let head: String = out.chars().take(160).collect();
+                        self.toast(format!("amty {}: {head}", it.target));
+                    }
+                    Err(e) => self.toast(e.to_string()),
+                }
             }
         }
     }
@@ -669,6 +826,9 @@ impl eframe::App for GuiApp {
             self.on_event(ev);
         }
         self.refresh_view();
+        if ui.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::K)) {
+            self.toggle_palette();
+        }
         // debounced draft persist: the composer buffer lives in GUI memory,
         // so a dirty draft is flushed to the session meta ~1s after typing
         // stops (switching sessions or sending flushes it immediately)
@@ -1863,6 +2023,9 @@ impl eframe::App for GuiApp {
         }
 
         // ----- floating note viewer/editor -----
+        if self.palette.is_some() {
+            self.render_palette(&ctx);
+        }
         if self.note_win.is_some() {
             let lang = self.app.cfg.read().unwrap().lang.clone();
             let t = |k: &'static str| crate::i18n::t(&lang, k);
