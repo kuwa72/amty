@@ -244,18 +244,28 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
             // `ask` is not a tool with side effects: it parks the run until the
             // user answers, then that answer is the tool result
             if name == "ask" {
-                let question = input["question"].as_str().unwrap_or("").to_string();
-                let options: Vec<String> = input["options"]
+                let question = input["question"].as_str().unwrap_or("").trim().to_string();
+                let mut options: Vec<String> = input["options"]
                     .as_array()
                     .map(|a| {
                         a.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
+                            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                            .filter(|s| !s.is_empty())
                             .take(4)
                             .collect()
                     })
                     .unwrap_or_default();
+                // one button is not a choice: fall back to free text
+                if options.len() < 2 {
+                    options.clear();
+                }
                 app.emit(sid, EvKind::ToolStart { name: name.clone(), detail: tools::guard_key(&name, &input) });
-                let out = question_gate(app, sid, &question, options, cancelled).await;
+                let out = if question.is_empty() {
+                    Err("ask: question required".to_string())
+                } else {
+                    question_gate(app, sid, &question, options, cancelled).await
+                };
+                crate::evolve::record_tool(app, &name, out.is_ok());
                 match out {
                     Ok(answer) => {
                         app.emit(sid, EvKind::ToolEnd { name: name.clone(), ok: true, preview: preview(&answer) });

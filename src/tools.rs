@@ -98,6 +98,7 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
                 json!({
                     "question": {"type": "string"},
                     "options": {"type": "array", "items": {"type": "string"},
+                                "minItems": 2, "maxItems": 4,
                                 "description": "2-4 choices shown as buttons"}
                 }),
                 &["question"],
