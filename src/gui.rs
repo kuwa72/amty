@@ -351,6 +351,8 @@ pub struct GuiApp {
     /// last error per session, shown in the header until cleared
     last_error: HashMap<String, String>,
     pending: Vec<PendingView>,
+    /// sessions whose current run already sent an error notification
+    notified_error: std::collections::HashSet<String>,
     /// window focus from the last frame: notifications only go out while the
     /// user is looking elsewhere
     window_focused: bool,
@@ -435,6 +437,7 @@ impl GuiApp {
             running: HashMap::new(),
             last_error: HashMap::new(),
             pending: vec![],
+            notified_error: Default::default(),
             window_focused: true,
             view: None,
             view_dirty: true,
@@ -506,12 +509,18 @@ impl GuiApp {
                 self.pending.retain(|p| p.id != approval_id);
             }
             EvKind::Running { running } => {
+                if running {
+                    // a new run: the previous run's error notification is spent
+                    self.notified_error.remove(&ev.session);
+                }
                 self.running.insert(ev.session.clone(), running);
             }
             EvKind::Error { message } => {
                 // a stop is not a failure
                 let title = if message == "cancelled" { "run cancelled" } else { "run failed" };
-                self.notify_if_away(title, &message);
+                let body: String = message.chars().take(200).collect();
+                self.notify_if_away(title, &body);
+                self.notified_error.insert(ev.session.clone());
                 self.last_error.insert(ev.session.clone(), message);
                 self.live_text.remove(&ev.session);
                 self.live_tool.remove(&ev.session);
@@ -535,7 +544,7 @@ impl GuiApp {
                 if matches!(ev.kind, EvKind::Done) {
                     // an Error earlier in this run already notified; a stream
                     // error is followed by Done for cleanup
-                    if !self.last_error.contains_key(&ev.session) {
+                    if !self.notified_error.remove(&ev.session) {
                         let title = self
                             .app
                             .sessions
