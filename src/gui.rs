@@ -285,6 +285,14 @@ fn rescue_offscreen_window(ctx: &egui::Context) {
     }
 }
 
+/// One pending `ask` call: the question, its buttons, and the free-text box.
+struct QView {
+    id: String,
+    question: String,
+    options: Vec<String>,
+    text: String,
+}
+
 struct PendingView {
     id: String,
     tool: String,
@@ -360,6 +368,8 @@ pub struct GuiApp {
     palette: Option<Palette>,
     /// output of a palette-run subcommand, delivered from its thread
     cmd_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// `ask` calls waiting for the user's answer
+    pending_q: Vec<QView>,
     /// cached view of the current session (refreshed on Touched)
     view: Option<Session>,
     view_dirty: bool,
@@ -456,6 +466,7 @@ impl GuiApp {
             window_focused: true,
             palette: None,
             cmd_rx: None,
+            pending_q: vec![],
             view: None,
             view_dirty: true,
             toast: None,
@@ -524,6 +535,14 @@ impl GuiApp {
             }
             EvKind::ApprovalResolved { approval_id, .. } => {
                 self.pending.retain(|p| p.id != approval_id);
+            }
+            EvKind::QuestionAsked { id, question, options } => {
+                let body: String = question.chars().take(200).collect();
+                self.notify_if_away("question", &body);
+                self.pending_q.push(QView { id, question, options, text: String::new() });
+            }
+            EvKind::QuestionAnswered { id } => {
+                self.pending_q.retain(|q| q.id != id);
             }
             EvKind::Running { running } => {
                 if running {
@@ -1022,7 +1041,7 @@ impl eframe::App for GuiApp {
 
         let any_running = self.running.values().any(|r| *r);
         let auth_running = self.app.auth.lock().unwrap().values().any(|a| a.running);
-        if any_running || auth_running || !self.pending.is_empty() {
+        if any_running || auth_running || (!self.pending.is_empty() || !self.pending_q.is_empty()) {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
@@ -1473,8 +1492,41 @@ impl eframe::App for GuiApp {
 
         // ----- bottom: input -----
         egui::Panel::bottom("input").show(ui, |ui| {
-            // pending approvals sit right above the input row so they can't
-            // hide behind the chat or drift off-screen like a floating window
+            // pending questions and approvals sit right above the input row so
+            // they can't hide behind the chat or drift off-screen
+            let lang = self.app.cfg.read().unwrap().lang.clone();
+            let t = |k: &'static str| crate::i18n::t(&lang, k);
+            let mut answers: Vec<(String, String)> = vec![];
+            for q in &mut self.pending_q {
+                ui.group(|ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(120, 180, 255),
+                        format!("❓ {}", q.question),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        for o in &q.options {
+                            if ui.button(o).clicked() {
+                                answers.push((q.id.clone(), o.clone()));
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut q.text)
+                                .hint_text(t("answer"))
+                                .desired_width(280.0),
+                        );
+                        if ui.button(t("send")).clicked() && !q.text.trim().is_empty() {
+                            answers.push((q.id.clone(), q.text.clone()));
+                        }
+                    });
+                });
+            }
+            for (id, a) in answers {
+                if self.app.questions.answer(&id, &a) {
+                    self.pending_q.retain(|q| q.id != id);
+                }
+            }
             let mut resolved: Vec<(String, bool)> = vec![];
             for p in &self.pending {
                 ui.group(|ui| {

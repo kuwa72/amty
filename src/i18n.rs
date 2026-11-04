@@ -27,6 +27,8 @@ static JA: &[(&str, &str)] = &[
     ("rewind to here", "ここまで巻き戻す"),
     ("fork from here", "ここから分岐"),
     ("rewound", "巻き戻しました"),
+    ("answer", "回答を入力"),
+    ("question", "質問"),
     ("run finished", "実行が終了しました"),
     ("run failed", "実行が失敗しました"),
     ("run cancelled", "実行を中止しました"),

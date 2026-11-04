@@ -18,7 +18,7 @@ pub enum Risk {
 pub fn risk_of(name: &str) -> Risk {
     match name {
         "fs_read" | "fs_list" | "config_get" | "mcp" | "web_search" | "web_fetch"
-        | "self_update" | "note_list" | "note_read" | "note_search" | "job_list" => Risk::Safe,
+        | "self_update" | "note_list" | "note_read" | "note_search" | "job_list" | "ask" => Risk::Safe,
         "shell" => Risk::Exec,
         _ => {
             if name.starts_with("mcp__") {
@@ -88,6 +88,19 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
                     "timeout": {"type": "integer"}
                 }),
                 &["command"],
+            ),
+        },
+        ToolSpec {
+            name: "ask".into(),
+            description: "Ask the user a question and wait for their answer. Use it when a decision cannot be inferred from the request: give 2-4 options when they are obvious, and the user can always type their own answer.".into(),
+            schema: schema(
+                json!({
+                    "question": {"type": "string"},
+                    "options": {"type": "array", "items": {"type": "string"},
+                                "minItems": 2, "maxItems": 4,
+                                "description": "2-4 choices shown as buttons"}
+                }),
+                &["question"],
             ),
         },
         ToolSpec {
@@ -323,6 +336,7 @@ pub fn summarize(name: &str, input: &Value) -> String {
         // missing path: the call itself fails, nothing to diff
         "fs_write" | "fs_edit" => format!("{name}: {}", input["path"].as_str().unwrap_or("")),
         "fs_read" | "fs_list" => format!("{name}: {}", input["path"].as_str().unwrap_or("")),
+        "ask" => format!("ask: {}", input["question"].as_str().unwrap_or("")),
         "web_search" => format!("web_search: {}", input["query"].as_str().unwrap_or("")),
         "web_fetch" => format!("web_fetch: {}", input["url"].as_str().unwrap_or("")),
         "config_set" => format!("config_set: {} = {}", input["key"].as_str().unwrap_or(""), input["value"].as_str().unwrap_or("")),
@@ -1791,6 +1805,15 @@ mod tests {
         );
         let _ = std::fs::remove_file(&p);
         assert_eq!(s, format!("fs_edit: {}", p.to_str().unwrap()));
+    }
+
+    #[test]
+    fn ask_question_tool_is_safe() {
+        let spec = builtin_specs().into_iter().find(|s| s.name == "ask").expect("ask spec");
+        // the description rides in every request: no hard-wrapped gaps
+        assert!(!spec.description.contains("  "), "{}", spec.description);
+        assert!(!needs_approval(&cfg(ApprovalMode::Ask), "ask", &json!({"question": "q"})));
+        assert_eq!(summarize("ask", &json!({"question": "which one?"})), "ask: which one?");
     }
 
     #[test]

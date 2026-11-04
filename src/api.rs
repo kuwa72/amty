@@ -31,6 +31,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/config/{key}", delete(unset_config))
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{id}", post(resolve_approval))
+        .route("/v1/questions", get(list_questions))
+        .route("/v1/questions/{id}", post(answer_question))
         .route("/v1/mcp", get(mcp_status).post(mcp_add))
         .route("/v1/mcp/{name}", post(mcp_toggle).delete(mcp_remove))
         .route("/v1/mcp-catalog", get(mcp_catalog))
@@ -310,6 +312,29 @@ async fn resolve_approval(
 ) -> Json<Value> {
     let ok = app.approvals.resolve(&id, b.allow);
     Json(json!({"resolved": ok}))
+}
+
+async fn list_questions(State(app): State<Arc<App>>) -> Json<Value> {
+    Json(json!(app.questions.list()))
+}
+
+#[derive(Deserialize)]
+struct AnswerBody {
+    answer: String,
+}
+
+async fn answer_question(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(b): Json<AnswerBody>,
+) -> Json<Value> {
+    // an empty answer would consume the question and then fail the tool, so
+    // the user could not answer it again
+    if b.answer.trim().is_empty() {
+        return Json(json!({"answered": false, "error": "empty answer"}));
+    }
+    let ok = app.questions.answer(&id, &b.answer);
+    Json(json!({"answered": ok}))
 }
 
 async fn mcp_status(State(app): State<Arc<App>>) -> Json<Value> {

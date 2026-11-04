@@ -316,6 +316,14 @@ pub async fn run(cmd: crate::Cmd) -> Result<()> {
             let (base, tok) = runtime_info()?;
             print_json(&post(&base, &tok, &format!("/v1/approvals/{id}"), json!({"allow": true})).await?);
         }
+        Questions => {
+            let (base, tok) = runtime_info()?;
+            print_json(&get(&base, &tok, "/v1/questions").await?);
+        }
+        Answer { id, text } => {
+            let (base, tok) = runtime_info()?;
+            print_json(&post(&base, &tok, &format!("/v1/questions/{id}"), json!({"answer": text})).await?);
+        }
         Deny { id, reason } => {
             let (base, tok) = runtime_info()?;
             let _ = reason;

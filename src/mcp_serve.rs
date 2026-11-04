@@ -89,6 +89,17 @@ fn tool_defs() -> Vec<Value> {
             "id": {"type": "string"}, "allow": {"type": "boolean"}}, "required": ["id", "allow"]}),
     ),
     (
+        "amty_list_questions",
+        "List pending `ask` questions the agent is waiting on.",
+        json!({"type": "object", "properties": {}}),
+    ),
+    (
+        "amty_answer_question",
+        "Answer a pending `ask` question so the run continues.",
+        json!({"type": "object", "properties": {
+            "id": {"type": "string"}, "answer": {"type": "string"}}, "required": ["id", "answer"]}),
+    ),
+    (
         "amty_cancel",
         "Cancel a running turn in a session.",
         json!({"type": "object", "properties": {"session": {"type": "string"}}, "required": []}),
@@ -276,6 +287,15 @@ async fn call_tool(name: &str, args: &Value) -> Result<Value> {
                 &base, &tok,
                 &format!("/v1/approvals/{}", args["id"].as_str().unwrap_or("")),
                 json!({"allow": args["allow"].as_bool().unwrap_or(false)}),
+            )
+            .await
+        }
+        "amty_list_questions" => crate::cli::get(&base, &tok, "/v1/questions").await,
+        "amty_answer_question" => {
+            crate::cli::post(
+                &base, &tok,
+                &format!("/v1/questions/{}", args["id"].as_str().unwrap_or("")),
+                json!({"answer": args["answer"].as_str().unwrap_or("")}),
             )
             .await
         }
