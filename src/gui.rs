@@ -353,6 +353,8 @@ pub struct GuiApp {
     pending: Vec<PendingView>,
     /// Ctrl/Cmd+K palette; items are collected once on open
     palette: Option<Palette>,
+    /// output of a palette-run subcommand, delivered from its thread
+    cmd_rx: Option<std::sync::mpsc::Receiver<String>>,
     /// cached view of the current session (refreshed on Touched)
     view: Option<Session>,
     view_dirty: bool,
@@ -446,6 +448,7 @@ impl GuiApp {
             last_error: HashMap::new(),
             pending: vec![],
             palette: None,
+            cmd_rx: None,
             view: None,
             view_dirty: true,
             toast: None,
@@ -562,12 +565,17 @@ impl GuiApp {
                 target: s.id,
             });
         }
-        let notes_dir = crate::notes::dir(&self.app.cfg.read().unwrap());
-        for n in crate::notes::list(&notes_dir) {
+        // reuse the notes browser's cache instead of re-reading every file
+        if self.notes_dirty {
+            let notes_dir = crate::notes::dir(&self.app.cfg.read().unwrap());
+            self.notes = crate::notes::list(&notes_dir);
+            self.notes_dirty = false;
+        }
+        for n in &self.notes {
             items.push(crate::palette::Item {
                 label: n.name.clone(),
                 kind: crate::palette::Kind::Note,
-                target: n.name,
+                target: n.name.clone(),
             });
         }
         for sk in crate::config::skills() {
@@ -577,7 +585,7 @@ impl GuiApp {
                 target: sk.path.display().to_string(),
             });
         }
-        for (name, _) in crate::palette::COMMANDS {
+        for name in crate::palette::COMMANDS {
             items.push(crate::palette::Item {
                 label: format!("amty {name}"),
                 kind: crate::palette::Kind::Command,
@@ -595,7 +603,6 @@ impl GuiApp {
         let mut close = false;
         egui::Window::new(t("palette"))
             .id(egui::Id::new("amty_palette"))
-            .title_bar(false)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 90.0))
@@ -610,6 +617,10 @@ impl GuiApp {
                     resp.request_focus();
                     p.focus = false;
                 }
+                if resp.changed() {
+                    // a new query starts at the top of its own ranking
+                    p.sel = 0;
+                }
                 let ranked = crate::palette::rank(&p.query, &p.items);
                 if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
                     p.sel = p.sel.saturating_add(1);
@@ -621,15 +632,16 @@ impl GuiApp {
                     close = true;
                 }
                 let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                p.sel = p.sel.min(ranked.len().saturating_sub(1));
+                // only the rows that are actually drawn can be selected
+                p.sel = p.sel.min(ranked.len().min(12).saturating_sub(1));
                 egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                     for (row, idx) in ranked.iter().take(12).enumerate() {
                         let it = &p.items[*idx];
                         let kind = match it.kind {
-                            crate::palette::Kind::Session => "session",
-                            crate::palette::Kind::Note => "note",
-                            crate::palette::Kind::Skill => "skill",
-                            crate::palette::Kind::Command => "command",
+                            crate::palette::Kind::Session => t("session"),
+                            crate::palette::Kind::Note => t("note"),
+                            crate::palette::Kind::Skill => t("skill"),
+                            crate::palette::Kind::Command => t("command"),
                         };
                         if ui
                             .selectable_label(row == p.sel, format!("{}   ({kind})", it.label))
@@ -658,7 +670,8 @@ impl GuiApp {
         let Some(it) = p.items.get(idx).cloned() else { return };
         match it.kind {
             crate::palette::Kind::Session => {
-                self.current = it.target;
+                // swap_draft keeps this session's draft out of the next one
+                self.swap_draft(it.target);
                 self.view_dirty = true;
                 self.refresh_view();
             }
@@ -680,14 +693,27 @@ impl GuiApp {
             crate::palette::Kind::Skill => open_path(&it.target),
             crate::palette::Kind::Command => {
                 let Ok(exe) = std::env::current_exe() else { return };
-                match std::process::Command::new(exe).arg(&it.target).output() {
-                    Ok(o) => {
-                        let out = String::from_utf8_lossy(&o.stdout);
-                        let head: String = out.chars().take(160).collect();
-                        self.toast(format!("amty {}: {head}", it.target));
-                    }
-                    Err(e) => self.toast(e.to_string()),
-                }
+                // the subcommand spins up its own runtime and talks to the
+                // control API: run it off the UI thread and report back
+                let (tx, rx) = std::sync::mpsc::channel();
+                let sub = it.target.clone();
+                std::thread::spawn(move || {
+                    let msg = match std::process::Command::new(exe).arg(&sub).output() {
+                        Ok(o) if o.status.success() => {
+                            let out = String::from_utf8_lossy(&o.stdout);
+                            let head: String = out.trim().chars().take(160).collect();
+                            format!("amty {sub}: {head}")
+                        }
+                        Ok(o) => {
+                            let err = String::from_utf8_lossy(&o.stderr);
+                            let head: String = err.trim().chars().take(160).collect();
+                            format!("amty {sub}: {}", if head.is_empty() { "failed".into() } else { head })
+                        }
+                        Err(e) => format!("amty {sub}: {e}"),
+                    };
+                    let _ = tx.send(msg);
+                });
+                self.cmd_rx = Some(rx);
             }
         }
     }
@@ -828,6 +854,18 @@ impl eframe::App for GuiApp {
         self.refresh_view();
         if ui.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::K)) {
             self.toggle_palette();
+        }
+        if let Some(rx) = &self.cmd_rx {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    self.toast(msg);
+                    self.cmd_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(200));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.cmd_rx = None,
+            }
         }
         // debounced draft persist: the composer buffer lives in GUI memory,
         // so a dirty draft is flushed to the session meta ~1s after typing

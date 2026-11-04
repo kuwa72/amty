@@ -46,17 +46,9 @@ pub fn rank(query: &str, items: &[Item]) -> Vec<usize> {
     scored.into_iter().map(|(_, i)| i).collect()
 }
 
-/// Read-only `amty` subcommands worth running from the palette.
-pub const COMMANDS: &[(&str, &str)] = &[
-    ("status", "status"),
-    ("sessions", "sessions"),
-    ("usage", "usage"),
-    ("te", "te"),
-    ("evolve", "evolve"),
-    ("notes", "notes"),
-    ("catalog", "catalog"),
-    ("search", "search"),
-];
+/// Read-only `amty` subcommands worth running from the palette (`search`
+/// needs an argument, so it is not one of them).
+pub const COMMANDS: &[&str] = &["status", "sessions", "usage", "te", "evolve", "notes", "catalog"];
 
 #[cfg(test)]
 mod tests {
