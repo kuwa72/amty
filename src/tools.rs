@@ -92,8 +92,7 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ask".into(),
-            description: "Ask the user a question and wait for their answer. Use it when a                           decision cannot be inferred from the request: give 2-4 options when                           they are obvious, and the user can always type their own answer."
-                .into(),
+            description: "Ask the user a question and wait for their answer. Use it when a decision cannot be inferred from the request: give 2-4 options when they are obvious, and the user can always type their own answer.".into(),
             schema: schema(
                 json!({
                     "question": {"type": "string"},
@@ -1810,7 +1809,9 @@ mod tests {
 
     #[test]
     fn ask_question_tool_is_safe() {
-        assert!(builtin_specs().iter().any(|s| s.name == "ask"));
+        let spec = builtin_specs().into_iter().find(|s| s.name == "ask").expect("ask spec");
+        // the description rides in every request: no hard-wrapped gaps
+        assert!(!spec.description.contains("  "), "{}", spec.description);
         assert!(!needs_approval(&cfg(ApprovalMode::Ask), "ask", &json!({"question": "q"})));
         assert_eq!(summarize("ask", &json!({"question": "which one?"})), "ask: which one?");
     }

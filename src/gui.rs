@@ -537,6 +537,8 @@ impl GuiApp {
                 self.pending.retain(|p| p.id != approval_id);
             }
             EvKind::QuestionAsked { id, question, options } => {
+                let body: String = question.chars().take(200).collect();
+                self.notify_if_away("question", &body);
                 self.pending_q.push(QView { id, question, options, text: String::new() });
             }
             EvKind::QuestionAnswered { id } => {
@@ -1039,7 +1041,7 @@ impl eframe::App for GuiApp {
 
         let any_running = self.running.values().any(|r| *r);
         let auth_running = self.app.auth.lock().unwrap().values().any(|a| a.running);
-        if any_running || auth_running || !self.pending.is_empty() {
+        if any_running || auth_running || (!self.pending.is_empty() || !self.pending_q.is_empty()) {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 

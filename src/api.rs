@@ -328,6 +328,11 @@ async fn answer_question(
     Path(id): Path<String>,
     Json(b): Json<AnswerBody>,
 ) -> Json<Value> {
+    // an empty answer would consume the question and then fail the tool, so
+    // the user could not answer it again
+    if b.answer.trim().is_empty() {
+        return Json(json!({"answered": false, "error": "empty answer"}));
+    }
     let ok = app.questions.answer(&id, &b.answer);
     Json(json!({"answered": ok}))
 }
