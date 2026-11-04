@@ -59,7 +59,7 @@ pub fn argv_for(os: Os, title: &str, body: &str) -> Vec<String> {
                  $x.Item(0).AppendChild($t.CreateTextNode('{title}')) > $null; \
                  $x.Item(1).AppendChild($t.CreateTextNode('{body}')) > $null; \
                  $toast = [Windows.UI.Notifications.ToastNotification]::new($t); \
-                 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('amty').Show($toast)",
+                 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\powershell.exe').Show($toast)",
                 title = ps_escape(title),
                 body = ps_escape(body),
             ),
@@ -75,11 +75,13 @@ fn ps_escape(s: &str) -> String {
 /// Fire and forget: a missing notifier or a failure never blocks the run.
 pub fn send(title: &str, body: &str) {
     let argv = argv_for(current(), title, body);
-    let child = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+        .stderr(std::process::Stdio::null());
+    // a GUI-subsystem app must not flash a console for the notifier
+    crate::catalog::no_window(&mut cmd);
+    let child = cmd.spawn();
     // reap it: a GUI that lives for days would otherwise collect zombies
     if let Ok(mut child) = child {
         std::thread::spawn(move || {
@@ -117,6 +119,8 @@ mod tests {
         let a = argv_for(Os::Windows, "amty", "it's done");
         assert_eq!(a[0], "powershell");
         assert!(a[3].contains("ToastNotificationManager"), "{:?}", a);
+        // a toast needs a registered AppUserModelID; ours isn't one
+        assert!(a[3].contains("1AC14E77-02E7-4E5D-B744-2EB1AE5198B7"), "{:?}", a);
         assert!(a[3].contains("it''s done"), "{:?}", a);
     }
 }

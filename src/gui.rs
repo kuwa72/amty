@@ -498,7 +498,8 @@ impl GuiApp {
                 self.live_tool.remove(&ev.session);
             }
             EvKind::ApprovalNeeded { approval_id, tool, detail } => {
-                self.notify_if_away("approval needed", &tool);
+                let body: String = format!("{tool}: {detail}").chars().take(200).collect();
+                self.notify_if_away("approval needed", &body);
                 self.pending.push(PendingView { id: approval_id, tool, detail });
             }
             EvKind::ApprovalResolved { approval_id, .. } => {
@@ -532,7 +533,17 @@ impl GuiApp {
                 // store now has everything streamed so far
                 self.live_text.remove(&ev.session);
                 if matches!(ev.kind, EvKind::Done) {
-                    self.notify_if_away("run finished", "");
+                    // an Error earlier in this run already notified; a stream
+                    // error is followed by Done for cleanup
+                    if !self.last_error.contains_key(&ev.session) {
+                        let title = self
+                            .app
+                            .sessions
+                            .get(&ev.session)
+                            .map(|s| s.title)
+                            .unwrap_or_default();
+                        self.notify_if_away("run finished", &title);
+                    }
                     self.live_tool.remove(&ev.session);
                 }
                 // Touched with no session = global change (config/mcp/notes)
@@ -681,8 +692,12 @@ impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.window_focused = ui.ctx().input(|i| i.focused);
         // keep draining the event bus while the window is in the background:
-        // a run started by a job, the CLI or MCP must still notify
-        ui.ctx().request_repaint_after(Duration::from_secs(1));
+        // a run started by a job, the CLI or MCP must still notify. Only when
+        // unfocused — a focused window already repaints on input, and a
+        // minimized one may not repaint at all (known limit of this approach).
+        if !self.window_focused {
+            ui.ctx().request_repaint_after(Duration::from_secs(1));
+        }
         let ctx = ui.ctx().clone();
         #[cfg(target_os = "windows")]
         rescue_offscreen_window(&ctx);
