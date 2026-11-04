@@ -351,8 +351,8 @@ pub struct GuiApp {
     /// last error per session, shown in the header until cleared
     last_error: HashMap<String, String>,
     pending: Vec<PendingView>,
-    /// sessions whose current run already sent an error notification
-    notified_error: std::collections::HashSet<String>,
+    /// last error of the current run, reported once when the run ends
+    run_error: HashMap<String, String>,
     /// window focus from the last frame: notifications only go out while the
     /// user is looking elsewhere
     window_focused: bool,
@@ -452,7 +452,7 @@ impl GuiApp {
             running: HashMap::new(),
             last_error: HashMap::new(),
             pending: vec![],
-            notified_error: Default::default(),
+            run_error: HashMap::new(),
             window_focused: true,
             palette: None,
             cmd_rx: None,
@@ -527,17 +527,33 @@ impl GuiApp {
             }
             EvKind::Running { running } => {
                 if running {
-                    // a new run: the previous run's error notification is spent
-                    self.notified_error.remove(&ev.session);
+                    self.run_error.remove(&ev.session);
+                } else {
+                    // the run is over: exactly one notification, with the
+                    // failure if the run had one, otherwise "finished"
+                    match self.run_error.remove(&ev.session) {
+                        Some(msg) => {
+                            let title = if msg == "cancelled" { "run cancelled" } else { "run failed" };
+                            self.notify_if_away(title, &msg);
+                        }
+                        None => {
+                            let title = self
+                                .app
+                                .sessions
+                                .get(&ev.session)
+                                .map(|s| s.title)
+                                .unwrap_or_default();
+                            self.notify_if_away("run finished", &title);
+                        }
+                    }
                 }
                 self.running.insert(ev.session.clone(), running);
             }
             EvKind::Error { message } => {
-                // a stop is not a failure
-                let title = if message == "cancelled" { "run cancelled" } else { "run failed" };
+                // reported when the run ends (Running{false}), so a mid-run
+                // stream error does not double-notify or mislabel the outcome
                 let body: String = message.chars().take(200).collect();
-                self.notify_if_away(title, &body);
-                self.notified_error.insert(ev.session.clone());
+                self.run_error.insert(ev.session.clone(), body);
                 self.last_error.insert(ev.session.clone(), message);
                 self.live_text.remove(&ev.session);
                 self.live_tool.remove(&ev.session);
@@ -559,17 +575,6 @@ impl GuiApp {
                 // store now has everything streamed so far
                 self.live_text.remove(&ev.session);
                 if matches!(ev.kind, EvKind::Done) {
-                    // an Error earlier in this run already notified; a stream
-                    // error is followed by Done for cleanup
-                    if !self.notified_error.remove(&ev.session) {
-                        let title = self
-                            .app
-                            .sessions
-                            .get(&ev.session)
-                            .map(|s| s.title)
-                            .unwrap_or_default();
-                        self.notify_if_away("run finished", &title);
-                    }
                     self.live_tool.remove(&ev.session);
                 }
                 // Touched with no session = global change (config/mcp/notes)

@@ -25,8 +25,17 @@ pub fn should_notify(enabled: bool, focused: bool) -> bool {
     enabled && !focused
 }
 
+/// One line: a newline breaks the AppleScript string and the Windows toast
+/// XML, and an approval detail is a multi-line diff.
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// argv of the notifier for `os`.
 pub fn argv_for(os: Os, title: &str, body: &str) -> Vec<String> {
+    let title = one_line(title);
+    let body = one_line(body);
+    let (title, body) = (title.as_str(), body.as_str());
     match os {
         Os::Linux => vec![
             "notify-send".into(),
@@ -99,6 +108,15 @@ mod tests {
         assert!(should_notify(true, false));
         assert!(!should_notify(true, true));
         assert!(!should_notify(false, false));
+    }
+
+    #[test]
+    fn multi_line_text_is_flattened() {
+        let a = argv_for(Os::Mac, "amty", "fs_edit: /x\n--- /x\n+++ /x\n@@ -1,2 +1,2 @@");
+        assert!(!a[2].contains('\n'), "{:?}", a);
+        assert!(a[2].contains("fs_edit: /x --- /x"), "{:?}", a);
+        let w = argv_for(Os::Windows, "amty", "a\nb");
+        assert!(!w[3].contains('\n'), "{:?}", w);
     }
 
     #[test]
