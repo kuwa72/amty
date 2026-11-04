@@ -351,6 +351,11 @@ pub struct GuiApp {
     /// last error per session, shown in the header until cleared
     last_error: HashMap<String, String>,
     pending: Vec<PendingView>,
+    /// last error of the current run, reported once when the run ends
+    run_error: HashMap<String, String>,
+    /// window focus from the last frame: notifications only go out while the
+    /// user is looking elsewhere
+    window_focused: bool,
     /// Ctrl/Cmd+K palette; items are collected once on open
     palette: Option<Palette>,
     /// output of a palette-run subcommand, delivered from its thread
@@ -447,6 +452,8 @@ impl GuiApp {
             running: HashMap::new(),
             last_error: HashMap::new(),
             pending: vec![],
+            run_error: HashMap::new(),
+            window_focused: true,
             palette: None,
             cmd_rx: None,
             view: None,
@@ -511,15 +518,42 @@ impl GuiApp {
                 self.live_tool.remove(&ev.session);
             }
             EvKind::ApprovalNeeded { approval_id, tool, detail } => {
+                let body: String = format!("{tool}: {detail}").chars().take(200).collect();
+                self.notify_if_away("approval needed", &body);
                 self.pending.push(PendingView { id: approval_id, tool, detail });
             }
             EvKind::ApprovalResolved { approval_id, .. } => {
                 self.pending.retain(|p| p.id != approval_id);
             }
             EvKind::Running { running } => {
+                if running {
+                    self.run_error.remove(&ev.session);
+                } else {
+                    // the run is over: exactly one notification, with the
+                    // failure if the run had one, otherwise "finished"
+                    match self.run_error.remove(&ev.session) {
+                        Some(msg) => {
+                            let title = if msg == "cancelled" { "run cancelled" } else { "run failed" };
+                            self.notify_if_away(title, &msg);
+                        }
+                        None => {
+                            let title = self
+                                .app
+                                .sessions
+                                .get(&ev.session)
+                                .map(|s| s.title)
+                                .unwrap_or_default();
+                            self.notify_if_away("run finished", &title);
+                        }
+                    }
+                }
                 self.running.insert(ev.session.clone(), running);
             }
             EvKind::Error { message } => {
+                // reported when the run ends (Running{false}), so a mid-run
+                // stream error does not double-notify or mislabel the outcome
+                let body: String = message.chars().take(200).collect();
+                self.run_error.insert(ev.session.clone(), body);
                 self.last_error.insert(ev.session.clone(), message);
                 self.live_text.remove(&ev.session);
                 self.live_tool.remove(&ev.session);
@@ -739,6 +773,14 @@ impl GuiApp {
         }
     }
 
+    /// Desktop notification, but only when it would not be redundant.
+    fn notify_if_away(&self, title: &'static str, body: &str) {
+        let enabled = self.app.cfg.read().unwrap().notify.enabled;
+        if crate::notify::should_notify(enabled, self.window_focused) {
+            crate::notify::send(&format!("amty — {}", self.tr(title)), body);
+        }
+    }
+
     fn toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), Instant::now()));
     }
@@ -845,6 +887,14 @@ impl GuiApp {
 
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.window_focused = ui.ctx().input(|i| i.focused);
+        // keep draining the event bus while the window is in the background:
+        // a run started by a job, the CLI or MCP must still notify. Only when
+        // unfocused — a focused window already repaints on input, and a
+        // minimized one may not repaint at all (known limit of this approach).
+        if !self.window_focused {
+            ui.ctx().request_repaint_after(Duration::from_secs(1));
+        }
         let ctx = ui.ctx().clone();
         #[cfg(target_os = "windows")]
         rescue_offscreen_window(&ctx);

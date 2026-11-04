@@ -119,7 +119,7 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "config_set".into(),
-            description: "Change an amty setting at runtime (persisted). Keys: provider, model, approval(ask|auto|allowlist), system_prompt, max_tokens, allow_commands, allow_paths, +allow_commands, +allow_paths, provider.<name>.{model,api_key,api_key_env,base_url,context_window}, mcp.<name>.enabled, search.{backend,api_key,api_key_env,base_url,max_results,fetch_max_chars}, evolve.{reflect,skills,self_modify,auto_restart,learn_approvals}.".into(),
+            description: "Change an amty setting at runtime (persisted). Keys: provider, model, approval(ask|auto|allowlist), system_prompt, max_tokens, allow_commands, allow_paths, +allow_commands, +allow_paths, provider.<name>.{model,api_key,api_key_env,base_url,context_window}, mcp.<name>.enabled, search.{backend,api_key,api_key_env,base_url,max_results,fetch_max_chars}, evolve.{reflect,skills,self_modify,auto_restart,learn_approvals}, notify.enabled.".into(),
             schema: schema(
                 json!({"key": {"type": "string"}, "value": {"type": "string"}}),
                 &["key", "value"],
