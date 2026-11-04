@@ -221,6 +221,9 @@ pub enum EvKind {
     ToolStart { name: String, detail: String },
     ToolEnd { name: String, ok: bool, preview: String },
     ApprovalNeeded { approval_id: String, tool: String, detail: String },
+    /// An `ask` call is waiting for the user's answer.
+    QuestionAsked { id: String, question: String, options: Vec<String> },
+    QuestionAnswered { id: String },
     ApprovalResolved { approval_id: String, allowed: bool },
     Running { running: bool },
     /// Token usage for the whole turn so far (emitted per provider call).

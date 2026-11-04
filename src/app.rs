@@ -60,6 +60,69 @@ impl ApprovalQueue {
     }
 }
 
+/// One `ask` call waiting for the user's answer.
+pub struct PendingQuestion {
+    pub id: String,
+    pub session: String,
+    pub question: String,
+    pub options: Vec<String>,
+    tx: oneshot::Sender<String>,
+}
+
+#[derive(Default)]
+pub struct QuestionQueue {
+    inner: Mutex<HashMap<String, PendingQuestion>>,
+}
+
+impl QuestionQueue {
+    pub fn ask(
+        &self,
+        session: &str,
+        question: &str,
+        options: Vec<String>,
+    ) -> (String, oneshot::Receiver<String>) {
+        let id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let (tx, rx) = oneshot::channel();
+        self.inner.lock().unwrap().insert(
+            id.clone(),
+            PendingQuestion {
+                id: id.clone(),
+                session: session.into(),
+                question: question.into(),
+                options,
+                tx,
+            },
+        );
+        (id, rx)
+    }
+
+    /// Deliver `answer` to the waiting run; false when the id is gone.
+    pub fn answer(&self, id: &str, answer: &str) -> bool {
+        if let Some(q) = self.inner.lock().unwrap().remove(id) {
+            let _ = q.tx.send(answer.to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drop a pending question without answering (run cancelled).
+    pub fn drop_question(&self, id: &str) -> bool {
+        self.inner.lock().unwrap().remove(id).is_some()
+    }
+
+    pub fn list(&self) -> Vec<serde_json::Value> {
+        self.inner
+            .lock()
+            .unwrap()
+            .values()
+            .map(|q| serde_json::json!({
+                "id": q.id, "session": q.session, "question": q.question, "options": q.options,
+            }))
+            .collect()
+    }
+}
+
 pub struct AuthRun {
     pub running: bool,
     pub log: std::path::PathBuf,
@@ -71,6 +134,7 @@ pub struct App {
     pub sessions: SessionStore,
     pub mcp: Arc<McpManager>,
     pub approvals: ApprovalQueue,
+    pub questions: QuestionQueue,
     pub events: broadcast::Sender<AppEvent>,
     /// session id → cancel flag
     pub runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
@@ -128,6 +192,7 @@ impl App {
             sessions,
             mcp,
             approvals: ApprovalQueue::default(),
+            questions: QuestionQueue::default(),
             events,
             runs: Mutex::new(HashMap::new()),
             auth: Mutex::new(HashMap::new()),
@@ -384,5 +449,31 @@ impl App {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn question_queue_delivers_once() {
+        let q = QuestionQueue::default();
+        let (id, rx) = q.ask("s1", "which one?", vec!["a".into(), "b".into()]);
+        assert_eq!(q.list().len(), 1);
+        assert!(q.answer(&id, "b"));
+        assert_eq!(rx.blocking_recv().unwrap(), "b");
+        assert!(q.list().is_empty());
+        // a second answer for the same id is refused
+        assert!(!q.answer(&id, "a"));
+    }
+
+    #[test]
+    fn question_queue_can_drop_a_pending_ask() {
+        let q = QuestionQueue::default();
+        let (id, _rx) = q.ask("s1", "still there?", vec![]);
+        assert!(q.drop_question(&id));
+        assert!(q.list().is_empty());
+        assert!(!q.drop_question(&id));
     }
 }

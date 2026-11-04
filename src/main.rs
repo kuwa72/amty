@@ -95,6 +95,10 @@ pub enum Cmd {
     },
     /// List pending approvals.
     Approvals,
+    /// List questions the agent is waiting on (`ask` tool).
+    Questions,
+    /// Answer a pending question.
+    Answer { id: String, text: String },
     /// Approve a pending tool call.
     Approve { id: String },
     /// Deny a pending tool call.

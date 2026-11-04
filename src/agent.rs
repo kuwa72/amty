@@ -237,6 +237,34 @@ async fn run_inner(app: &Arc<App>, sid: &str, blocks: Vec<Block>) -> Result<()> 
             }
             let Block::ToolUse { id, name, input } = b.clone() else { continue };
 
+            // `ask` is not a tool with side effects: it parks the run until the
+            // user answers, then that answer is the tool result
+            if name == "ask" {
+                let question = input["question"].as_str().unwrap_or("").to_string();
+                let options: Vec<String> = input["options"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .take(4)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                app.emit(sid, EvKind::ToolStart { name: name.clone(), detail: tools::guard_key(&name, &input) });
+                let out = question_gate(app, sid, &question, options, cancelled).await;
+                match out {
+                    Ok(answer) => {
+                        app.emit(sid, EvKind::ToolEnd { name: name.clone(), ok: true, preview: preview(&answer) });
+                        results.push(Block::ToolResult { tool_use_id: id, content: answer, is_error: false });
+                    }
+                    Err(e) => {
+                        app.emit(sid, EvKind::ToolEnd { name: name.clone(), ok: false, preview: preview(&e) });
+                        results.push(Block::ToolResult { tool_use_id: id, content: e, is_error: true });
+                    }
+                }
+                continue;
+            }
+
             // Read-only calls are stable within a session (a file does not
             // change behind our back mid-loop), so a repeated identical call
             // is answered from the memo instead of costing another round trip.
@@ -541,6 +569,35 @@ fn record_created(
         }
         _ => 0,
     }
+}
+
+/// Park the run until the user answers `ask` (or it is cancelled).
+async fn question_gate(
+    app: &Arc<App>,
+    sid: &str,
+    question: &str,
+    options: Vec<String>,
+    cancelled: impl Fn() -> bool,
+) -> Result<String, String> {
+    let (id, rx) = app.questions.ask(sid, question, options.clone());
+    app.emit(sid, EvKind::QuestionAsked { id: id.clone(), question: question.into(), options });
+    let mut rx = rx;
+    let answer = loop {
+        if cancelled() {
+            app.questions.drop_question(&id);
+            app.emit(sid, EvKind::QuestionAnswered { id: id.clone() });
+            return Err("cancelled".into());
+        }
+        tokio::select! {
+            r = &mut rx => break r.unwrap_or_default(),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+        }
+    };
+    app.emit(sid, EvKind::QuestionAnswered { id });
+    if answer.trim().is_empty() {
+        return Err("the user gave no answer".into());
+    }
+    Ok(answer)
 }
 
 async fn approval_gate(
